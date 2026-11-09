@@ -92,6 +92,8 @@ public enum Scanning {
     ///   - srgbToSRGB: the matrix the output transfer function applies before
     ///     the encoding, `rgb = matrix · rgb`.
     ///   - colorReference: the black / white reference of the print.
+    ///   - outputGamutCompress: the output gamut compression (`nil` or the
+    ///     `"off"` algorithm leaves the values untouched).
     /// - Returns: the encoded output RGB image, three values per pixel.
     public static func scan(
         cmy: [Double],
@@ -101,7 +103,8 @@ public enum Scanning {
         colourMatchingFunctions: [[Double]],
         xyzToRGB: [[Double]],
         srgbToSRGB: [[Double]],
-        colorReference: ColorReference = ColorReference()
+        colorReference: ColorReference = ColorReference(),
+        outputGamutCompress: OutputGamutCompressSpec? = nil
     ) -> [Double] {
         let logXYZ = cmyToLogXYZ(
             cmy: cmy,
@@ -126,6 +129,20 @@ public enum Scanning {
                 }
                 rgb[pixel * 3 + channel] = total
             }
+        }
+
+        // The output gamut compression, applied to the linear RGB values
+        // before the output transfer function.
+        //
+        // Upstream reference:
+        // `spektrafilm.runtime.stages.scanning.ScanningStage._density_to_rgb`
+        // and `spektrafilm.utils.gamut_compression.compress_rgb`.
+        if let outputGamutCompress, outputGamutCompress.active {
+            rgb = GamutCompression.compressRGB(
+                rgb,
+                spec: outputGamutCompress,
+                outputColourSpace: .sRGB
+            )
         }
 
         // The output transfer function first applies the sRGB to sRGB matrix

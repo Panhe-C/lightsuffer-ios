@@ -56,4 +56,37 @@ public enum FilmPhysics {
 
     /// The stock names of the profiles that ship with this package.
     public static let bundledProfiles = ["kodak_portra_400", "kodak_portra_endura"]
+
+    /// The spectral sampling of the upstream engine: 380…780 nm in 5 nm steps.
+    ///
+    /// Upstream reference: `spektrafilm.config.SPECTRAL_SHAPE`
+    /// (`colour.SpectralShape(380, 780, 5)`).
+    public static let wavelengths: [Double] = Array(
+        stride(from: 380.0, through: 780.0, by: 5.0)
+    )
+
+    /// Location of a bundled resource of the package.
+    ///
+    /// - Parameters:
+    ///   - name: the name of the resource, without its extension.
+    ///   - extension: the extension of the resource.
+    public static func resourceURL(named name: String, extension ext: String) -> URL? {
+        for subdirectory in [nil, "spectral", "filters", "profiles"] {
+            if let url = resourcesBundle.url(
+                forResource: name, withExtension: ext, subdirectory: subdirectory
+            ) {
+                return url
+            }
+        }
+        for root in [resourcesBundle.resourceURL, resourcesBundle.bundleURL].compactMap({ $0 }) {
+            guard let enumerator = FileManager.default.enumerator(
+                at: root, includingPropertiesForKeys: nil
+            ) else { continue }
+            for case let url as URL in enumerator
+            where url.lastPathComponent == "\(name).\(ext)" {
+                return url
+            }
+        }
+        return nil
+    }
 }

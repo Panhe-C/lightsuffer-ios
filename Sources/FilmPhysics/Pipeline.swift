@@ -175,6 +175,11 @@ public struct ScannerInputs: Equatable, Sendable {
     public var srgbToSRGB: [[Double]]
     /// The output gamut compression algorithm (`"off"` in slice 1).
     public var outputGamutCompress: String
+    /// The parameters of the output gamut compression.
+    ///
+    /// When `nil`, the compression is derived from ``outputGamutCompress``
+    /// with the upstream default parameters.
+    public var outputGamutCompressSpec: OutputGamutCompressSpec?
     /// The black and white reference of the print.
     public var colorReference: ColorReference
 
@@ -182,12 +187,24 @@ public struct ScannerInputs: Equatable, Sendable {
         xyzToRGB: [[Double]],
         srgbToSRGB: [[Double]],
         outputGamutCompress: String = "off",
+        outputGamutCompressSpec: OutputGamutCompressSpec? = nil,
         colorReference: ColorReference = ColorReference()
     ) {
         self.xyzToRGB = xyzToRGB
         self.srgbToSRGB = srgbToSRGB
         self.outputGamutCompress = outputGamutCompress
+        self.outputGamutCompressSpec = outputGamutCompressSpec
         self.colorReference = colorReference
+    }
+
+    /// The output gamut compression to apply.
+    public var resolvedOutputGamutCompress: OutputGamutCompressSpec? {
+        if let outputGamutCompressSpec { return outputGamutCompressSpec }
+        switch outputGamutCompress {
+        case "off": return nil
+        case "cam16ucs": return OutputGamutCompressSpec(algorithm: "cam16ucs")
+        default: return nil
+        }
     }
 }
 
@@ -307,8 +324,11 @@ public struct Slice1Pipeline {
         guard inputs.scanner.xyzToRGB.count == 3, inputs.scanner.srgbToSRGB.count == 3 else {
             throw PipelineError.invalidInputs("the colour matrices must be 3x3")
         }
-        guard inputs.scanner.outputGamutCompress == "off" else {
-            // The output gamut compression is not part of slice 1.
+        guard inputs.scanner.outputGamutCompress == "off"
+            || inputs.scanner.outputGamutCompress == "cam16ucs"
+        else {
+            // Only the "off" and the "cam16ucs" output gamut compressions
+            // are ported.
             throw PipelineError.invalidInputs(
                 "the output gamut compression '\(inputs.scanner.outputGamutCompress)' is not ported yet"
             )
@@ -520,7 +540,8 @@ public struct Slice1Pipeline {
             colourMatchingFunctions: inputs.spectral.colourMatchingFunctions,
             xyzToRGB: inputs.scanner.xyzToRGB,
             srgbToSRGB: inputs.scanner.srgbToSRGB,
-            colorReference: colorReference
+            colorReference: colorReference,
+            outputGamutCompress: inputs.scanner.resolvedOutputGamutCompress
         )
         return RGBImage(width: cmyPrint.width, height: cmyPrint.height, data: rgb)
     }

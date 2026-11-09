@@ -92,6 +92,46 @@ public enum Colour {
         return 1.055 * pow(value, 1.0 / 2.4) - 0.055
     }
 
+    // MARK: - ProPhoto RGB
+
+    /// The ProPhoto RGB electro-optical transfer function.
+    ///
+    /// Upstream reference: `colour.models.cctf_decoding_ProPhotoRGB`
+    /// (the ROMM RGB transfer function).
+    ///
+    /// ```
+    /// linear = value / 16          for value < 16 · E_t
+    /// linear = value ** 1.8        otherwise
+    /// ```
+    ///
+    /// with `E_t = 16 ** (1.8 / (1 - 1.8))`.
+    public static func proPhotoDecode(_ value: Double) -> Double {
+        let threshold = 16 * pow(16.0, 1.8 / (1.0 - 1.8))
+        if value < threshold {
+            return value / 16.0
+        }
+        // `spow` keeps the sign of negative values.
+        let magnitude = pow(abs(value), 1.8)
+        return value < 0 ? -magnitude : magnitude
+    }
+
+    /// The inverse electro-optical transfer function of ProPhoto RGB.
+    ///
+    /// Upstream reference: `colour.models.cctf_encoding_ProPhotoRGB`.
+    ///
+    /// ```
+    /// encoded = value · 16          for value < E_t
+    /// encoded = value ** (1 / 1.8)  otherwise
+    /// ```
+    public static func proPhotoEncode(_ value: Double) -> Double {
+        let threshold = pow(16.0, 1.8 / (1.0 - 1.8))
+        if value < threshold {
+            return value * 16.0
+        }
+        let magnitude = pow(abs(value), 1.0 / 1.8)
+        return value < 0 ? -magnitude : magnitude
+    }
+
     /// Converts an encoded sRGB triplet into CIELAB (D65).
     ///
     /// - Parameter rgb: the encoded sRGB values (R, G, B).

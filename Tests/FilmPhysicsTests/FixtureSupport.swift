@@ -92,6 +92,12 @@ enum JSONValue {
         return values
     }
 
+    /// The value as an array of JSON values.
+    var arrayElements: [JSONValue]? {
+        guard case let .array(array) = self else { return nil }
+        return array
+    }
+
     /// The value as a nested array of numbers.
     var doubleRows: [[Double]]? {        guard case let .array(array) = self else { return nil }
         var rows: [[Double]] = []

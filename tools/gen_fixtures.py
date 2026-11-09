@@ -70,7 +70,7 @@ from spektrafilm.profiles.io import load_profile  # noqa: E402
 from spektrafilm.runtime.params_builder import digest_params, init_params  # noqa: E402
 from spektrafilm.runtime.pipeline import SimulationPipeline  # noqa: E402
 from spektrafilm.utils.conversions import density_to_light  # noqa: E402
-from spektrafilm.utils.gamut_compression import OutputGamutCompressSpec  # noqa: E402
+from spektrafilm.utils.gamut_compression import OutputGamutCompressSpec, compress_rgb  # noqa: E402
 from spektrafilm.utils.morph_curves import (  # noqa: E402
     _evaluate_fitted_density,
 )
@@ -305,8 +305,13 @@ def _exposure_factor(sensitivity, print_illuminant, density_spectral_midgray):
 # --------------------------------------------------------------------------
 
 
-def _base_params():
-    """init_params() with every spatial / stochastic effect disabled."""
+def _base_params(output_gamut_compress: str = "off"):
+    """init_params() with every spatial / stochastic effect disabled.
+
+    ``output_gamut_compress`` selects the output gamut compression: the
+    slice 1 fixtures use the diagnostic ``"off"`` build, the slice 2 fixtures
+    use the upstream default (``"cam16ucs"``).
+    """
     params = init_params(film_profile=FILM_PROFILE, print_profile=PRINT_PROFILE)
 
     # --- camera ---------------------------------------------------------
@@ -347,7 +352,9 @@ def _base_params():
     params.io.upscale_factor = 1.0
     # input gamut compression stays at the upstream default
     # (active=True, algorithm="xy", knee=(0.0, 1.0, 6.0)).
-    params.io.output_gamut_compress = OutputGamutCompressSpec(algorithm="off")
+    params.io.output_gamut_compress = OutputGamutCompressSpec(
+        algorithm=output_gamut_compress
+    )
 
     # --- debug / settings ----------------------------------------------
     params.debug.deactivate_spatial_effects = False
@@ -813,6 +820,328 @@ def build_common(tc_lut: np.ndarray, image: np.ndarray) -> dict:
 
 
 # --------------------------------------------------------------------------
+# slice 2: the whole pipeline, from rgb_in
+# --------------------------------------------------------------------------
+
+
+def build_srgb_test_image() -> np.ndarray:
+    """The test image encoded in sRGB (the realistic phone photo path).
+
+    The linear test image is clipped to [0, 1] (a camera never records
+    negative light) and encoded with the sRGB inverse EOTF.
+    """
+    linear = np.clip(build_test_image(), 0.0, 1.0)
+    return np.where(
+        linear <= 0.0031308,
+        linear * 12.92,
+        1.055 * np.power(linear, 1.0 / 2.4) - 0.055,
+    )
+
+
+#: The linear sRGB samples used to reference the CAM16-UCS forward model and
+#: the output gamut compressor.
+CAM16UCS_SAMPLES = [
+    [0.0, 0.0, 0.0],
+    [1.0, 1.0, 1.0],
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.5, 0.5, 0.5],
+    [0.184, 0.184, 0.184],
+    [1.0, 0.5, 0.0],
+    [0.2, 0.4, 0.9],
+    [1.4, -0.2, 0.3],
+    [-0.1, 1.2, 0.4],
+    [0.9, 0.9, 1.3],
+]
+
+
+SLICE2_CASES = (
+    {
+        "name": "defaults",
+        "title": "Upstream defaults, end to end from rgb_in",
+        "description": (
+            "Kodak Portra 400 -> Kodak Portra Endura with the upstream "
+            "defaults: every spatial and stochastic effect is switched off, "
+            "the input gamut compression is the upstream default (xy, knee "
+            "(0, 1, 6)), the output gamut compression is the upstream "
+            "default (cam16ucs) and the scanner corrections are off."
+        ),
+        "input": "linear_prophoto",
+        "output_gamut_compress": "cam16ucs",
+        "apply": lambda p: None,
+    },
+    {
+        "name": "srgb_input",
+        "title": "An sRGB encoded phone photo (CCTF decoding)",
+        "description": (
+            "Same as 'defaults' but the input is an sRGB encoded image and "
+            "io.input_color_space is 'sRGB' with io.input_cctf_decoding = True, "
+            "i.e. the realistic path of a phone photo."
+        ),
+        "input": "srgb_encoded",
+        "output_gamut_compress": "cam16ucs",
+        "apply": lambda p: (
+            setattr(p.io, "input_color_space", "sRGB"),
+            setattr(p.io, "input_cctf_decoding", True),
+        ),
+    },
+    {
+        "name": "camera_ev_minus1",
+        "title": "Camera exposure compensation -1 EV",
+        "description": (
+            "Same as 'defaults' but with camera.exposure_compensation_ev = -1.0. "
+            "The negative receives one stop less light; the enlarger "
+            "re-normalises the print exposure against the compensated "
+            "mid-grey reference (enlarger.print_exposure_compensation is on)."
+        ),
+        "input": "linear_prophoto",
+        "output_gamut_compress": "cam16ucs",
+        "apply": lambda p: setattr(p.camera, "exposure_compensation_ev", -1.0),
+    },
+    {
+        "name": "output_gamut_off",
+        "title": "Output gamut compression off",
+        "description": (
+            "Same as 'defaults' but with io.output_gamut_compress.algorithm = "
+            "'off', which isolates the CAM16-UCS output compressor."
+        ),
+        "input": "linear_prophoto",
+        "output_gamut_compress": "off",
+        "apply": lambda p: None,
+    },
+)
+
+
+def run_slice2_case(case, images):
+    """Digest the params, run the whole pipeline and collect every tap."""
+    params = _base_params(output_gamut_compress=case["output_gamut_compress"])
+    case["apply"](params)
+    params = digest_params(params)
+
+    image = images[case["input"]]
+    pipeline = SimulationPipeline(params)
+
+    taps = {}
+    for tap in TAPS:
+        value = pipeline.process(image, inject="rgb_in", collect=tap)
+        taps[tap] = np.asarray(value, dtype=np.float64)
+
+    enlarger_service = pipeline._enlarger_service
+    color_reference = pipeline._color_reference_service
+
+    light_source = standard_illuminant(pipeline.enlarger.illuminant)
+    print_illuminant = np.asarray(enlarger_service.enlarger_filtered_illuminant(light_source))
+    print_sensitivity = 10 ** np.asarray(pipeline.print.data.log_sensitivity)
+    density_spectral_midgray = np.asarray(enlarger_service.density_spectral_midgray)
+    density_spectral_midgray_comp = enlarger_service.density_spectral_midgray_comp
+    if density_spectral_midgray_comp is not None:
+        density_spectral_midgray_comp = np.asarray(density_spectral_midgray_comp)
+
+    factor_midgray = _exposure_factor(
+        print_sensitivity, print_illuminant, density_spectral_midgray
+    )
+    if density_spectral_midgray_comp is not None:
+        factor_midgray_comp = _exposure_factor(
+            print_sensitivity, print_illuminant, density_spectral_midgray_comp
+        )
+    else:
+        factor_midgray_comp = 1.0
+    if (
+        pipeline.enlarger.print_exposure_compensation
+        and not pipeline.enlarger.normalize_print_exposure
+    ):
+        factor_used = factor_midgray_comp / factor_midgray
+    elif pipeline.enlarger.normalize_print_exposure and pipeline.enlarger.print_exposure_compensation:
+        factor_used = factor_midgray_comp
+    elif pipeline.enlarger.normalize_print_exposure and not pipeline.enlarger.print_exposure_compensation:
+        factor_used = factor_midgray
+    else:
+        factor_used = 1.0
+
+    derived = {
+        "neutral_filters_cc": {
+            "c": float(pipeline.enlarger.c_filter_neutral),
+            "m": float(pipeline.enlarger.m_filter_neutral),
+            "y": float(pipeline.enlarger.y_filter_neutral),
+        },
+        "enlarger": {
+            "illuminant": pipeline.enlarger.illuminant,
+            "light_source_spectrum": np.asarray(light_source),
+            "filtered_illuminant_spectrum": print_illuminant,
+            "print_sensitivity": print_sensitivity,
+            "print_exposure": float(pipeline.enlarger.print_exposure),
+            "exposure_factor_midgray": np.ravel(factor_midgray),
+            "exposure_factor_midgray_comp": np.ravel(factor_midgray_comp),
+            "exposure_factor_used": np.ravel(factor_used),
+        },
+        "print_balance": {
+            "density_spectral_midgray": np.ravel(density_spectral_midgray),
+            "density_spectral_midgray_comp": (
+                None
+                if density_spectral_midgray_comp is None
+                else np.ravel(density_spectral_midgray_comp)
+            ),
+        },
+        "print_black_white_reference": {
+            "log_raw_print_black": np.ravel(color_reference.log_raw_print_black),
+            "log_raw_print_white": np.ravel(color_reference.log_raw_print_white),
+        },
+        "camera_exposure_scale": float(2 ** pipeline.camera.exposure_compensation_ev),
+    }
+
+    return {
+        "case": case["name"],
+        "title": case["title"],
+        "description": case["description"],
+        "film_profile": FILM_PROFILE,
+        "print_profile": PRINT_PROFILE,
+        "input": case["input"],
+        "params": params_to_json(params),
+        "taps": {tap: taps[tap] for tap in TAPS},
+        "derived": derived,
+    }
+
+
+def build_slice2_common(images) -> dict:
+    """The data shared by the slice 2 cases."""
+    film = load_profile(FILM_PROFILE)
+    print_profile = load_profile(PRINT_PROFILE)
+
+    reference_illuminant = film.info.reference_illuminant
+    reference_illuminant_xy = _illuminant_to_xy(reference_illuminant)
+    scan_illuminant_label = print_profile.info.viewing_illuminant
+    scan_illuminant = np.asarray(standard_illuminant(scan_illuminant_label))
+    normalization = float(np.sum(scan_illuminant * STANDARD_OBSERVER_CMFS[:, 1], axis=0))
+    illuminant_xyz = contract("k,kl->l", scan_illuminant, STANDARD_OBSERVER_CMFS[:]) / normalization
+    scan_illuminant_xy = colour.XYZ_to_xy(illuminant_xyz)
+
+    srgb = colour.RGB_COLOURSPACES["sRGB"]
+    white = np.asarray(srgb.whitepoint, dtype=float)
+    xyz_w = np.asarray([white[0] / white[1], 1.0, (1.0 - white[0] - white[1]) / white[1]])
+
+    # The CAM16-UCS forward model and the output gamut compressor, on a set
+    # of linear sRGB samples.
+    cam16_samples = []
+    for rgb in CAM16UCS_SAMPLES:
+        xyz = np.asarray(
+            colour.RGB_to_XYZ(
+                np.array(rgb),
+                colourspace="sRGB",
+                apply_cctf_decoding=False,
+                illuminant=white,
+            )
+        )
+        jab = np.asarray(
+            colour.XYZ_to_CAM16UCS(xyz, XYZ_w=xyz_w, L_A=64.0, Y_b=20.0)
+        )
+        compressed = np.asarray(
+            compress_rgb(
+                np.array(rgb),
+                OutputGamutCompressSpec(algorithm="cam16ucs"),
+                output_color_space="sRGB",
+            )
+        )
+        cam16_samples.append(
+            {
+                "rgb": list(rgb),
+                "xyz": list(xyz),
+                "jpab": list(jab),
+                "compressed": list(compressed),
+            }
+        )
+
+    common = {
+        "format": "lightsuffer-ios slice2 common fixture v1",
+        "generated_by": "tools/gen_fixtures.py",
+        "upstream": {
+            "project": UPSTREAM_PROJECT,
+            "url": UPSTREAM_URL,
+            "commit": UPSTREAM_COMMIT,
+            "license": "GPL-3.0-or-later (code) / CC BY-SA 4.0 (profile data)",
+        },
+        "notes": {
+            "float_format": "all floating point values are rounded to 7 significant digits",
+            "tc_lut": (
+                "the hanatos2025 tc LUT of the film is the same as the one of "
+                "slice1_common.json (it only depends on the film sensitivity, "
+                "the hanatos2025 adaptation and the input gamut compression)"
+            ),
+        },
+        "spectral": {
+            "wavelengths": np.asarray(film.data.wavelengths),
+            "cmfs_cie1931_2deg": np.asarray(STANDARD_OBSERVER_CMFS[:], dtype=np.float64),
+        },
+        "illuminants": {
+            "TH-KG3": np.asarray(standard_illuminant("TH-KG3")),
+            "D55": np.asarray(standard_illuminant("D55")),
+            "D50": np.asarray(standard_illuminant("D50")),
+            "D65": np.asarray(standard_illuminant("D65")),
+            "scan_illuminant_label": scan_illuminant_label,
+            "scan_illuminant_spectrum": scan_illuminant,
+            "scan_normalization": normalization,
+            "scan_illuminant_xyz": illuminant_xyz,
+            "scan_illuminant_xy": scan_illuminant_xy,
+        },
+        "color": {
+            "reference_illuminant": reference_illuminant,
+            "reference_illuminant_xy": reference_illuminant_xy,
+            "filming_prophoto_rgb_to_xyz": _filming_rgb_to_xyz_matrix(
+                reference_illuminant_xy
+            ),
+            "filming_srgb_rgb_to_xyz": np.asarray(
+                colour.RGB_to_XYZ(
+                    np.eye(3),
+                    colourspace="sRGB",
+                    apply_cctf_decoding=False,
+                    illuminant=reference_illuminant_xy,
+                    chromatic_adaptation_transform="CAT16",
+                )
+            ).T,
+            "scanning_xyz_to_rgb": _scanning_xyz_to_rgb_matrix(scan_illuminant_xy),
+            "srgb_to_srgb_matrix": np.asarray(
+                colour.models.matrix_RGB_to_RGB(srgb, srgb)
+            ),
+            "srgb_whitepoint_xy": np.asarray(srgb.whitepoint)[0:2],
+            "prophoto_whitepoint_xy": np.asarray(
+                colour.RGB_COLOURSPACES["ProPhoto RGB"].whitepoint
+            )[0:2],
+            "srgb_xyz_to_rgb_matrix": np.asarray(srgb.matrix_XYZ_to_RGB),
+            "prophoto_rgb_to_xyz_matrix": np.asarray(
+                colour.RGB_COLOURSPACES["ProPhoto RGB"].matrix_RGB_to_XYZ
+            ),
+            "matrix_note": (
+                "the matrices are stored with the RGB response of every XYZ "
+                "basis vector in their rows (the layout colour.XYZ_to_RGB "
+                "returns for an identity input), i.e. rgb = xyz · matrix"
+            ),
+        },
+        "cam16ucs": {
+            "viewing_conditions": {"L_A": 64.0, "Y_b": 20.0},
+            "xyz_w": xyz_w,
+            "samples": cam16_samples,
+        },
+        "input_images": {
+            "linear_prophoto": {
+                "size": [IMAGE_SIZE, IMAGE_SIZE, 3],
+                "color_space": "linear ProPhoto RGB",
+                "data": images["linear_prophoto"],
+            },
+            "srgb_encoded": {
+                "size": [IMAGE_SIZE, IMAGE_SIZE, 3],
+                "color_space": "sRGB (encoded)",
+                "data": images["srgb_encoded"],
+            },
+        },
+        "enlarger": {
+            "illuminant": "TH-KG3",
+            "dichroic_filter_transmittance_cmy": np.asarray(custom_dichroic_filters.filters),
+        },
+    }
+    return jsonable(common)
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -858,6 +1187,30 @@ def main(argv=None) -> int:
     written.append(common_path)
     print(
         f"  {'common':<34} {os.path.getsize(common_path) / 1024:8.1f} KiB"
+    )
+
+    # --- slice 2: the whole pipeline, from rgb_in ----------------------
+    images = {
+        "linear_prophoto": image,
+        "srgb_encoded": build_srgb_test_image(),
+    }
+    for case in SLICE2_CASES:
+        case_start = time.time()
+        payload = run_slice2_case(case, images)
+        path = os.path.join(out_dir, f"slice2_{case['name']}.json")
+        _write_json(path, jsonable(payload))
+        written.append(path)
+        print(
+            f"  slice2 {case['name']:<28} {os.path.getsize(path) / 1024:8.1f} KiB  "
+            f"({time.time() - case_start:5.1f} s)"
+        )
+
+    slice2_common = build_slice2_common(images)
+    slice2_common_path = os.path.join(out_dir, "slice2_common.json")
+    _write_json(slice2_common_path, slice2_common)
+    written.append(slice2_common_path)
+    print(
+        f"  slice2 {'common':<28} {os.path.getsize(slice2_common_path) / 1024:8.1f} KiB"
     )
 
     total = sum(os.path.getsize(p) for p in written)

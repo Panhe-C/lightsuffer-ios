@@ -232,6 +232,16 @@ public struct ProfileData: Codable, Equatable, Sendable {
     public var wavelengths: [Double]
     /// The base-10 logarithm of the spectral sensitivity, `[wavelength][channel]`.
     public var logSensitivity: [[Double]]
+    /// The parameters of the hanatos 2025 band pass window.
+    ///
+    /// Upstream reference:
+    /// `spektrafilm.profiles.io.ProfileData.hanatos2025_adaptation_window_params`.
+    public var hanatos2025AdaptationWindowParams: [Double]
+    /// The parameters of the hanatos 2025 log exposure correction surface.
+    ///
+    /// Upstream reference:
+    /// `spektrafilm.profiles.io.ProfileData.hanatos2025_adaptation_surface_params`.
+    public var hanatos2025AdaptationSurfaceParams: [[Double]]
     /// The spectral density of the image forming layer, `[wavelength][channel]`.
     public var channelDensity: [[Double]]
     /// The base (fog) density of the emulsion, `[wavelength]`.
@@ -250,6 +260,8 @@ public struct ProfileData: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case wavelengths
         case logSensitivity = "log_sensitivity"
+        case hanatos2025AdaptationWindowParams = "hanatos2025_adaptation_window_params"
+        case hanatos2025AdaptationSurfaceParams = "hanatos2025_adaptation_surface_params"
         case channelDensity = "channel_density"
         case baseDensity = "base_density"
         case midscaleNeutralDensity = "midscale_neutral_density"
@@ -262,6 +274,8 @@ public struct ProfileData: Codable, Equatable, Sendable {
     public init(
         wavelengths: [Double] = [],
         logSensitivity: [[Double]] = [],
+        hanatos2025AdaptationWindowParams: [Double] = [],
+        hanatos2025AdaptationSurfaceParams: [[Double]] = [],
         channelDensity: [[Double]] = [],
         baseDensity: [Double] = [],
         midscaleNeutralDensity: [Double] = [],
@@ -272,6 +286,8 @@ public struct ProfileData: Codable, Equatable, Sendable {
     ) {
         self.wavelengths = wavelengths
         self.logSensitivity = logSensitivity
+        self.hanatos2025AdaptationWindowParams = hanatos2025AdaptationWindowParams
+        self.hanatos2025AdaptationSurfaceParams = hanatos2025AdaptationSurfaceParams
         self.channelDensity = channelDensity
         self.baseDensity = baseDensity
         self.midscaleNeutralDensity = midscaleNeutralDensity
@@ -285,6 +301,12 @@ public struct ProfileData: Codable, Equatable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         wavelengths = try container.decodeNaNAwareDoubles(forKey: .wavelengths)
         logSensitivity = try container.decodeNaNAwareDoubleRows(forKey: .logSensitivity)
+        hanatos2025AdaptationWindowParams = try container.decodeNaNAwareDoubles(
+            forKey: .hanatos2025AdaptationWindowParams
+        )
+        hanatos2025AdaptationSurfaceParams = try container.decodeNaNAwareDoubleRows(
+            forKey: .hanatos2025AdaptationSurfaceParams
+        )
         channelDensity = try container.decodeNaNAwareDoubleRows(forKey: .channelDensity)
         baseDensity = try container.decodeNaNAwareDoubles(forKey: .baseDensity)
         midscaleNeutralDensity = try container.decodeNaNAwareDoubles(forKey: .midscaleNeutralDensity)
@@ -326,6 +348,17 @@ public struct Profile: Codable, Equatable, Sendable {
 
     /// `true` when the profile describes a film.
     public var isFilm: Bool { info.support == .film }
+
+    /// The hanatos 2025 sensitivity adaptation of the profile.
+    ///
+    /// Upstream reference: `spektrafilm.profiles.io.Profile.hanatos2025_adaptation`.
+    public func hanatos2025Adaptation() -> Hanatos2025Adaptation {
+        Hanatos2025Adaptation(
+            windowParams: data.hanatos2025AdaptationWindowParams,
+            surfaceParams: data.hanatos2025AdaptationSurfaceParams,
+            referenceIlluminant: info.referenceIlluminant
+        )
+    }
 }
 
 // MARK: - Loading

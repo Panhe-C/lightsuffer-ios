@@ -22,7 +22,10 @@ let package = Package(
         .target(
             name: "FilmPhysics",
             resources: [
-                .copy("Resources/profiles")
+                .copy("Resources/profiles"),
+                .copy("Resources/spectral"),
+                .copy("Resources/filters"),
+                .copy("Resources/CHANGELOG.txt"),
             ]
         ),
         .testTarget(

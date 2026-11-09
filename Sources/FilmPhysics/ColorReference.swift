@@ -119,8 +119,7 @@ public struct ColorReference: Equatable, Sendable {
     ///
     /// - Parameter printProfile: the profile of the paper.
     /// - Returns: the exposure correction factor (1.0 when the correction is off).
-    public func printingExposureCorrection(printProfile: Profile) -> Double {
-        guard !isIdentity else { return 1.0 }
+    public func printingExposureCorrection(printProfile: Profile) -> Double {        guard !isIdentity else { return 1.0 }
         guard printProfile.info.type == .negative else { return 1.0 }
         guard let correction = correctionFunction() else { return 1.0 }
         let midgray = -log10(0.184)
@@ -146,6 +145,57 @@ public struct ColorReference: Equatable, Sendable {
             values: logExposure
         )
         return pow(10.0, logExposureMidgrayCorrected - logExposureMidgray)
+    }
+
+    /// The correction of the exposure of the camera.
+    ///
+    /// Upstream reference:
+    /// `ColorReferenceService.black_white_filming_exposure_correction`.
+    ///
+    /// The correction is only active for a positive film that is scanned
+    /// directly; a negative (the print and scan path) is never corrected.
+    ///
+    /// - Parameters:
+    ///   - film: the profile of the film.
+    ///   - print: the profile of the paper.
+    ///   - scanFilm: whether the film is scanned directly.
+    /// - Returns: the exposure correction factor (1.0 when the correction is off).
+    public func filmingExposureCorrection(
+        film: Profile,
+        print: Profile,
+        scanFilm: Bool
+    ) -> Double {
+        guard !isIdentity else { return 1.0 }
+        guard film.info.type != .negative else { return 1.0 }
+        guard scanFilm, film.info.type == .positive else { return 1.0 }
+        guard let correction = correctionFunction() else { return 1.0 }
+
+        let midgray = -log10(0.184)
+        let midgrayCorrected = (0.184 - correction.offset) / correction.slope
+        let densityMidgrayCorrected = -log10(midgrayCorrected)
+
+        var densityCurveAverage = [Double](repeating: 0, count: film.data.densityCurves.count)
+        for sample in film.data.densityCurves.indices {
+            densityCurveAverage[sample] = Numerics.nanMean(film.data.densityCurves[sample])
+        }
+        let densityMinAverage = Numerics.nanMean(film.data.baseDensity)
+        let logExposure = film.data.logExposure
+
+        // The upstream interpolates on the *mirrored* density curve.
+        let mirroredCurve = densityCurveAverage.map { -$0 }
+        let mirroredAxis = logExposure
+        let logExposureMidgrayCorrected = Numerics.interpolate(
+            x: -(densityMidgrayCorrected - densityMinAverage),
+            axis: mirroredCurve,
+            values: mirroredAxis
+        )
+        let logExposureMidgray = Numerics.interpolate(
+            x: -(midgray - densityMinAverage),
+            axis: mirroredCurve,
+            values: mirroredAxis
+        )
+        let exposureCorrection = pow(10.0, logExposureMidgrayCorrected - logExposureMidgray)
+        return 1.0 / exposureCorrection
     }
 
     /// The correction of the scanned tristimulus values.
