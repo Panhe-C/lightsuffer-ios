@@ -15,7 +15,7 @@ back — not a set of baked LUTs.
 
 | Phase | Scope | State |
 |---|---|---|
-| P1 | `FilmPhysics`: pure-Swift port of the spektrafilm pipeline (CPU reference), validated tap by tap against the Python engine | **in progress** (scaffold + reference fixtures done) |
+| P1 | `FilmPhysics`: pure-Swift port of the spektrafilm pipeline (CPU reference), validated tap by tap against the Python engine | **in progress** (slice 1 ported: profile loading, negative development with DIR couplers, enlarger printing, print development, scanning — parity with the Python engine, mean ΔE2000 ≈ 0.0025) |
 | P2 | Spatial effects (halation, grain, DIR-coupler diffusion, diffusion filters, glare, blur, unsharp) | not started |
 | P3 | Metal port of the engine, parity-tested against the CPU reference | not started |
 | P4 | SwiftUI app shell (photo/RAW input, all parameters, export, borders) | not started |
@@ -35,16 +35,33 @@ box), on macOS and on iOS.
 Package.swift                     SwiftPM manifest (iOS 17 / macOS 14, Linux friendly)
 Sources/FilmPhysics/              pure-Swift physical engine (CPU reference)
   FilmPhysics.swift               version + bundled-resource accessors
+  Profile.swift                   profile model + loader (spektrafilm.profiles.io)
+  Digest.swift                    the digest of the runtime parameters (params_builder)
+  Numerics.swift                  interpolation, geometric mean, normal CDF
+  DensityCurves.swift             density curves, the fitted CDF model
+  Couplers.swift                  the DIR coupler chemistry
+  Spectral.swift                  spectral density and light transmittance
+  Enlarger.swift                  the filtered illuminant, the exposure factor
+  Printing.swift                  the printing stage
+  Scanning.swift                  the scanning stage
+  ColorReference.swift            the black / white reference of the print
+  Colour.swift                    sRGB, CIELAB, CIEDE2000
+  Pipeline.swift                  the public entry point (Slice1Pipeline)
   Resources/profiles/             spektrafilm profile JSON (unmodified copies)
     kodak_portra_400.json         film    — CC BY-SA 4.0
     kodak_portra_endura.json       print   — CC BY-SA 4.0
     CHANGELOG.txt                 provenance of the copied profiles
 Tests/FilmPhysicsTests/           Swift test target
   Fixtures/                       reference fixtures generated from upstream Python
+  Slice1ParityTests.swift         tap by tap parity with the Python engine
+  ProfileLoaderTests.swift        the loaded profile vs. the digested fixture data
+  ColourTests.swift               sRGB / CIELAB / CIEDE2000 (Sharma test data)
+  NumericsTests.swift             the numeric helpers
 tools/
   gen_fixtures.py                 regenerates the reference fixtures
   README.md                       how to regenerate them
 docs/PLAN.md                      project plan and decisions
+docs/PORTING.md                   upstream → Swift mapping, TODO list, measured errors
 LICENSE                           GPL-3.0-or-later (this repository)
 SPEKTRAFILM_LICENSE.txt           CC BY-SA 4.0 for the upstream spektrafilm data
 NOTICE                            attribution
@@ -59,9 +76,24 @@ swift build        # build the FilmPhysics library
 swift test         # run the FilmPhysics test target
 ```
 
-The test target checks the package scaffold, the bundled profiles and the
-presence/shape of the reference fixtures. The numerical parity tests
-(Swift pipeline vs. the Python reference) are added as the port progresses.
+The test target checks the package scaffold and the bundled profiles, and
+validates the ported slice 1 against the reference fixtures:
+
+* `Slice1ParityTests` — the Swift pipeline is fed with the `log_e_film` tap
+  captured from the upstream Python engine and every downstream tap
+  (`cmy_film`, `log_e_print`, `cmy_print`, `rgb_out`) is compared with the
+  reference. Measured: max abs error ≈ 1e-6 on the density taps and a mean
+  ΔE2000 of ≈ 0.0025 on the scanned image (gate: < 0.5).
+* `ProfileLoaderTests` — the loaded profile data vs. the digested fixture
+  data (max relative difference ≤ 1e-6).
+* `ColourTests` — the sRGB transfer function, the CIELAB conversion and the
+  CIEDE2000 formula against the published Sharma et al. test pairs.
+* `NumericsTests` — the interpolation semantics, the geometric mean and the
+  normal distribution function.
+
+See [`docs/PORTING.md`](docs/PORTING.md) for the upstream → Swift mapping,
+the list of values that are still taken from the fixtures and the measured
+error numbers.
 
 > **Linux note.** The Swift toolchain on the development box needs
 > `libncurses.so.6`. If `swift test` fails with
