@@ -1,0 +1,36 @@
+spektrafilm profile data — CHANGELOG
+====================================
+
+The JSON files in this directory are UNMODIFIED copies of the profile data
+bundled with the upstream project "spektrafilm":
+
+    kodak_portra_400.json    (film, Kodak Portra 400)
+    kodak_portra_endura.json  (print, Kodak Portra Endura)
+
+Source
+------
+    https://github.com/andreavolpato/spektrafilm
+    commit 3bb2c2d
+    path: src/spektrafilm/data/profiles/
+
+Copied verbatim (byte for byte) on 2026-11-09. No value, key, order or
+number formatting was changed.
+
+Licence
+-------
+    The spektrafilm profile data is licensed under the Creative Commons
+    Attribution-ShareAlike 4.0 International licence (CC BY-SA 4.0).
+
+    Copyright (c) 2026 Andrea Volpato.
+
+    The full licence text and the attribution requirements are shipped in
+    SPEKTRAFILM_LICENSE.txt at the root of this repository.
+
+    Redistribution and derivatives must credit the author, link the project
+    (https://github.com/andreavolpato/spektrafilm), preserve the licence and
+    remain CC BY-SA 4.0. Modifications must be noted — this file is that
+    note: so far the profiles are unmodified copies.
+
+Credits
+-------
+    film modeling powered by spektrafilm

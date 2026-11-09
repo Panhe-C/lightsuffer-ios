@@ -1,0 +1,54 @@
+light suffer胶片 — iOS 版
+NOTICE
+======
+
+This product is a Swift port of the physical film-simulation engine of the
+project "spektrafilm".
+
+--------------------------------------------------------------------------
+spektrafilm — physics engine
+--------------------------------------------------------------------------
+
+    Copyright (c) Andrea Volpato
+    https://github.com/andreavolpato/spektrafilm
+
+    The physical engine of this app (Sources/FilmPhysics) is a port of the
+    code of "spektrafilm", which is licensed under the GNU General Public
+    License, version 3 (GPLv3). As a derivative work, this repository is
+    distributed under the same licence; the full text is in LICENSE at the
+    root of this repository.
+
+    Upstream commit used as the reference for the port and for the reference
+    fixtures: 3bb2c2d
+
+    Upstream citation:
+    https://github.com/andreavolpato/spektrafilm
+
+    If you use this engine in your work, please cite the spektrafilm
+    project; see CITATION.cff in the upstream repository.
+
+--------------------------------------------------------------------------
+spektrafilm — profile data (and derivatives)
+--------------------------------------------------------------------------
+
+    Copyright (c) 2026 Andrea Volpato
+    Licensed under the Creative Commons Attribution-ShareAlike 4.0
+    International licence (CC BY-SA 4.0).
+
+    The film and print profile JSON files in
+    Sources/FilmPhysics/Resources/profiles/ are unmodified copies of the
+    profile data bundled with spektrafilm (commit 3bb2c2d). Every derivative
+    of that data (for example the reference fixtures in
+    Tests/FilmPhysicsTests/Fixtures/) is covered by the same licence.
+
+    The full licence text and the attribution requirements are in
+    SPEKTRAFILM_LICENSE.txt at the root of this repository.
+
+    Redistribution and derivatives must credit the author, link the project
+    (https://github.com/andreavolpato/spektrafilm), preserve the licence and
+    remain CC BY-SA 4.0. Modifications must be noted; see
+    Sources/FilmPhysics/Resources/profiles/CHANGELOG.txt.
+
+--------------------------------------------------------------------------
+
+    film modeling powered by spektrafilm
