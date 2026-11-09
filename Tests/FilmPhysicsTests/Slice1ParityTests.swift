@@ -279,7 +279,8 @@ final class Slice1ParityTests: XCTestCase {
     }
 
     /// The exposure factor of the fixture is reproduced.
-    func testExposureFactorIsReproduced() throws {        for name in Self.cases {
+    func testExposureFactorIsReproduced() throws {
+        for name in Self.cases {
             let fixture = try JSONValue.load(named: "slice1_\(name)")
             let derived = try XCTUnwrap(fixture["derived"])
             let enlargerDerived = try XCTUnwrap(derived["enlarger"])

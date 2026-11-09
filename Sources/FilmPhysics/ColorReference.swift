@@ -119,7 +119,8 @@ public struct ColorReference: Equatable, Sendable {
     ///
     /// - Parameter printProfile: the profile of the paper.
     /// - Returns: the exposure correction factor (1.0 when the correction is off).
-    public func printingExposureCorrection(printProfile: Profile) -> Double {        guard !isIdentity else { return 1.0 }
+    public func printingExposureCorrection(printProfile: Profile) -> Double {
+        guard !isIdentity else { return 1.0 }
         guard printProfile.info.type == .negative else { return 1.0 }
         guard let correction = correctionFunction() else { return 1.0 }
         let midgray = -log10(0.184)

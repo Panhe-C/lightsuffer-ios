@@ -28,7 +28,7 @@ spektrafilm — physics engine
     project; see CITATION.cff in the upstream repository.
 
 --------------------------------------------------------------------------
-spektrafilm — profile data (and derivatives)
+spektrafilm — profile and spectral data (and derivatives)
 --------------------------------------------------------------------------
 
     Copyright (c) 2026 Andrea Volpato
@@ -37,9 +37,13 @@ spektrafilm — profile data (and derivatives)
 
     The film and print profile JSON files in
     Sources/FilmPhysics/Resources/profiles/ are unmodified copies of the
-    profile data bundled with spektrafilm (commit 3bb2c2d). Every derivative
-    of that data (for example the reference fixtures in
-    Tests/FilmPhysicsTests/Fixtures/) is covered by the same licence.
+    profile data bundled with spektrafilm (commit 3bb2c2d). The spectral
+    resources in Sources/FilmPhysics/Resources/spectral/ (the hanatos 2025
+    irradiance spectra, the CIE 1931 2° colour matching functions and the
+    standard illuminant spectra) and the neutral print filter database in
+    Sources/FilmPhysics/Resources/filters/ are packed from the same upstream
+    tree. Every derivative of that data (for example the reference fixtures
+    in Tests/FilmPhysicsTests/Fixtures/) is covered by the same licence.
 
     The full licence text and the attribution requirements are in
     SPEKTRAFILM_LICENSE.txt at the root of this repository.
@@ -47,7 +51,7 @@ spektrafilm — profile data (and derivatives)
     Redistribution and derivatives must credit the author, link the project
     (https://github.com/andreavolpato/spektrafilm), preserve the licence and
     remain CC BY-SA 4.0. Modifications must be noted; see
-    Sources/FilmPhysics/Resources/profiles/CHANGELOG.txt.
+    Sources/FilmPhysics/Resources/CHANGELOG.txt.
 
 --------------------------------------------------------------------------
 

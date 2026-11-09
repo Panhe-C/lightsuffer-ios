@@ -47,10 +47,58 @@ For every parameter case the script runs
 | `slice1_camera_ev_plus1.json` | case 2 |
 | `slice1_print_exposure_and_filter_shifts.json` | case 3 |
 | `slice1_dir_couplers_inactive.json` | case 4 |
+| `slice2_common.json` | everything the slice 2 cases share: the spectral sampling, the illuminants, the colour matrices, the CAM16-UCS samples, the two input images and the enlarger data |
+| `slice2_defaults.json` | slice 2 case 1 |
+| `slice2_srgb_input.json` | slice 2 case 2 |
+| `slice2_camera_ev_minus1.json` | slice 2 case 3 |
+| `slice2_output_gamut_off.json` | slice 2 case 4 |
 
-Total size is ≈ 1.0 MB.
+Total size is ≈ 1.2 MB (slice 1: ≈ 972 KiB, slice 2: ≈ 232 KiB).
 
-### Number format
+### The slice 2 fixtures
+
+The slice 2 fixtures run the **whole** upstream pipeline, injected at
+`rgb_in`, and store **every** tap — `log_e_film` included. They are the
+ground truth of the camera stage (the hanatos 2025 spectral upsampling), of
+the input / output colour space handling and of the output gamut
+compression.
+
+### The cases
+
+| Case | Input | Output gamut compression | What it exercises |
+|---|---|---|---|
+| `defaults` | `linear_prophoto` | `cam16ucs` | the upstream defaults, end to end |
+| `srgb_input` | `srgb_encoded` | `cam16ucs` | an sRGB encoded phone photo (`input_color_space = "sRGB"`, `input_cctf_decoding = True`) |
+| `camera_ev_minus1` | `linear_prophoto` | `cam16ucs` | `camera.exposure_compensation_ev = -1.0` (the enlarger re-normalises the print exposure) |
+| `output_gamut_off` | `linear_prophoto` | `off` | isolates the CAM16-UCS output compressor |
+
+Every other parameter is the base configuration above (all the spatial and
+stochastic effects off, the input gamut compression at the upstream default
+`xy`).
+
+### The shared file
+
+`slice2_common.json` carries:
+
+* `spectral` — the wavelengths and the CIE 1931 2° colour matching
+  functions;
+* `illuminants` — the TH-KG3, D55, D50 and D65 spectra, the scan illuminant
+  and its normalisation, and its chromaticity;
+* `color` — the reference illuminant chromaticity (D55), the ProPhoto RGB →
+  XYZ matrix of the filming stage, the XYZ → sRGB matrix of the scanning
+  stage and the sRGB → sRGB matrix of the output transfer function;
+* `cam16ucs` — the viewing conditions (`L_A`, `Y_b`), the white point and a
+  set of samples with their `Jpab` (the forward model) and their compressed
+  sRGB values (the output gamut compressor);
+* `input_images` — the two camera images (`linear_prophoto`, `srgb_encoded`);
+* `enlarger` — the illuminant of the enlarger and the transmittance of the
+  CMY dichroic filters.
+
+The hanatos 2025 tc LUT is the one of `slice1_common.json` (it only depends
+on the film sensitivity, the hanatos 2025 adaptation and the input gamut
+compression).
+
+## Number format
 
 * All floating point values are rounded to **7 significant digits**.
 * `NaN` is written as JSON `null`. Upstream

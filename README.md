@@ -15,7 +15,7 @@ back — not a set of baked LUTs.
 
 | Phase | Scope | State |
 |---|---|---|
-| P1 | `FilmPhysics`: pure-Swift port of the spektrafilm pipeline (CPU reference), validated tap by tap against the Python engine | **in progress** (slice 1 ported: profile loading, negative development with DIR couplers, enlarger printing, print development, scanning — parity with the Python engine, mean ΔE2000 ≈ 0.0025) |
+| P1 | `FilmPhysics`: pure-Swift port of the spektrafilm pipeline (CPU reference), validated tap by tap against the Python engine | **in progress** (slices 1 and 2 ported: profile loading, the hanatos 2025 spectral upsampling and the whole camera → print → scan chain, negative development with DIR couplers, enlarger printing, print development, scanning and the cam16ucs gamut compression — parity with the Python engine, mean ΔE2000 ≈ 0.0021) |
 | P2 | Spatial effects (halation, grain, DIR-coupler diffusion, diffusion filters, glare, blur, unsharp) | not started |
 | P3 | Metal port of the engine, parity-tested against the CPU reference | not started |
 | P4 | SwiftUI app shell (photo/RAW input, all parameters, export, borders) | not started |
@@ -45,14 +45,33 @@ Sources/FilmPhysics/              pure-Swift physical engine (CPU reference)
   Printing.swift                  the printing stage
   Scanning.swift                  the scanning stage
   ColorReference.swift            the black / white reference of the print
-  Colour.swift                    sRGB, CIELAB, CIEDE2000
-  Pipeline.swift                  the public entry point (Slice1Pipeline)
+  Colour.swift                    sRGB, ProPhoto RGB, CIELAB, CIEDE2000
+  ColourScience.swift             the colour-science primitives (CAT02/CAT16, RGB ↔ XYZ)
+  CAM16.swift                     the CAM16 / CAM16-UCS appearance model
+  SpectralUpsampling.swift        the hanatos 2025 spectral upsampling and its tc LUT
+  Filming.swift                   the filming stage (camera image → log exposure)
+  GamutCompression.swift          the input and the output gamut compression
+  Illuminants.swift               the illuminant spectra and their chromaticity
+  NeutralPrintFilters.swift       the neutral print filter database lookup
+  ColorFilters.swift              the CMY dichroic filters of the enlarger
+  Pipeline.swift                  the slice 1 entry point (Slice1Pipeline)
+  FilmPipeline.swift              the slice 2 entry point (FilmPipeline, rgb_in → rgb_out)
+  Resources.swift                 the bundled upstream resources (spectra, CMFs, filters)
   Resources/profiles/             spektrafilm profile JSON (unmodified copies)
     kodak_portra_400.json         film    — CC BY-SA 4.0
     kodak_portra_endura.json       print   — CC BY-SA 4.0
     CHANGELOG.txt                 provenance of the copied profiles
+  Resources/spectral/             the packed upstream spectral tables
+    irradiance_xy_tc.f16          the hanatos 2025 irradiance spectra (float16)
+    cmfs_cie1931_2deg.f32          the CIE 1931 2° colour matching functions
+    illuminants.f32                TH-KG3, D55, D50 and D65
+  Resources/filters/
+    neutral_print_filters.json    the neutral print filter database
+  Resources/CHANGELOG.txt         provenance of every bundled resource
 Tests/FilmPhysicsTests/           Swift test target
   Fixtures/                       reference fixtures generated from upstream Python
+  Slice2ParityTests.swift         whole pipeline parity (rgb_in → rgb_out) + the
+                                  tc LUT, the CAM16-UCS model, the gamut compressor
   Slice1ParityTests.swift         tap by tap parity with the Python engine
   ProfileLoaderTests.swift        the loaded profile vs. the digested fixture data
   ColourTests.swift               sRGB / CIELAB / CIEDE2000 (Sharma test data)
@@ -77,8 +96,16 @@ swift test         # run the FilmPhysics test target
 ```
 
 The test target checks the package scaffold and the bundled profiles, and
-validates the ported slice 1 against the reference fixtures:
+validates the ported slices against the reference fixtures:
 
+* `Slice2ParityTests` — the whole pipeline is fed with the **camera image**
+  captured from the upstream Python engine and every tap (`log_e_film`,
+  `cmy_film`, `log_e_print`, `cmy_print`, `rgb_out`) is compared with the
+  reference. Measured: max abs error ≤ 8.6e-07 on the density taps and a
+  mean ΔE2000 of ≈ 0.0021 on the scanned image (gate: < 0.5). The test also
+  checks the hanatos 2025 tc LUT (max relative error 2.4e-07), the CAM16-UCS
+  model (max abs error 2.5e-05, round trip 1.1e-15), the cam16ucs output
+  gamut compressor (max abs error 4.8e-08) and the colour matrices.
 * `Slice1ParityTests` — the Swift pipeline is fed with the `log_e_film` tap
   captured from the upstream Python engine and every downstream tap
   (`cmy_film`, `log_e_print`, `cmy_print`, `rgb_out`) is compared with the
@@ -116,6 +143,15 @@ the Swift port.
 /workspace/venv-sf/bin/python tools/gen_fixtures.py
 ```
 
+The upstream data tables the package bundles (the hanatos 2025 irradiance
+spectra, the CIE 1931 2° CMFs, the illuminant spectra and the neutral print
+filter database) are packed into the binary resources of
+`Sources/FilmPhysics/Resources/` by:
+
+```bash
+/workspace/venv-sf/bin/python tools/pack_resources.py
+```
+
 See [`tools/README.md`](tools/README.md) for the details (what is captured, the
 parameter cases, the file format and the exact upstream parameters that are
 switched off).
@@ -136,16 +172,18 @@ The upstream project is the reference implementation of every physical model
 used here (spectral upsampling, film exposure and development, DIR couplers,
 enlarger printing, scanning) and of the reference fixtures.
 
-### Profile data
+### Profile and resource data
 
 The film and print **profile data** copied from spektrafilm
-(`Sources/FilmPhysics/Resources/profiles/*.json`) and every derivative of it
-are licensed under the **Creative Commons Attribution-ShareAlike 4.0
+(`Sources/FilmPhysics/Resources/profiles/*.json`), the **spectral resources**
+packed from the upstream tables (`Sources/FilmPhysics/Resources/spectral/`,
+`Sources/FilmPhysics/Resources/filters/`) and every derivative of them are
+licensed under the **Creative Commons Attribution-ShareAlike 4.0
 International licence (CC BY-SA 4.0)**, as stated in the upstream metadata
 and in [`SPEKTRAFILM_LICENSE.txt`](SPEKTRAFILM_LICENSE.txt) at the root of
 this repository. Redistribution must credit the author, link the project,
 preserve the licence and stay CC BY-SA 4.0; modifications must be noted (see
-`Sources/FilmPhysics/Resources/profiles/CHANGELOG.txt`).
+`Sources/FilmPhysics/Resources/CHANGELOG.txt`).
 
 If you use these profiles in your work, please cite the spektrafilm project:
 <https://github.com/andreavolpato/spektrafilm> (see `CITATION.cff` upstream).
@@ -154,7 +192,7 @@ If you use these profiles in your work, please cite the spektrafilm project:
 
 * Code (including the Swift port of the physics engine): **GPL-3.0-or-later** —
   [`LICENSE`](LICENSE).
-* Bundled/derived spektrafilm profile data: **CC BY-SA 4.0** —
+* Bundled/derived spektrafilm profile and spectral data: **CC BY-SA 4.0** —
   [`SPEKTRAFILM_LICENSE.txt`](SPEKTRAFILM_LICENSE.txt).
 * Attribution summary: [`NOTICE`](NOTICE).
 

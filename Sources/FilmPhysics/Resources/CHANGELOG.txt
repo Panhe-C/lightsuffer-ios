@@ -1,0 +1,82 @@
+================================================================================
+Resources bundled with FilmPhysics — provenance and changelog
+================================================================================
+
+The files in this directory are the upstream spektrafilm data the Swift port
+needs, packed into compact binary resources by ``tools/pack_resources.py``.
+The script never modifies the upstream checkout; it only reads it.
+
+Upstream: https://github.com/andreavolpato/spektrafilm @ 3bb2c2d
+Licence:  CC BY-SA 4.0 (see ``SPEKTRAFILM_LICENSE.txt`` at the repository root
+          and ``src/spektrafilm/data/license/SPEKTRAFILM_LICENSE.txt``
+          upstream).  The licence requires the changes to the profiles and
+          the LUTs to be tracked — this file is that changelog.
+
+
+--------------------------------------------------------------------------------
+resources/profiles/            the film and the print profiles
+--------------------------------------------------------------------------------
+
+    kodak_portra_400.json      unmodified copy of
+                                src/spektrafilm/data/profiles/kodak_portra_400.json
+    kodak_portra_endura.json   unmodified copy of
+                                src/spektrafilm/data/profiles/kodak_portra_endura.json
+    CHANGELOG.txt              the changelog of the copied profiles (upstream)
+
+    No change: byte for byte copies of the upstream files.
+
+
+--------------------------------------------------------------------------------
+resources/spectral/            the packed spectral tables
+--------------------------------------------------------------------------------
+
+    irradiance_xy_tc.f16       the hanatos 2025 irradiance spectra
+                                192 x 192 x 81 float16, C order (5 971 968 bytes)
+                                upstream: src/spektrafilm/data/luts/spectral_upsampling/
+                                          irradiance_xy_tc.npy (float16)
+                                change:   none — the upstream float16 payload is
+                                          copied verbatim (the upstream engine
+                                          widens it to double without any loss, so
+                                          the port does the same on the fly)
+
+    cmfs_cie1931_2deg.f32      the CIE 1931 2° colour matching functions
+                                81 x 3 float32, C order (972 bytes)
+                                upstream: spektrafilm.config.STANDARD_OBSERVER_CMFS
+                                change:   narrowed from double to float32
+
+    illuminants.f32            the standard illuminant spectra
+                                4 x 81 float32, C order (1 296 bytes)
+                                rows:     TH-KG3, D55, D50, D65
+                                upstream: spektrafilm.model.illuminants.standard_illuminant
+                                change:   narrowed from double to float32
+
+    The float32 narrowing costs about 1e-7 relative on the chromaticity of
+    the reference illuminant; it is the floor of the colour matrix parity
+    (see docs/PORTING.md).
+
+
+--------------------------------------------------------------------------------
+resources/filters/            the neutral print filter database
+--------------------------------------------------------------------------------
+
+    neutral_print_filters.json unmodified copy of
+                               src/spektrafilm/data/filters/neutral_print_filters.json
+                               (the print stock -> illuminant -> film stock ->
+                                (C, M, Y) Kodak CC values of the neutral filters)
+
+    No change: byte for byte copy of the upstream file.
+
+
+--------------------------------------------------------------------------------
+the binary layout
+--------------------------------------------------------------------------------
+
+Every ``.f32`` / ``.f16`` file is a *flat* C-order array of little-endian
+floats; the shape is the one described above.  The index of the hanatos
+spectra is
+
+    spectra[(i * 192 + j) * 81 + wavelength]
+
+i.e. the first axis is the ``tc.x`` grid, the second the ``tc.y`` grid and
+the third the wavelength (380…780 nm in 5 nm steps).  The loader is
+``Sources/FilmPhysics/Resources.swift``.

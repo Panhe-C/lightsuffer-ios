@@ -99,7 +99,8 @@ enum JSONValue {
     }
 
     /// The value as a nested array of numbers.
-    var doubleRows: [[Double]]? {        guard case let .array(array) = self else { return nil }
+    var doubleRows: [[Double]]? {
+        guard case let .array(array) = self else { return nil }
         var rows: [[Double]] = []
         rows.reserveCapacity(array.count)
         for element in array {

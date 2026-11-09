@@ -22,7 +22,53 @@ final class Slice2ParityTests: XCTestCase {
         "output_gamut_off",
     ]
 
+    /// The relative tolerance of the comparison with the reference fixtures.
+    ///
+    /// The fixtures store the values with seven significant digits, so the
+    /// rounding alone is worth about 1e-6 relative.
+    private let relativeTolerance = 1e-6
+
+    /// The absolute floor of the comparison with the reference fixtures.
+    ///
+    /// The near-null components of the colour matrices (≈ 1e-3) are stored
+    /// with a unit in the last place of 1e-8, and the bundled spectral
+    /// resources are `float32`; the floor keeps the comparison meaningful
+    /// for those components (their *relative* error is dominated by the
+    /// rounding of the reference, not by the port).
+    private let absoluteFloor = 1e-8
+
     // MARK: - Helpers
+
+    /// The tolerance of a comparison with the reference fixtures.
+    ///
+    /// The relative tolerance dominates; the absolute floor covers the
+    /// near-null components of the matrices.
+    private func tolerance(for expected: Double, produced: Double) -> Double {
+        Swift.max(
+            relativeTolerance * Swift.max(abs(expected), abs(produced)),
+            absoluteFloor
+        )
+    }
+
+    /// Compares a value with the reference fixture.
+    private func assertMatches(
+        _ produced: Double,
+        _ expected: Double,
+        _ label: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let difference = abs(produced - expected)
+        let allowed = tolerance(for: expected, produced: produced)
+        XCTAssertLessThanOrEqual(
+            difference,
+            allowed,
+            "\(label): \(produced) is not \(expected) "
+                + "(difference \(difference), tolerance \(allowed))",
+            file: file,
+            line: line
+        )
+    }
 
     /// The CIELAB image of an encoded sRGB image, clipped to [0, 1].
     private func labImage(_ rgb: [Double]) -> [LabColour] {
@@ -239,10 +285,14 @@ final class Slice2ParityTests: XCTestCase {
         }
 
         let film = try ProfileLoader.load(stock: "kodak_portra_400")
+        // The spatial effects are off (the upstream reference fixtures run
+        // without them): the unsharp mask of the scanner is disabled, so the
+        // pipeline accepts the parameters.
         let params = PipelineParams(
             film: film,
             print: try ProfileLoader.load(stock: "kodak_portra_endura"),
-            camera: CameraParams(autoExposure: false)
+            camera: CameraParams(autoExposure: false),
+            scanner: ScannerParams(unsharpMaskSigma: 0, unsharpMaskAmount: 0)
         )
         let pipeline = try FilmPipeline(params: params)
         XCTAssertEqual(pipeline.tcLUT.size, size)
@@ -370,8 +420,8 @@ final class Slice2ParityTests: XCTestCase {
         }
         let total = xyz[0] + xyz[1] + xyz[2]
         let chromaticity = Chromaticity(x: xyz[0] / total, y: xyz[1] / total)
-        XCTAssertEqual(chromaticity.x, reference.x, accuracy: 1e-9)
-        XCTAssertEqual(chromaticity.y, reference.y, accuracy: 1e-9)
+        assertMatches(chromaticity.x, reference.x, "the chromaticity x of D55")
+        assertMatches(chromaticity.y, reference.y, "the chromaticity y of D55")
 
         // The ProPhoto RGB -> XYZ matrix of the filming stage.
         let filmingReference = try XCTUnwrap(colour["filming_prophoto_rgb_to_xyz"]?.doubleRows)
@@ -382,8 +432,28 @@ final class Slice2ParityTests: XCTestCase {
             transform: .cat16,
             applyCCTFDecoding: false
         )
-        XCTAssertEqual(filming[0], filmingReference[0][0], accuracy: 1e-9)
-        XCTAssertEqual(filming[1], filmingReference[1][0], accuracy: 1e-9)
-        XCTAssertEqual(filming[2], filmingReference[2][0], accuracy: 1e-9)
+        assertMatches(filming[0], filmingReference[0][0], "the filming matrix X")
+        assertMatches(filming[1], filmingReference[1][0], "the filming matrix Y")
+        assertMatches(filming[2], filmingReference[2][0], "the filming matrix Z")
+
+        let relativeErrors = [
+            relativeDifference(chromaticity.x, reference.x),
+            relativeDifference(chromaticity.y, reference.y),
+            relativeDifference(filming[0], filmingReference[0][0]),
+            relativeDifference(filming[1], filmingReference[1][0]),
+            relativeDifference(filming[2], filmingReference[2][0]),
+        ]
+        print("""
+
+            [slice2 colour matrices] max relative error \(relativeErrors.max() ?? 0)
+
+            """)
+    }
+
+    /// The relative difference of two values.
+    private func relativeDifference(_ lhs: Double, _ rhs: Double) -> Double {
+        let scale = Swift.max(abs(lhs), abs(rhs))
+        guard scale > 0 else { return 0 }
+        return abs(lhs - rhs) / scale
     }
 }
