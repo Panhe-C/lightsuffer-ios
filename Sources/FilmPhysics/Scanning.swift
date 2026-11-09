@@ -106,10 +106,62 @@ public enum Scanning {
         colorReference: ColorReference = ColorReference(),
         outputGamutCompress: OutputGamutCompressSpec? = nil
     ) -> [Double] {
-        let logXYZ = cmyToLogXYZ(
+        scan(
             cmy: cmy,
             channelDensity: printProfile.data.channelDensity,
             baseDensity: printProfile.data.baseDensity,
+            scanIlluminant: scanIlluminant,
+            normalization: normalization,
+            colourMatchingFunctions: colourMatchingFunctions,
+            xyzToRGB: xyzToRGB,
+            srgbToSRGB: srgbToSRGB,
+            colorReference: colorReference,
+            outputGamutCompress: outputGamutCompress
+        )
+    }
+
+    /// Scans an emulsion and returns the output RGB image.
+    ///
+    /// This is the generic form of ``scan(cmy:printProfile:scanIlluminant:normalization:colourMatchingFunctions:xyzToRGB:srgbToSRGB:colorReference:outputGamutCompress:)``:
+    /// it scans the densities of *any* emulsion — the paper of the print and
+    /// scan path, or the negative of the direct scan path.
+    ///
+    /// Upstream reference: `spektrafilm.runtime.stages.scanning.ScanningStage._density_to_rgb`
+    /// and `ScanningStage._return_callable_cmy_to_log_xyz`.
+    ///
+    /// - Parameters:
+    ///   - cmy: the densities of the emulsion, three values per pixel.
+    ///   - channelDensity: the spectral density of the image forming layer,
+    ///     `[wavelength][channel]`.
+    ///   - baseDensity: the base (fog) density of the emulsion.
+    ///   - scanIlluminant: the illuminant of the scanner.
+    ///   - normalization: the normalisation of the illuminant.
+    ///   - colourMatchingFunctions: the CIE 1931 2° CMFs.
+    ///   - xyzToRGB: the XYZ to output RGB matrix. **Row `i` is the RGB
+    ///     response to the `i`-th XYZ basis vector**, i.e. the conversion is
+    ///     `rgb = xyz · matrix`.
+    ///   - srgbToSRGB: the matrix the output transfer function applies before
+    ///     the encoding, `rgb = matrix · rgb`.
+    ///   - colorReference: the black / white reference.
+    ///   - outputGamutCompress: the output gamut compression (`nil` or the
+    ///     `"off"` algorithm leaves the values untouched).
+    /// - Returns: the encoded output RGB image, three values per pixel.
+    public static func scan(
+        cmy: [Double],
+        channelDensity: [[Double]],
+        baseDensity: [Double],
+        scanIlluminant: [Double],
+        normalization: Double,
+        colourMatchingFunctions: [[Double]],
+        xyzToRGB: [[Double]],
+        srgbToSRGB: [[Double]],
+        colorReference: ColorReference = ColorReference(),
+        outputGamutCompress: OutputGamutCompressSpec? = nil
+    ) -> [Double] {
+        let logXYZ = cmyToLogXYZ(
+            cmy: cmy,
+            channelDensity: channelDensity,
+            baseDensity: baseDensity,
             scanIlluminant: scanIlluminant,
             colourMatchingFunctions: colourMatchingFunctions,
             normalization: normalization

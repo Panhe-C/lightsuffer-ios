@@ -55,7 +55,10 @@ public enum FilmPhysics {
     }
 
     /// The stock names of the profiles that ship with this package.
-    public static let bundledProfiles = ["kodak_portra_400", "kodak_portra_endura"]
+    ///
+    /// The package bundles the complete upstream catalogue: the 20 camera
+    /// films and the 8 print media (see ``StockCatalog``).
+    public static let bundledProfiles = StockCatalog.stockNames
 
     /// The spectral sampling of the upstream engine: 380…780 nm in 5 nm steps.
     ///

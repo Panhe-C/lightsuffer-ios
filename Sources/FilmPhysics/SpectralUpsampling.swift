@@ -623,3 +623,113 @@ public enum SpectralUpsampling {
         return raw
     }
 }
+
+// MARK: - The lookup table cache
+
+/// A cache of the hanatos 2025 lookup tables.
+///
+/// The table only depends on the film (its spectral sensitivity and its
+/// hanatos 2025 adaptation) and on the spectral settings, never on the
+/// print medium. Building it costs a few hundred milliseconds, so a
+/// catalogue sweep (every film × every paper) reuses the twenty tables of
+/// the films instead of building one hundred and forty eight of them.
+///
+/// Upstream reference: `spektrafilm.runtime.services.spectral_lut_compute.SpectralLUTService`
+/// (the upstream service caches the table of the film as well).
+public enum HanatosTCLUTCache {
+
+    /// The cached lookup table of a film.
+    ///
+    /// - Parameters:
+    ///   - film: the profile of the film.
+    ///   - settings: the spectral settings of the run.
+    ///   - inputGamutCompress: the input gamut compression baked into the table.
+    /// - Returns: the lookup table of the film.
+    public static func table(
+        for film: Profile,
+        settings: SettingsParams,
+        inputGamutCompress: InputGamutCompressSpec
+    ) throws -> HanatosTCLUT {
+        let key = cacheKey(
+            for: film, settings: settings, inputGamutCompress: inputGamutCompress
+        )
+        return try storage.table(for: key) {
+            try build(
+                for: film,
+                settings: settings,
+                inputGamutCompress: inputGamutCompress
+            )
+        }
+    }
+
+    /// The key of the cache entry of a film.
+    private static func cacheKey(
+        for film: Profile,
+        settings: SettingsParams,
+        inputGamutCompress: InputGamutCompressSpec
+    ) -> String {
+        let knee = inputGamutCompress.knee
+        return [
+            film.info.stock,
+            settings.applyHanatos2025AdaptationWindow ? "w1" : "w0",
+            settings.applyHanatos2025AdaptationSurface ? "s1" : "s0",
+            "\(settings.spectralGaussianBlur)",
+            inputGamutCompress.active ? "a1" : "a0",
+            inputGamutCompress.algorithm,
+            "\(knee.threshold)|\(knee.limit)|\(knee.power)",
+        ].joined(separator: "/")
+    }
+
+    /// Builds the lookup table of a film.
+    private static func build(
+        for film: Profile,
+        settings: SettingsParams,
+        inputGamutCompress: InputGamutCompressSpec
+    ) throws -> HanatosTCLUT {
+        let illuminants = try Resources.illuminants()
+        let wavelengths = film.data.wavelengths
+        let sensitivity = film.data.logSensitivity.map { row in
+            Numerics.nanToNum(row.map { pow(10.0, $0) })
+        }
+        var adaptation = film.hanatos2025Adaptation()
+        adaptation.applyWindow = settings.applyHanatos2025AdaptationWindow
+        adaptation.applySurface = settings.applyHanatos2025AdaptationSurface
+        adaptation.spectralGaussianBlur = settings.spectralGaussianBlur
+        guard let illuminant = illuminants[adaptation.referenceIlluminant] else {
+            throw PipelineError.invalidInputs(
+                "the illuminant '\(adaptation.referenceIlluminant)' is not bundled with the package"
+            )
+        }
+        let spectra = try Resources.hanatosSpectra()
+        return SpectralUpsampling.computeHanatos2025TCLUT(
+            sensitivity: sensitivity,
+            adaptation: adaptation,
+            gamutCompress: inputGamutCompress,
+            spectra: spectra,
+            illuminant: illuminant,
+            wavelengths: wavelengths
+        )
+    }
+
+    /// The cached tables.
+    private static let storage = Storage()
+
+    private final class Storage {
+        private let lock = NSLock()
+        private var tables: [String: HanatosTCLUT] = [:]
+
+        func table(for key: String, build: () throws -> HanatosTCLUT) throws -> HanatosTCLUT {
+            lock.lock()
+            if let cached = tables[key] {
+                lock.unlock()
+                return cached
+            }
+            lock.unlock()
+            let built = try build()
+            lock.lock()
+            tables[key] = built
+            lock.unlock()
+            return built
+        }
+    }
+}

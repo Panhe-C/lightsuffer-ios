@@ -93,6 +93,39 @@ public struct ColorReference: Equatable, Sendable {
         yWhite = pow(10.0, logXYZWhite[1])
     }
 
+    /// Updates the black and white reference luminances of a directly scanned
+    /// film.
+    ///
+    /// Upstream reference:
+    /// `ColorReferenceService._update_cmy_black_white_references` (the
+    /// `scan_film` + `positive` branch).
+    ///
+    /// The black reference of a scanned slide is the maximum density of its
+    /// characteristic curves and its white reference is a density of zero.
+    /// A scanned negative is never corrected (the upstream service returns
+    /// early for it).
+    ///
+    /// - Parameters:
+    ///   - film: the profile of the film.
+    ///   - cmyToLogXYZ: the conversion of the scanning stage, used to turn
+    ///     the reference densities into tristimulus values.
+    public mutating func updateFilmReferences(
+        film: Profile,
+        cmyToLogXYZ: ([Double]) -> [Double]
+    ) {
+        guard !isIdentity else { return }
+        guard film.info.type == .positive else { return }
+        var cmyBlack = [Double](repeating: 0, count: 3)
+        for channel in 0..<3 {
+            cmyBlack[channel] = Numerics.nanMax(film.data.densityCurves.map { $0[channel] })
+        }
+        let cmyWhite = [Double](repeating: 0, count: 3)
+        let logXYZBlack = cmyToLogXYZ(cmyBlack)
+        let logXYZWhite = cmyToLogXYZ(cmyWhite)
+        yBlack = pow(10.0, logXYZBlack[1])
+        yWhite = pow(10.0, logXYZWhite[1])
+    }
+
     /// The slope and the offset of the black / white correction.
     ///
     /// Upstream reference: `ColorReferenceService._correction_fucntion`.

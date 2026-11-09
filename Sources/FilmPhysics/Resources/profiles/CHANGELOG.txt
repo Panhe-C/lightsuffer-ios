@@ -4,8 +4,34 @@ spektrafilm profile data — CHANGELOG
 The JSON files in this directory are UNMODIFIED copies of the profile data
 bundled with the upstream project "spektrafilm":
 
-    kodak_portra_400.json    (film, Kodak Portra 400)
-    kodak_portra_endura.json  (print, Kodak Portra Endura)
+    kodak_ektar_100.json                  (film, Kodak Ektar 100)
+    kodak_portra_160.json                 (film, Kodak Portra 160)
+    kodak_portra_400.json                 (film, Kodak Portra 400)
+    kodak_portra_800.json                 (film, Kodak Portra 800)
+    kodak_portra_800_push1.json           (film, Kodak Portra 800 (Push 1))
+    kodak_portra_800_push2.json           (film, Kodak Portra 800 (Push 2))
+    kodak_gold_200.json                   (film, Kodak Gold 200)
+    kodak_ultramax_400.json               (film, Kodak Ultramax 400)
+    kodak_vision3_50d.json                (film, Kodak Vision3 50D)
+    kodak_vision3_250d.json               (film, Kodak Vision3 250D)
+    kodak_verita_200d.json                (film, Kodak Verita 200D)
+    kodak_vision3_200t.json               (film, Kodak Vision3 200T)
+    kodak_vision3_500t.json               (film, Kodak Vision3 500T)
+    fujifilm_pro_400h.json                (film, Fujifilm Pro 400H)
+    fujifilm_c200.json                    (film, Fujifilm C200)
+    fujifilm_xtra_400.json                (film, Fujifilm X-Tra 400)
+    kodak_ektachrome_100.json             (slide, Kodak Ektachrome 100)
+    kodak_kodachrome_64.json              (slide, Kodak Kodachrome 64)
+    fujifilm_velvia_100.json              (slide, Fujifilm Velvia 100)
+    fujifilm_provia_100f.json             (slide, Fujifilm Provia 100F)
+    kodak_ultra_endura.json               (print, Kodak Professional Ultra Endura)
+    kodak_endura_premier.json             (print, Kodak Professional Endura Premier)
+    kodak_ektacolor_edge.json             (print, Kodak Ektacolor Edge)
+    kodak_supra_endura.json               (print, Kodak Professional Supra Endura)
+    kodak_portra_endura.json              (print, Kodak Professional Portra Endura)
+    fujifilm_crystal_archive_typeii.json  (print, Fujifilm Crystal Archive Type II)
+    kodak_2383.json                       (print film, Kodak Vision 2383)
+    kodak_2393.json                       (print film, Kodak Vision Premier 2393)
 
 Source
 ------
@@ -13,8 +39,9 @@ Source
     commit 3bb2c2d
     path: src/spektrafilm/data/profiles/
 
-Copied verbatim (byte for byte) on 2026-11-09. No value, key, order or
-number formatting was changed.
+Copied verbatim (byte for byte) on 2026-11-09 by
+``tools/pack_resources.py``. No value, key, order or number formatting was
+changed.
 
 Licence
 -------

@@ -181,14 +181,13 @@ public enum Couplers {
                     x: logExposure[sample], axis: shiftedAxis, values: values
                 )
             }
-            if positive {
-                for sample in 0..<samples {
-                    corrected[sample][channel] = -inverted[sample]
-                }
-            } else {
-                for sample in 0..<samples {
-                    corrected[sample][channel] = inverted[sample]
-                }
+            // The upstream evaluates the positive branch as
+            // `-numpy.interp(log_exposure, log_exposure_0, -density_curves)`,
+            // which — the interpolation being linear — is the same as
+            // `numpy.interp(log_exposure, log_exposure_0, density_curves)`:
+            // the sign of the two negations cancels.
+            for sample in 0..<samples {
+                corrected[sample][channel] = inverted[sample]
             }
         }
         return corrected

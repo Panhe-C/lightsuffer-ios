@@ -40,7 +40,7 @@ public enum ResourceError: Error, CustomStringConvertible {
 /// |---|---|---|
 /// | `spectral/irradiance_xy_tc.f16` | 192 × 192 × 81 (float16) | the hanatos 2025 irradiance spectra |
 /// | `spectral/cmfs_cie1931_2deg.f32` | 81 × 3 (float32) | the CIE 1931 2° colour matching functions |
-/// | `spectral/illuminants.f32` | 4 × 81 (float32) | TH-KG3, D55, D50 and D65 |
+/// | `spectral/illuminants.f32` | 6 × 81 (float32) | TH-KG3, D55, D50, D65, T and K75P |
 /// | `filters/neutral_print_filters.json` | JSON | the neutral print filter database |
 public enum Resources {
 
@@ -52,7 +52,77 @@ public enum Resources {
     public static let tcGridSize = 192
 
     /// The labels of the bundled illuminants, in the order they are packed.
-    public static let illuminantLabels = ["TH-KG3", "D55", "D50", "D65"]
+    ///
+    /// | Label | Role |
+    /// |---|---|
+    /// | `TH-KG3` | the enlarger lamp and the reference illuminant of the papers |
+    /// | `D55` | the reference illuminant of the films |
+    /// | `D50` | the viewing illuminant of the films and of the papers |
+    /// | `D65` | the white point of the sRGB output colourspace |
+    /// | `T` | the incandescent reference illuminant of the Kodak Vision3 200T / 500T |
+    /// | `K75P` | the Kinoton viewing illuminant of the Kodak 2383 / 2393 print films |
+    public static let illuminantLabels = ["TH-KG3", "D55", "D50", "D65", "T", "K75P"]
+
+    // MARK: - Caching
+
+    /// The lazily loaded resources.
+    ///
+    /// The hanatos 2025 irradiance table holds three million values (12 MiB
+    /// as `Float`); decoding it for every pipeline would dominate the run
+    /// time of a catalogue sweep, so the decoded resources are cached.
+    private static let storage = Storage()
+
+    private final class Storage {
+        private let lock = NSLock()
+        private var spectraCache: [Float]?
+        private var colourMatchingFunctionsCache: [[Double]]?
+        private var illuminantsCache: [String: [Double]]?
+        private var neutralPrintFiltersCache: [String: [String: [String: [Double]]]]?
+
+        func spectra() throws -> [Float] {
+            lock.lock()
+            if let cached = spectraCache { lock.unlock(); return cached }
+            lock.unlock()
+            let decoded = try Resources.decodeSpectra()
+            lock.lock()
+            spectraCache = decoded
+            lock.unlock()
+            return decoded
+        }
+
+        func colourMatchingFunctions() throws -> [[Double]] {
+            lock.lock()
+            if let cached = colourMatchingFunctionsCache { lock.unlock(); return cached }
+            lock.unlock()
+            let decoded = try Resources.decodeColourMatchingFunctions()
+            lock.lock()
+            colourMatchingFunctionsCache = decoded
+            lock.unlock()
+            return decoded
+        }
+
+        func illuminants() throws -> [String: [Double]] {
+            lock.lock()
+            if let cached = illuminantsCache { lock.unlock(); return cached }
+            lock.unlock()
+            let decoded = try Resources.decodeIlluminants()
+            lock.lock()
+            illuminantsCache = decoded
+            lock.unlock()
+            return decoded
+        }
+
+        func neutralPrintFilters() throws -> [String: [String: [String: [Double]]]] {
+            lock.lock()
+            if let cached = neutralPrintFiltersCache { lock.unlock(); return cached }
+            lock.unlock()
+            let decoded = try Resources.decodeNeutralPrintFilters()
+            lock.lock()
+            neutralPrintFiltersCache = decoded
+            lock.unlock()
+            return decoded
+        }
+    }
 
     // MARK: - Locating
 
@@ -152,6 +222,11 @@ public enum Resources {
     /// i.e. the first axis is the `tc.x` grid, the second the `tc.y` grid and
     /// the third the wavelength.
     public static func hanatosSpectra() throws -> [Float] {
+        try storage.spectra()
+    }
+
+    /// Decodes the hanatos 2025 irradiance spectra table.
+    private static func decodeSpectra() throws -> [Float] {
         let values = try float16Data(named: "irradiance_xy_tc")
         let expected = tcGridSize * tcGridSize * wavelengthCount
         guard values.count == expected else {
@@ -166,6 +241,11 @@ public enum Resources {
     ///
     /// Upstream reference: `spektrafilm.config.STANDARD_OBSERVER_CMFS`.
     public static func colourMatchingFunctions() throws -> [[Double]] {
+        try storage.colourMatchingFunctions()
+    }
+
+    /// Decodes the CIE 1931 2° colour matching functions.
+    private static func decodeColourMatchingFunctions() throws -> [[Double]] {
         let values = try float32Data(named: "cmfs_cie1931_2deg")
         guard values.count == wavelengthCount * 3 else {
             throw ResourceError.invalidShape(
@@ -186,6 +266,11 @@ public enum Resources {
     ///
     /// Upstream reference: `spektrafilm.model.illuminants.standard_illuminant`.
     public static func illuminants() throws -> [String: [Double]] {
+        try storage.illuminants()
+    }
+
+    /// Decodes the bundled illuminant spectra.
+    private static func decodeIlluminants() throws -> [String: [Double]] {
         let values = try float32Data(named: "illuminants")
         guard values.count == illuminantLabels.count * wavelengthCount else {
             throw ResourceError.invalidShape(
@@ -212,6 +297,11 @@ public enum Resources {
     /// The database maps a print stock to an illuminant to a film stock and to
     /// the (C, M, Y) Kodak CC values of the neutral print filters.
     public static func neutralPrintFilters() throws -> [String: [String: [String: [Double]]]] {
+        try storage.neutralPrintFilters()
+    }
+
+    /// Decodes the neutral print filter database.
+    private static func decodeNeutralPrintFilters() throws -> [String: [String: [String: [Double]]]] {
         guard let url = url(named: "neutral_print_filters", extension: "json") else {
             throw ResourceError.notFound("neutral_print_filters")
         }

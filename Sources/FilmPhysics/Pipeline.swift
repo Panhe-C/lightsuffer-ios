@@ -359,13 +359,47 @@ public struct Slice1Pipeline {
         )
     }
 
+    /// Runs the direct scan path: the negative is developed and scanned
+    /// directly, without being printed on a paper.
+    ///
+    /// Upstream reference:
+    /// `spektrafilm.runtime.pipeline.SimulationPipeline._build_topology` (the
+    /// `io.scan_film` branch) and
+    /// `spektrafilm.runtime.stages.scanning.ScanningStage.scan`.
+    ///
+    /// ```
+    /// log_e_film ──▶ filming.develop ──▶ cmy_film ──▶ scanning.scan ──▶ rgb_out
+    /// ```
+    ///
+    /// The scanning stage uses the **film** (not the paper) channel density,
+    /// base density and viewing illuminant, exactly like the upstream
+    /// `_return_callable_cmy_to_log_xyz` does when `io.scan_film` is set.
+    ///
+    /// - Parameters:
+    ///   - logEFilm: the log10 exposure of the negative.
+    ///   - colorReference: the black / white reference of the scan.
+    /// - Returns: the scanned and encoded image.
+    public func runScanFilm(
+        logEFilm: RGBImage,
+        colorReference: ColorReference
+    ) throws -> RGBImage {
+        guard logEFilm.data.count == logEFilm.width * logEFilm.height * 3 else {
+            throw PipelineError.invalidImageData(
+                "expected \(logEFilm.width * logEFilm.height * 3) values for a "
+                    + "\(logEFilm.width)x\(logEFilm.height) image, got \(logEFilm.data.count)"
+            )
+        }
+        let cmyFilm = developFilm(logEFilm)
+        return scanFilm(cmyFilm, colorReference: colorReference)
+    }
+
     // MARK: - Stages
 
     /// Develops the negative.
     ///
     /// Upstream reference: `spektrafilm.runtime.stages.filming.FilmingStage.develop`
     /// and `spektrafilm.model.develop.develop` (without the grain).
-    private func developFilm(_ logRaw: RGBImage) -> RGBImage {
+    func developFilm(_ logRaw: RGBImage) -> RGBImage {
         let normalized = DensityCurves.normalized(film.data.densityCurves)
         var density = DensityCurves.interpolateExposureToDensity(
             logExposureRGB: logRaw.data,
@@ -389,7 +423,10 @@ public struct Slice1Pipeline {
                 matrix: matrix,
                 positive: positive
             )
-            let densityMax = normalized.map { Numerics.nanMax($0) }
+            // The maximum density of every channel (`np.nanmax(density_curves, axis=0)`).
+            let densityMax = (0..<3).map { channel in
+                Numerics.nanMax(normalized.map { $0[channel] })
+            }
             let correctedLogRaw = Couplers.exposureCorrection(
                 logRaw: logRaw.data,
                 densityCMY: density,
@@ -544,5 +581,31 @@ public struct Slice1Pipeline {
             outputGamutCompress: inputs.scanner.resolvedOutputGamutCompress
         )
         return RGBImage(width: cmyPrint.width, height: cmyPrint.height, data: rgb)
+    }
+
+    /// Scans the negative directly, without printing it.
+    ///
+    /// Upstream reference:
+    /// `spektrafilm.runtime.stages.scanning.ScanningStage._density_to_rgb`
+    /// (the `io.scan_film` branch) and
+    /// `ScanningStage._return_callable_cmy_to_log_xyz`.
+    ///
+    /// The film is scanned with its own channel density, base density and
+    /// viewing illuminant; the glare of the print is not applied (the
+    /// upstream sets `glare = None` for a direct film scan).
+    private func scanFilm(_ cmyFilm: RGBImage, colorReference: ColorReference) -> RGBImage {
+        let rgb = Scanning.scan(
+            cmy: cmyFilm.data,
+            channelDensity: film.data.channelDensity,
+            baseDensity: film.data.baseDensity,
+            scanIlluminant: inputs.spectral.scanIlluminant,
+            normalization: inputs.spectral.scanIlluminantNormalization,
+            colourMatchingFunctions: inputs.spectral.colourMatchingFunctions,
+            xyzToRGB: inputs.scanner.xyzToRGB,
+            srgbToSRGB: inputs.scanner.srgbToSRGB,
+            colorReference: colorReference,
+            outputGamutCompress: inputs.scanner.resolvedOutputGamutCompress
+        )
+        return RGBImage(width: cmyFilm.width, height: cmyFilm.height, data: rgb)
     }
 }

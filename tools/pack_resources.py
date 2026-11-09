@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack the upstream spektrafilm spectral resources into compact binary files.
+"""Pack the upstream spektrafilm resources into the Swift package.
 
 The Swift port (``Sources/FilmPhysics``) needs a few upstream data tables
 that are too big or too awkward to keep in JSON:
@@ -8,12 +8,18 @@ that are too big or too awkward to keep in JSON:
   (``data/luts/spectral_upsampling/irradiance_xy_tc.npy``) — the spectral
   upsampling table the whole camera stage is built on,
 * the CIE 1931 2° colour matching functions,
-* the standard illuminant spectra (TH-KG3, D55, D50, D65),
+* the standard illuminant spectra (TH-KG3, D55, D50, D65, T, K75P),
 * the neutral print filter database (``data/filters/neutral_print_filters.json``).
 
-The script converts them into little-endian binary resources that the Swift
-package bundles.  It never writes outside the output directory and never
-modifies the upstream checkout.
+It also copies the **28 film and print profile JSON files** of the upstream
+catalogue (``data/profiles/*.json``) verbatim into the package resources: the
+profiles are the reference data of the whole engine, they are small enough to
+be bundled as they are (≈ 5.6 MB) and keeping them unchanged guarantees
+that the Swift port and the upstream engine read exactly the same numbers.
+
+The script converts the tables into little-endian binary resources that the
+Swift package bundles.  It never writes outside the output directory and
+never modifies the upstream checkout.
 
 Binary layout
 -------------
@@ -55,7 +61,50 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_OUT = os.path.join(REPO_ROOT, "Sources", "FilmPhysics", "Resources")
 
 #: The illuminants the port needs, in the order they are packed.
-ILLUMINANTS = ("TH-KG3", "D55", "D50", "D65")
+#:
+#: ``T`` (the incandescent lamp) is the reference illuminant of the Kodak
+#: Vision3 200T and 500T, ``K75P`` (the Kinoton print projection lamp) is
+#: the viewing illuminant of the Kodak 2383 and 2393 print films.
+ILLUMINANTS = ("TH-KG3", "D55", "D50", "D65", "T", "K75P")
+
+#: The upstream profile stocks, in the order of ``spektrafilm.model.stocks``.
+FILM_STOCKS = (
+    "kodak_ektar_100",
+    "kodak_portra_160",
+    "kodak_portra_400",
+    "kodak_portra_800",
+    "kodak_portra_800_push1",
+    "kodak_portra_800_push2",
+    "kodak_gold_200",
+    "kodak_ultramax_400",
+    "kodak_vision3_50d",
+    "kodak_vision3_250d",
+    "kodak_verita_200d",
+    "kodak_vision3_200t",
+    "kodak_vision3_500t",
+    "fujifilm_pro_400h",
+    "fujifilm_c200",
+    "fujifilm_xtra_400",
+    "kodak_ektachrome_100",
+    "kodak_kodachrome_64",
+    "fujifilm_velvia_100",
+    "fujifilm_provia_100f",
+)
+
+#: The upstream print media (6 papers + 2 cine print films).
+PRINT_STOCKS = (
+    "kodak_ultra_endura",
+    "kodak_endura_premier",
+    "kodak_ektacolor_edge",
+    "kodak_supra_endura",
+    "kodak_portra_endura",
+    "fujifilm_crystal_archive_typeii",
+    "kodak_2383",
+    "kodak_2393",
+)
+
+#: Every profile the upstream package ships.
+ALL_STOCKS = FILM_STOCKS + PRINT_STOCKS
 
 #: The shape of the hanatos 2025 irradiance spectra table.
 SPECTRA_SHAPE = (192, 192, 81)
@@ -106,11 +155,13 @@ def pack_cmfs(out_dir: str) -> str:
 
 
 def pack_illuminants(out_dir: str) -> str:
-    """Pack the standard illuminant spectra (4 x 81, float32).
+    """Pack the standard illuminant spectra (6 x 81, float32).
 
     The rows are, in order: TH-KG3 (the enlarger lamp), D55 (the film
-    reference illuminant), D50 (the print viewing illuminant) and D65 (the
-    sRGB white point).
+    reference illuminant), D50 (the print viewing illuminant), D65 (the
+    sRGB white point), T (the incandescent reference illuminant of the
+    Kodak Vision3 200T / 500T) and K75P (the Kinoton viewing illuminant of
+    the Kodak 2383 / 2393 print films).
     """
     rows = [np.asarray(standard_illuminant(label), dtype=np.float64) for label in ILLUMINANTS]
     payload = np.ascontiguousarray(np.stack(rows).astype("<f4"))
@@ -136,6 +187,28 @@ def pack_neutral_print_filters(out_dir: str) -> str:
     return target
 
 
+def pack_profiles(out_dir: str) -> list[str]:
+    """Copy the 28 upstream profile JSON files into the resources.
+
+    The profiles are copied **verbatim** (byte for byte): they are the
+    reference data of the engine and the Swift loader has to read exactly the
+    same numbers as the upstream engine.  The provenance of the copies is
+    documented in ``Sources/FilmPhysics/Resources/profiles/CHANGELOG.txt``.
+    """
+    source_dir = os.path.join(_upstream_root(), "data", "profiles")
+    target_dir = os.path.join(out_dir, "profiles")
+    os.makedirs(target_dir, exist_ok=True)
+    written = []
+    for stock in ALL_STOCKS:
+        source = os.path.join(source_dir, f"{stock}.json")
+        if not os.path.isfile(source):
+            raise RuntimeError(f"the upstream profile '{stock}' is missing")
+        target = os.path.join(target_dir, f"{stock}.json")
+        shutil.copyfile(source, target)
+        written.append(target)
+    return written
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -156,6 +229,7 @@ def main(argv=None) -> int:
         pack_illuminants(out_dir),
         pack_neutral_print_filters(out_dir),
     ]
+    written += pack_profiles(out_dir)
     total = 0
     for path in written:
         size = os.path.getsize(path)

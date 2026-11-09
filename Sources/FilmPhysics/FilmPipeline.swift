@@ -147,15 +147,29 @@ public struct FilmRenderParams: Equatable, Sendable {
     public var densityCurveGamma: Double
     /// The minimum density of the grain, per channel.
     public var grainDensityMin: [Double]
+    /// The sigma of the first halation bounce, per channel.
+    ///
+    /// The digest of the stock sets it (65 µm for a still triacetate base,
+    /// 50 µm for a PET cine base).
+    public var halationFirstSigmaUM: [Double]
+    /// The strength of the halation, per channel.
+    ///
+    /// The digest of the stock sets it from the anti-halation layer of the
+    /// emulsion.
+    public var halationStrength: [Double]
 
     public init(
         dirCouplers: DirCouplersParams = DirCouplersParams(),
         densityCurveGamma: Double = 1.0,
-        grainDensityMin: [Double] = [0.03, 0.03, 0.03]
+        grainDensityMin: [Double] = [0.03, 0.03, 0.03],
+        halationFirstSigmaUM: [Double] = [65, 65, 65],
+        halationStrength: [Double] = [0.05, 0.015, 0]
     ) {
         self.dirCouplers = dirCouplers
         self.densityCurveGamma = densityCurveGamma
         self.grainDensityMin = grainDensityMin
+        self.halationFirstSigmaUM = halationFirstSigmaUM
+        self.halationStrength = halationStrength
     }
 }
 
@@ -341,9 +355,6 @@ public struct FilmPipeline {
                 "the RGB to raw method '\(params.settings.rgbToRawMethod)' is not ported yet"
             )
         }
-        guard !params.io.scanFilm else {
-            throw PipelineError.invalidInputs("the direct film scan is not ported yet")
-        }
         guard params.camera.autoExposure == false else {
             throw PipelineError.invalidInputs("the auto exposure is not ported yet")
         }
@@ -356,7 +367,7 @@ public struct FilmPipeline {
         guard params.scanner.unsharpMaskSigma == 0, params.scanner.unsharpMaskAmount == 0 else {
             throw PipelineError.invalidInputs("the unsharp mask is not ported yet")
         }
-        guard let inputColourSpace = RGBColourspace.named(params.io.inputColorSpace) else {
+        guard RGBColourspace.named(params.io.inputColorSpace) != nil else {
             throw PipelineError.invalidInputs(
                 "the input colour space '\(params.io.inputColorSpace)' is not supported"
             )
@@ -367,6 +378,13 @@ public struct FilmPipeline {
             )
         }
 
+        // The stock specific digest of the parameters: the neutral print
+        // filters of the film / paper pair, the DIR coupler chemistry and
+        // the halation baseline of the film.
+        //
+        // Upstream reference:
+        // `spektrafilm.runtime.params_builder.digest_params`.
+        let params = Digest.digest(params)
         self.params = params
 
         // --- the spectral data -----------------------------------------
@@ -379,7 +397,15 @@ public struct FilmPipeline {
                     + "matching functions"
             )
         }
-        let scanIlluminantLabel = params.print.info.viewingIlluminant
+        // The illuminant of the scanner is the viewing illuminant of the
+        // medium that is scanned: the paper of the print and scan path, the
+        // film itself of the direct scan path.
+        //
+        // Upstream reference:
+        // `spektrafilm.runtime.stages.scanning.ScanningStage._density_to_rgb`.
+        let scanIlluminantLabel = params.io.scanFilm
+            ? params.film.info.viewingIlluminant
+            : params.print.info.viewingIlluminant
         guard let scanIlluminant = illuminants[scanIlluminantLabel] else {
             throw PipelineError.invalidInputs(
                 "the illuminant '\(scanIlluminantLabel)' is not bundled with the package"
@@ -398,26 +424,12 @@ public struct FilmPipeline {
         let dichroicFilters = ColorFilters.customDichroicFilters(wavelengths: wavelengths)
 
         // --- the hanatos 2025 lookup table ------------------------------
-        let sensitivity = params.film.data.logSensitivity.map { row in
-            Numerics.nanToNum(row.map { pow(10.0, $0) })
-        }
-        var adaptation = params.film.hanatos2025Adaptation()
-        adaptation.applyWindow = params.settings.applyHanatos2025AdaptationWindow
-        adaptation.applySurface = params.settings.applyHanatos2025AdaptationSurface
-        adaptation.spectralGaussianBlur = params.settings.spectralGaussianBlur
-        let spectra = try Resources.hanatosSpectra()
-        guard let adaptationIlluminant = illuminants[adaptation.referenceIlluminant] else {
-            throw PipelineError.invalidInputs(
-                "the illuminant '\(adaptation.referenceIlluminant)' is not bundled with the package"
-            )
-        }
-        let tcLUT = SpectralUpsampling.computeHanatos2025TCLUT(
-            sensitivity: sensitivity,
-            adaptation: adaptation,
-            gamutCompress: params.io.inputGamutCompress,
-            spectra: spectra,
-            illuminant: adaptationIlluminant,
-            wavelengths: wavelengths
+        // The table only depends on the film and on the spectral settings,
+        // so it is cached and shared by every print medium of the stock.
+        let tcLUT = try HanatosTCLUTCache.table(
+            for: params.film,
+            settings: params.settings,
+            inputGamutCompress: params.io.inputGamutCompress
         )
         self.tcLUT = tcLUT
 
@@ -455,20 +467,13 @@ public struct FilmPipeline {
         let srgbToSRGB = ColourScience.matrixRGBToRGB(from: .sRGB, to: .sRGB)
 
         // --- the neutral print filters ----------------------------------
-        var neutralFilterCC = [
+        // The digest already applied the neutral print filter database of
+        // the film / paper / illuminant triplet.
+        let neutralFilterCC = [
             params.enlarger.cFilterNeutral,
             params.enlarger.mFilterNeutral,
             params.enlarger.yFilterNeutral,
         ]
-        if params.settings.neutralPrintFiltersFromDatabase,
-            let databaseValues = NeutralPrintFilters.lookup(
-                printStock: params.print.info.stock,
-                illuminant: params.enlarger.illuminant,
-                filmStock: params.film.info.stock
-            )
-        {
-            neutralFilterCC = databaseValues
-        }
 
         // --- the print balance reference --------------------------------
         let (midgray, midgrayCompensated) = Filming.densitySpectralMidgray(
@@ -481,9 +486,9 @@ public struct FilmPipeline {
         )
 
         // --- the digest of the film rendering ---------------------------
-        var digest = Digest.filmRender(for: params.film)
-        digest.dirCouplers = params.filmRender.dirCouplers
-        digest.densityCurveGamma = params.filmRender.densityCurveGamma
+        // The digest of the stock has already been applied to the
+        // parameters (see above).
+        let digest = params.filmRender
 
         let spectralInputs = SpectralInputs(
             colourMatchingFunctions: colourMatchingFunctions,
@@ -562,7 +567,24 @@ public struct FilmPipeline {
             applyCCTFDecoding: params.io.inputCCTFDecoding,
             referenceIlluminant: referenceIlluminantXY
         )
-        let colorReference = inputs.scanner.colorReference
+        var colorReference = inputs.scanner.colorReference
+        if params.io.scanFilm {
+            // The black / white reference of a directly scanned slide is
+            // computed from the density curves of the film itself.
+            //
+            // Upstream reference:
+            // `ColorReferenceService._update_cmy_black_white_references`.
+            colorReference.updateFilmReferences(film: params.film) { cmy in
+                Scanning.cmyToLogXYZ(
+                    cmy: cmy,
+                    channelDensity: params.film.data.channelDensity,
+                    baseDensity: params.film.data.baseDensity,
+                    scanIlluminant: inputs.spectral.scanIlluminant,
+                    colourMatchingFunctions: inputs.spectral.colourMatchingFunctions,
+                    normalization: inputs.spectral.scanIlluminantNormalization
+                )
+            }
+        }
         let filmingCorrection = colorReference.filmingExposureCorrection(
             film: params.film,
             print: params.print,
@@ -579,6 +601,24 @@ public struct FilmPipeline {
         let pipeline = try Slice1Pipeline(
             film: params.film, print: params.print, inputs: inputs
         )
+        if params.io.scanFilm {
+            // The direct scan path: the negative is scanned directly, the
+            // printing stage is skipped.
+            //
+            // Upstream reference:
+            // `spektrafilm.runtime.pipeline.SimulationPipeline._build_topology`.
+            let cmyFilm = pipeline.developFilm(logEFilmImage)
+            let rgbOut = try pipeline.runScanFilm(
+                logEFilm: logEFilmImage, colorReference: colorReference
+            )
+            return FilmTaps(
+                logEFilm: logEFilmImage,
+                cmyFilm: cmyFilm,
+                logEPrint: RGBImage(width: 0, height: 0, data: []),
+                cmyPrint: RGBImage(width: 0, height: 0, data: []),
+                rgbOut: rgbOut
+            )
+        }
         let taps = try pipeline.run(logEFilm: logEFilmImage)
         return FilmTaps(
             logEFilm: logEFilmImage,

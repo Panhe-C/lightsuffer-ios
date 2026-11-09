@@ -40,6 +40,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 import time
 from dataclasses import fields, is_dataclass, replace
 
@@ -48,6 +49,13 @@ import numpy as np
 # --------------------------------------------------------------------------
 # upstream import
 # --------------------------------------------------------------------------
+
+# Keep the numba JIT cache out of the upstream checkout: the upstream tree is
+# read only for this project, the compiled kernels are cached in a temporary
+# directory instead (the first run pays the compilation, ≈ 10 s).
+os.environ.setdefault(
+    "NUMBA_CACHE_DIR", os.path.join(tempfile.gettempdir(), "spektrafilm-numba-cache")
+)
 
 try:  # pragma: no cover - import shim
     import spektrafilm  # noqa: F401
@@ -305,14 +313,18 @@ def _exposure_factor(sensitivity, print_illuminant, density_spectral_midgray):
 # --------------------------------------------------------------------------
 
 
-def _base_params(output_gamut_compress: str = "off"):
+def _base_params(
+    output_gamut_compress: str = "off",
+    film_profile: str = FILM_PROFILE,
+    print_profile: str = PRINT_PROFILE,
+):
     """init_params() with every spatial / stochastic effect disabled.
 
     ``output_gamut_compress`` selects the output gamut compression: the
     slice 1 fixtures use the diagnostic ``"off"`` build, the slice 2 fixtures
     use the upstream default (``"cam16ucs"``).
     """
-    params = init_params(film_profile=FILM_PROFILE, print_profile=PRINT_PROFILE)
+    params = init_params(film_profile=film_profile, print_profile=print_profile)
 
     # --- camera ---------------------------------------------------------
     params.camera.auto_exposure = False
@@ -1142,6 +1154,314 @@ def build_slice2_common(images) -> dict:
 
 
 # --------------------------------------------------------------------------
+# slice 4: the full catalogue (every film x print + the direct scan)
+# --------------------------------------------------------------------------
+
+#: The 20 camera films of the upstream catalogue
+#: (``spektrafilm.model.stocks.FilmStocks``).
+SLICE4_FILM_STOCKS = (
+    "kodak_ektar_100",
+    "kodak_portra_160",
+    "kodak_portra_400",
+    "kodak_portra_800",
+    "kodak_portra_800_push1",
+    "kodak_portra_800_push2",
+    "kodak_gold_200",
+    "kodak_ultramax_400",
+    "kodak_vision3_50d",
+    "kodak_vision3_250d",
+    "kodak_verita_200d",
+    "kodak_vision3_200t",
+    "kodak_vision3_500t",
+    "fujifilm_pro_400h",
+    "fujifilm_c200",
+    "fujifilm_xtra_400",
+    "kodak_ektachrome_100",
+    "kodak_kodachrome_64",
+    "fujifilm_velvia_100",
+    "fujifilm_provia_100f",
+)
+
+#: The 8 print media of the upstream catalogue
+#: (``spektrafilm.model.stocks.PrintPapers``).
+SLICE4_PRINT_STOCKS = (
+    "kodak_ultra_endura",
+    "kodak_endura_premier",
+    "kodak_ektacolor_edge",
+    "kodak_supra_endura",
+    "kodak_portra_endura",
+    "fujifilm_crystal_archive_typeii",
+    "kodak_2383",
+    "kodak_2393",
+)
+
+#: The papers that are scanned directly do not use a print medium at all; the
+#: reference paper of the upstream GUI is kept in the parameters so that the
+#: parameter set is complete, but the result does not depend on it.
+SLICE4_DIRECT_SCAN_PRINT = "kodak_portra_endura"
+
+#: The size of the (small) slice 4 test image.
+SLICE4_IMAGE_SIZE = 6
+
+
+def build_slice4_test_image() -> np.ndarray:
+    """The deterministic linear ProPhoto RGB test image of the slice 4 (6 x 6).
+
+    row 0 : neutral grey ramp, log spaced 0.002 .. 2.0
+    row 1 : saturated colour patches
+    row 2 : skin like colour patches
+    row 3 : mixed patches (black, white, 50 % grey, 18 % grey, ...)
+    rows 4-5 : seeded random block (numpy default_rng(20261109))
+    """
+    size = SLICE4_IMAGE_SIZE
+    img = np.zeros((size, size, 3), dtype=np.float64)
+
+    grey = np.logspace(np.log10(0.002), np.log10(2.0), size)
+    img[0, :, :] = grey[:, None]
+
+    saturated = [
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+        (1.0, 1.0, 0.0),
+        (0.2, 0.8, 1.0),
+        (1.0, 0.4, 0.1),
+    ]
+    img[1, :, :] = np.array(saturated, dtype=np.float64)
+
+    skin = [
+        (0.72, 0.55, 0.45),
+        (0.60, 0.42, 0.33),
+        (0.85, 0.68, 0.57),
+        (0.45, 0.30, 0.24),
+        (0.95, 0.78, 0.66),
+        (0.35, 0.22, 0.18),
+    ]
+    img[2, :, :] = np.array(skin, dtype=np.float64)
+
+    mixed = [
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 1.0),
+        (0.5, 0.5, 0.5),
+        (0.184, 0.184, 0.184),
+        (0.9, 0.9, 0.05),
+        (0.05, 0.9, 0.9),
+    ]
+    img[3, :, :] = np.array(mixed, dtype=np.float64)
+
+    rng = np.random.default_rng(20261109)
+    block = rng.random((size - 4, size, 3))
+    lo, hi = math.log10(0.001), math.log10(4.0)
+    img[4:, :, :] = 10 ** (lo + block * (hi - lo))
+
+    return img
+
+
+def slice4_cases() -> list[tuple[str, str, bool]]:
+    """The (film, print, scan_film) triplets of the slice 4.
+
+    * the 16 colour negatives are printed on the 8 print media (128 cases),
+    * the 20 films (negatives and slides) are scanned directly (20 cases).
+    """
+    cases: list[tuple[str, str, bool]] = []
+    for film in SLICE4_FILM_STOCKS:
+        profile = load_profile(film)
+        if profile.info.type != "negative":
+            # A slide (positive) emulsion is never printed: the upstream
+            # engine scans it directly.
+            continue
+        for print_stock in SLICE4_PRINT_STOCKS:
+            cases.append((film, print_stock, False))
+    for film in SLICE4_FILM_STOCKS:
+        cases.append((film, SLICE4_DIRECT_SCAN_PRINT, True))
+    return cases
+
+
+def _slice4_digest_summary(pipeline) -> dict:
+    """The stock specific digest values of a case (they are what the port has
+    to reproduce)."""
+    dir_couplers = pipeline.film_render.dir_couplers
+    halation = pipeline.film_render.halation
+    return {
+        "neutral_filters_cc": [
+            float(pipeline.enlarger.c_filter_neutral),
+            float(pipeline.enlarger.m_filter_neutral),
+            float(pipeline.enlarger.y_filter_neutral),
+        ],
+        "dir_couplers": {
+            "gamma_samelayer_rgb": [float(v) for v in dir_couplers.gamma_samelayer_rgb],
+            "gamma_interlayer_r_to_gb": [float(v) for v in dir_couplers.gamma_interlayer_r_to_gb],
+            "gamma_interlayer_g_to_rb": [float(v) for v in dir_couplers.gamma_interlayer_g_to_rb],
+            "gamma_interlayer_b_to_rg": [float(v) for v in dir_couplers.gamma_interlayer_b_to_rg],
+        },
+        "halation": {
+            "halation_first_sigma_um": [float(v) for v in halation.halation_first_sigma_um],
+            "halation_strength": [float(v) for v in halation.halation_strength],
+        },
+        "scan_illuminant": (
+            pipeline.film.info.viewing_illuminant
+            if pipeline.io.scan_film
+            else pipeline.print.info.viewing_illuminant
+        ),
+    }
+
+
+def run_slice4_case(case, image):
+    """Run one catalogue case and collect the taps the fixture stores."""
+    film_stock, print_stock, scan_film = case
+    params = _base_params(
+        output_gamut_compress="cam16ucs",
+        film_profile=film_stock,
+        print_profile=print_stock,
+    )
+    params.io.scan_film = scan_film
+    params = digest_params(params)
+
+    pipeline = SimulationPipeline(params)
+
+    rgb_out = np.asarray(
+        pipeline.process(image, inject="rgb_in", collect="rgb_out"), dtype=np.float64
+    )
+    cmy_film = None
+    if scan_film:
+        cmy_film = np.asarray(
+            pipeline.process(image, inject="rgb_in", collect="cmy_film"), dtype=np.float64
+        )
+
+    return {
+        "id": f"{film_stock}__{print_stock}" + ("__scan" if scan_film else ""),
+        "film": film_stock,
+        "print": print_stock,
+        "mode": "scan_film" if scan_film else "print",
+        "digest": _slice4_digest_summary(pipeline),
+        "rgb_out": rgb_out,
+        "cmy_film": cmy_film,
+    }
+
+
+def _slice4_worker(task):
+    """The multiprocessing worker of the slice 4 (module level so that it can
+    be pickled)."""
+    case, image = task
+    return run_slice4_case(case, image)
+
+
+def build_slice4(image: np.ndarray, processes: int | None = None) -> dict:
+    """Build the slice 4 catalogue fixture.
+
+    ``processes`` selects the number of worker processes of the
+    ``multiprocessing`` pool.  It defaults to **one** (no pool at all): the
+    numba kernels of the upstream engine use the GNU OpenMP threading layer
+    and a pool deadlocks when the workers are forked after the kernels have
+    been compiled in the parent process.  The pool is only used when it is
+    explicitly asked for, and it then uses the ``spawn`` start method.
+    """
+    cases = slice4_cases()
+
+    started = time.time()
+
+    # Warm the numba kernels up in the parent process, so that the workers
+    # load the compiled kernels from the cache instead of compiling them.
+    run_slice4_case(cases[0], image)
+
+    if processes is None:
+        processes = 1
+    results = []
+    if processes > 1:
+        import multiprocessing
+
+        # The "spawn" start method is used on purpose: the numba kernels use
+        # the GNU OpenMP threading layer, which cannot be forked.
+        context = multiprocessing.get_context("spawn")
+        tasks = [(case, image) for case in cases]
+        with context.Pool(processes=processes) as pool:
+            for index, result in enumerate(pool.imap_unordered(_slice4_worker, tasks, chunksize=1)):
+                results.append(result)
+                print(f"  slice4 case {index + 1:3d}/{len(cases)}  {result['id']}")
+    else:
+        for index, case in enumerate(cases):
+            result = run_slice4_case(case, image)
+            results.append(result)
+            print(f"  slice4 case {index + 1:3d}/{len(cases)}  {result['id']}")
+
+    # keep the order of the case list
+    order = {case_key(case): index for index, case in enumerate(cases)}
+    results.sort(key=lambda result: order[(result["film"], result["print"], result["mode"] == "scan_film")])
+
+    payload = {
+        "format": "lightsuffer-ios slice4 catalogue fixture v1",
+        "generated_by": "tools/gen_fixtures.py",
+        "upstream": {
+            "project": UPSTREAM_PROJECT,
+            "url": UPSTREAM_URL,
+            "commit": UPSTREAM_COMMIT,
+            "license": "GPL-3.0-or-later (code) / CC BY-SA 4.0 (profile data)",
+        },
+        "notes": {
+            "float_format": "all floating point values are rounded to 7 significant digits",
+            "parameters": (
+                "init_params() with every spatial and stochastic effect "
+                "switched off (grain, halation, glare, the camera and the "
+                "enlarger diffusion filters, the lens blurs, the unsharp mask "
+                "and the auto exposure), the DIR couplers active but per "
+                "pixel, the print density curve morph off, the input gamut "
+                "compression at its upstream default (xy) and the output "
+                "gamut compression at its upstream default (cam16ucs)."
+            ),
+            "print_cases": (
+                "the 16 colour negatives printed on the 8 print media "
+                "(128 cases)."
+            ),
+            "scan_cases": (
+                "the 20 films scanned directly (io.scan_film = True). The "
+                "upstream GUI scans the slides (Velvia, Provia, Kodachrome, "
+                "Ektachrome) directly by default "
+                "(spektrafilm_gui.state.digest_after_selection) and offers the "
+                "same for the negatives. The direct scan does not use the "
+                "print medium at all: the reference paper of the upstream GUI "
+                "is kept in the parameters, the result does not depend on it."
+            ),
+            "rgb_in": (
+                "the camera image is stored once; every case is fed with the "
+                "same linear ProPhoto RGB image."
+            ),
+        },
+        "test_image": {
+            "size": [SLICE4_IMAGE_SIZE, SLICE4_IMAGE_SIZE, 3],
+            "color_space": "linear ProPhoto RGB",
+            "description": (
+                "row 0: neutral grey ramp log spaced 0.002..2.0; row 1: "
+                "saturated patches; row 2: skin like patches; row 3: mixed "
+                "patches (black, white, 50 % grey, 18 % grey, ...); rows 4-5: "
+                "seeded random block (numpy default_rng(20261109)) log spaced "
+                "0.001..4.0"
+            ),
+            "data": image,
+        },
+        "cases": [
+            {
+                "id": result["id"],
+                "film": result["film"],
+                "print": result["print"],
+                "mode": result["mode"],
+                "digest": result["digest"],
+                "rgb_out": result["rgb_out"],
+                **({"cmy_film": result["cmy_film"]} if result["cmy_film"] is not None else {}),
+            }
+            for result in results
+        ],
+    }
+    payload["elapsed_seconds"] = time.time() - started
+    return jsonable(payload)
+
+
+def case_key(case):
+    """The sort key of a slice 4 case."""
+    film_stock, print_stock, scan_film = case
+    return (film_stock, print_stock, scan_film)
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -1153,10 +1473,29 @@ def main(argv=None) -> int:
         default=DEFAULT_OUT,
         help="output directory for the fixtures (default: %(default)s)",
     )
+    parser.add_argument(
+        "--slices",
+        default="1,2,4",
+        help="the slices to generate, comma separated (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--processes",
+        type=int,
+        default=1,
+        help=(
+            "number of worker processes of the slice 4 (1 = no pool, 0 = auto). "
+            "The default is 1: the numba kernels of the upstream engine use "
+            "the GNU OpenMP threading layer and a multiprocessing pool "
+            "deadlocks when the workers are forked after the kernels have "
+            "been compiled in the parent process."
+        ),
+    )
     args = parser.parse_args(argv)
 
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
+
+    slices = {part.strip() for part in args.slices.split(",") if part.strip()}
 
     started = time.time()
     image = build_test_image()
@@ -1165,53 +1504,71 @@ def main(argv=None) -> int:
     print(f"film profile : {FILM_PROFILE}")
     print(f"print profile: {PRINT_PROFILE}")
     print(f"output dir   : {out_dir}")
+    print(f"slices       : {','.join(sorted(slices))}")
     print("-" * 72)
 
     written = []
     tc_lut = None
-    for case in CASES:
-        case_start = time.time()
-        payload, tc_lut = run_case(case, image)
-        path = os.path.join(out_dir, f"slice1_{case['name']}.json")
-        _write_json(path, jsonable(payload))
-        size = os.path.getsize(path)
-        written.append(path)
-        print(
-            f"  {case['name']:<34} {size / 1024:8.1f} KiB  "
-            f"({time.time() - case_start:5.1f} s)"
-        )
+    if "1" in slices:
+        for case in CASES:
+            case_start = time.time()
+            payload, tc_lut = run_case(case, image)
+            path = os.path.join(out_dir, f"slice1_{case['name']}.json")
+            _write_json(path, jsonable(payload))
+            size = os.path.getsize(path)
+            written.append(path)
+            print(
+                f"  {case['name']:<34} {size / 1024:8.1f} KiB  "
+                f"({time.time() - case_start:5.1f} s)"
+            )
 
-    common = build_common(tc_lut, image)
-    common_path = os.path.join(out_dir, "slice1_common.json")
-    _write_json(common_path, common)
-    written.append(common_path)
-    print(
-        f"  {'common':<34} {os.path.getsize(common_path) / 1024:8.1f} KiB"
-    )
+        common = build_common(tc_lut, image)
+        common_path = os.path.join(out_dir, "slice1_common.json")
+        _write_json(common_path, common)
+        written.append(common_path)
+        print(
+            f"  {'common':<34} {os.path.getsize(common_path) / 1024:8.1f} KiB"
+        )
 
     # --- slice 2: the whole pipeline, from rgb_in ----------------------
     images = {
         "linear_prophoto": image,
         "srgb_encoded": build_srgb_test_image(),
     }
-    for case in SLICE2_CASES:
-        case_start = time.time()
-        payload = run_slice2_case(case, images)
-        path = os.path.join(out_dir, f"slice2_{case['name']}.json")
-        _write_json(path, jsonable(payload))
-        written.append(path)
+    if "2" in slices:
+        for case in SLICE2_CASES:
+            case_start = time.time()
+            payload = run_slice2_case(case, images)
+            path = os.path.join(out_dir, f"slice2_{case['name']}.json")
+            _write_json(path, jsonable(payload))
+            written.append(path)
+            print(
+                f"  slice2 {case['name']:<28} {os.path.getsize(path) / 1024:8.1f} KiB  "
+                f"({time.time() - case_start:5.1f} s)"
+            )
+
+        slice2_common = build_slice2_common(images)
+        slice2_common_path = os.path.join(out_dir, "slice2_common.json")
+        _write_json(slice2_common_path, slice2_common)
+        written.append(slice2_common_path)
         print(
-            f"  slice2 {case['name']:<28} {os.path.getsize(path) / 1024:8.1f} KiB  "
-            f"({time.time() - case_start:5.1f} s)"
+            f"  slice2 {'common':<28} {os.path.getsize(slice2_common_path) / 1024:8.1f} KiB"
         )
 
-    slice2_common = build_slice2_common(images)
-    slice2_common_path = os.path.join(out_dir, "slice2_common.json")
-    _write_json(slice2_common_path, slice2_common)
-    written.append(slice2_common_path)
-    print(
-        f"  slice2 {'common':<28} {os.path.getsize(slice2_common_path) / 1024:8.1f} KiB"
-    )
+    # --- slice 4: the full catalogue -----------------------------------
+    if "4" in slices:
+        slice4_start = time.time()
+        slice4 = build_slice4(
+            build_slice4_test_image(),
+            processes=args.processes if args.processes > 0 else None,
+        )
+        slice4_path = os.path.join(out_dir, "slice4_catalog.json")
+        _write_json(slice4_path, slice4)
+        written.append(slice4_path)
+        print(
+            f"  slice4 {'catalogue':<28} {os.path.getsize(slice4_path) / 1024:8.1f} KiB  "
+            f"({time.time() - slice4_start:5.1f} s, {len(slice4['cases'])} cases)"
+        )
 
     total = sum(os.path.getsize(p) for p in written)
     print("-" * 72)

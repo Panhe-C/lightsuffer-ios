@@ -17,13 +17,45 @@ Licence:  CC BY-SA 4.0 (see ``SPEKTRAFILM_LICENSE.txt`` at the repository root
 resources/profiles/            the film and the print profiles
 --------------------------------------------------------------------------------
 
-    kodak_portra_400.json      unmodified copy of
-                                src/spektrafilm/data/profiles/kodak_portra_400.json
-    kodak_portra_endura.json   unmodified copy of
-                                src/spektrafilm/data/profiles/kodak_portra_endura.json
-    CHANGELOG.txt              the changelog of the copied profiles (upstream)
+    The complete upstream catalogue, copied verbatim: the 20 camera films
+    (16 colour negatives and 4 slides) and the 8 print media (6 papers and
+    2 cine print films), i.e. the 148 looks of the upstream engine
+    (16 x 8 = 128 printed looks + 20 direct scans).
 
-    No change: byte for byte copies of the upstream files.
+    kodak_ektar_100.json                  film    — CC BY-SA 4.0
+    kodak_portra_160.json                 film    — CC BY-SA 4.0
+    kodak_portra_400.json                 film    — CC BY-SA 4.0
+    kodak_portra_800.json                 film    — CC BY-SA 4.0
+    kodak_portra_800_push1.json           film    — CC BY-SA 4.0
+    kodak_portra_800_push2.json           film    — CC BY-SA 4.0
+    kodak_gold_200.json                   film    — CC BY-SA 4.0
+    kodak_ultramax_400.json               film    — CC BY-SA 4.0
+    kodak_vision3_50d.json                film    — CC BY-SA 4.0
+    kodak_vision3_250d.json               film    — CC BY-SA 4.0
+    kodak_verita_200d.json                film    — CC BY-SA 4.0
+    kodak_vision3_200t.json               film    — CC BY-SA 4.0
+    kodak_vision3_500t.json               film    — CC BY-SA 4.0
+    fujifilm_pro_400h.json                film    — CC BY-SA 4.0
+    fujifilm_c200.json                    film    — CC BY-SA 4.0
+    fujifilm_xtra_400.json                film    — CC BY-SA 4.0
+    kodak_ektachrome_100.json             slide   — CC BY-SA 4.0
+    kodak_kodachrome_64.json              slide   — CC BY-SA 4.0
+    fujifilm_velvia_100.json              slide   — CC BY-SA 4.0
+    fujifilm_provia_100f.json             slide   — CC BY-SA 4.0
+    kodak_ultra_endura.json               print   — CC BY-SA 4.0
+    kodak_endura_premier.json             print   — CC BY-SA 4.0
+    kodak_ektacolor_edge.json             print   — CC BY-SA 4.0
+    kodak_supra_endura.json               print   — CC BY-SA 4.0
+    kodak_portra_endura.json              print   — CC BY-SA 4.0
+    fujifilm_crystal_archive_typeii.json  print   — CC BY-SA 4.0
+    kodak_2383.json                       print   — CC BY-SA 4.0
+    kodak_2393.json                       print   — CC BY-SA 4.0
+    CHANGELOG.txt                         the changelog of the copied profiles
+
+    Every file is an unmodified copy of
+    src/spektrafilm/data/profiles/<stock>.json (about 206 KiB each,
+    5 790 537 bytes in total).  No change: byte for byte copies of the
+    upstream files.
 
 
 --------------------------------------------------------------------------------
@@ -45,10 +77,13 @@ resources/spectral/            the packed spectral tables
                                 change:   narrowed from double to float32
 
     illuminants.f32            the standard illuminant spectra
-                                4 x 81 float32, C order (1 296 bytes)
-                                rows:     TH-KG3, D55, D50, D65
+                                6 x 81 float32, C order (1 944 bytes)
+                                rows:     TH-KG3, D55, D50, D65, T, K75P
                                 upstream: spektrafilm.model.illuminants.standard_illuminant
-                                change:   narrowed from double to float32
+                                change:   narrowed from double to float32;
+                                          the T (incandescent) and K75P (Kinoton)
+                                          rows were added for the Kodak Vision3
+                                          200T / 500T and the Kodak 2383 / 2393
 
     The float32 narrowing costs about 1e-7 relative on the chromaticity of
     the reference illuminant; it is the floor of the colour matrix parity
@@ -63,8 +98,21 @@ resources/filters/            the neutral print filter database
                                src/spektrafilm/data/filters/neutral_print_filters.json
                                (the print stock -> illuminant -> film stock ->
                                 (C, M, Y) Kodak CC values of the neutral filters)
+                               22 195 bytes, 8 print stocks x 1 illuminant x
+                               20 films
 
     No change: byte for byte copy of the upstream file.
+
+
+--------------------------------------------------------------------------------
+the total size of the bundled resources
+--------------------------------------------------------------------------------
+
+    profiles (28 files)      5 790 537 bytes
+    spectral (3 files)       5 974 884 bytes
+    filters (1 file)             22 195 bytes
+    ------------------------------------------------
+    total                   11 787 616 bytes (11.24 MiB)
 
 
 --------------------------------------------------------------------------------
