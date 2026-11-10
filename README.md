@@ -16,7 +16,7 @@ back — not a set of baked LUTs.
 | Phase | Scope | State |
 |---|---|---|
 | P1 | `FilmPhysics`: pure-Swift port of the spektrafilm pipeline (CPU reference), validated tap by tap against the Python engine | **in progress** (slices 1, 2 and 4 ported: profile loading, the hanatos 2025 spectral upsampling and the whole camera → print → scan chain, negative development with DIR couplers, enlarger printing, print development, scanning, the cam16ucs gamut compression and the whole stock catalogue — parity with the Python engine, mean ΔE2000 ≈ 0.0021) |
-| P2 | Spatial effects (halation, grain, DIR-coupler diffusion, diffusion filters, glare, blur, unsharp) | **in progress** (slice 5 ported: the highlight boost, the in-emulsion scatter, the back-reflection halation, the DIR-coupler diffusion, the four diffusion-filter families, the lens blurs and the unsharp mask — parity with the Python engine, mean ΔE2000 ≈ 0.0011. The **grain** and the **glare** are stochastic and are deferred to the next slice) |
+| P2 | Spatial effects (halation, grain, DIR-coupler diffusion, diffusion filters, glare, blur, unsharp) | **in progress** (slice 5 ported: the highlight boost, the in-emulsion scatter, the back-reflection halation, the DIR-coupler diffusion, the four diffusion-filter families, the lens blurs and the unsharp mask — parity with the Python engine, mean ΔE2000 ≈ 0.0011. The **grain** and the **glare** are ported in slice 6 and validated statistically against the upstream) |
 | P3 | Metal port of the engine, parity-tested against the CPU reference | not started |
 | P4 | SwiftUI app shell (photo/RAW input, all parameters, export, borders) | not started |
 | P5 | Release | not started |
@@ -57,6 +57,12 @@ Sources/FilmPhysics/              pure-Swift physical engine (CPU reference)
                                   enlarger (the four families and their PSF)
   Halation.swift                  the highlight boost, the in emulsion scatter and
                                   the back reflection halation
+  Grain.swift                     the grain of the negative (the stochastic
+                                  particle model of the upstream)
+  Glare.swift                     the veiling glare of the print
+  Random.swift                    the seeded random generator and the random
+                                  variates (the uniform, the normal, the
+                                  Poisson, the binomial, the lognormal)
   GamutCompression.swift          the input and the output gamut compression
   Illuminants.swift               the illuminant spectra and their chromaticity
   NeutralPrintFilters.swift       the neutral print filter database lookup
@@ -84,6 +90,13 @@ Tests/FilmPhysicsTests/           Swift test target
                                   highlight boost, the DIR coupler diffusion, the
                                   diffusion filters, the lens blurs, the unsharp
                                   mask) and of the image space helpers
+  GrainStatisticsTests.swift      the statistical validation of the grain of the
+                                  negative (the summary statistics against the
+                                  upstream, the determinism, the timing)
+  GlareStatisticsTests.swift      the statistical validation of the glare of the
+                                  print (the summary statistics against the
+                                  upstream, the determinism)
+  StatisticsSupportTests.swift    the numerics of the statistical gate
   CatalogParityTests.swift        the whole stock catalogue (148 looks)
   ProfileLoaderTests.swift        the loaded profile vs. the digested fixture data
   ColourTests.swift               sRGB / CIELAB / CIEDE2000 (Sharma test data)
@@ -137,6 +150,20 @@ validates the ported slices against the reference fixtures:
   upstream engine) is compared with the reference.
 * `ProfileLoaderTests` — the loaded profile data vs. the digested fixture
   data (max relative difference ≤ 1e-6).
+* `GrainStatisticsTests` and `GlareStatisticsTests` — the two stochastic
+  effects cannot be reproduced bit for bit (the upstream grain draws from
+  the legacy NumPy random state, the upstream glare from the *unseeded* one),
+  so the port draws from its own seeded generator (xoshiro256\*\*) and the
+  validation compares the **summary statistics** of the field of the effect
+  (the mean, the standard deviation, the autocorrelation, the correlation of
+  the channels and the quantiles) with the ones of the upstream, over 12
+  upstream realisations. The gate is honest: the tolerance is the measured
+  spread of the upstream times the critical value of a Bonferroni corrected
+  Student t test (k = 7.84 over the 836 comparisons of the family, at a
+  family-wise false alarm rate of 1 %), with **no relative and no absolute
+  tolerance** of its own. Measured: max |z| = 3.80 (the grain against the
+  upstream fast samplers) and 3.51 (the glare); the grain of a 1024 × 1024
+  image takes 0.92 s in the release build.
 * `ColourTests` — the sRGB transfer function, the CIELAB conversion and the
   CIEDE2000 formula against the published Sharma et al. test pairs.
 * `NumericsTests` — the interpolation semantics, the geometric mean and the

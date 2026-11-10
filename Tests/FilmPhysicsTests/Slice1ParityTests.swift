@@ -105,7 +105,7 @@ final class Slice1ParityTests: XCTestCase {
         let filmRenderInputs = FilmRenderInputs(
             dirCouplers: digest.dirCouplers,
             densityCurveGamma: digest.densityCurveGamma,
-            grainDensityMin: try XCTUnwrap(grainParams["density_min"]?.doubles),
+            grain: try filmParams.grainParams(),
             pixelSizeUM: try XCTUnwrap(derived["pixel_size_um"]?.double)
         )
 
@@ -247,7 +247,7 @@ final class Slice1ParityTests: XCTestCase {
             normalizePrintExposure: inputs.enlarger.normalizePrintExposure
         )
 
-        let cmyBlack = inputs.filmRender.grainDensityMin.map { -$0 }
+        let cmyBlack = inputs.filmRender.grain.densityMin.map { -$0 }
         let cmyWhite = (0..<3).map { channel in
             Numerics.nanMax(film.data.densityCurves.map { $0[channel] })
         }

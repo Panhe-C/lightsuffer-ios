@@ -95,12 +95,18 @@ final class CatalogParityTests: XCTestCase {
         // effects: the halation and the scatter of the negative are off.
         var filmRender = FilmRenderParams(dirCouplers: dirCouplers)
         filmRender.halation.active = false
+        // The reference fixtures of the catalogue also run without the
+        // stochastic effects: the grain of the negative and the glare of
+        // the print are off (the upstream glare is drawn from the unseeded
+        // NumPy random state and cannot be captured in a reference).
+        filmRender.grain.active = false
 
         return PipelineParams(
             film: filmProfile,
             print: printProfile,
             camera: CameraParams(autoExposure: false),
             filmRender: filmRender,
+            printRender: PrintRenderParams(glare: GlareParams(active: false)),
             scanner: ScannerParams(unsharpMaskSigma: 0, unsharpMaskAmount: 0),
             io: IOParams(scanFilm: scanFilm)
         )

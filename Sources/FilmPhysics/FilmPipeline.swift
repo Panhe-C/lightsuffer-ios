@@ -164,8 +164,11 @@ public struct FilmRenderParams: Equatable, Sendable {
     public var dirCouplers: DirCouplersParams
     /// The gamma factor of the density curves.
     public var densityCurveGamma: Double
-    /// The minimum density of the grain, per channel.
-    public var grainDensityMin: [Double]
+    /// The grain of the negative.
+    ///
+    /// Its minimum density defines the black patch of the negative, which the
+    /// printing stage uses for the black reference.
+    public var grain: GrainParams
     /// The halation and the scatter of the negative.
     ///
     /// The digest of the stock sets the width of the first halation bounce
@@ -177,14 +180,48 @@ public struct FilmRenderParams: Equatable, Sendable {
     public init(
         dirCouplers: DirCouplersParams = DirCouplersParams(),
         densityCurveGamma: Double = 1.0,
-        grainDensityMin: [Double] = [0.03, 0.03, 0.03],
+        grain: GrainParams = GrainParams(),
         halation: HalationParams = HalationParams()
     ) {
         self.dirCouplers = dirCouplers
         self.densityCurveGamma = densityCurveGamma
-        self.grainDensityMin = grainDensityMin
+        self.grain = grain
         self.halation = halation
     }
+}
+
+/// The parameters of the print rendering.
+///
+/// Upstream reference: `spektrafilm.runtime.params_schema.PrintRenderingParams`.
+public struct PrintRenderParams: Equatable, Sendable {
+    /// The glare of the print.
+    public var glare: GlareParams
+
+    public init(glare: GlareParams = GlareParams()) {
+        self.glare = glare
+    }
+}
+
+/// The parameters of the stochastic effects.
+///
+/// The upstream engine has **no reproducible** stochastic path: the grain
+/// reseeds the global legacy NumPy random state with a fixed seed per
+/// channel and sub layer, and the glare draws from the *unseeded* global
+/// state. The port makes the seed an explicit parameter of the pipeline, so
+/// that a render is exactly reproducible.
+public struct StochasticParams: Equatable, Sendable {
+    /// The seed of the random number generator.
+    public var seed: UInt64
+
+    public init(seed: UInt64 = StochasticParams.defaultSeed) {
+        self.seed = seed
+    }
+
+    /// The default seed of the port.
+    ///
+    /// A fixed value, so that two renders of the same image with the same
+    /// parameters are bit identical.
+    public static let defaultSeed: UInt64 = 0x1F1E_5A17_0000_0001
 }
 
 /// The input / output parameters.
@@ -275,6 +312,8 @@ public struct PipelineParams: Equatable, Sendable {
     public var camera: CameraParams
     /// The film rendering parameters.
     public var filmRender: FilmRenderParams
+    /// The print rendering parameters.
+    public var printRender: PrintRenderParams
     /// The enlarger parameters.
     public var enlarger: EnlargerParams
     /// The scanner parameters.
@@ -283,25 +322,31 @@ public struct PipelineParams: Equatable, Sendable {
     public var io: IOParams
     /// The settings of the pipeline.
     public var settings: SettingsParams
+    /// The parameters of the stochastic effects (the seed).
+    public var stochastic: StochasticParams
 
     public init(
         film: Profile,
         print: Profile,
         camera: CameraParams = CameraParams(),
         filmRender: FilmRenderParams = FilmRenderParams(),
+        printRender: PrintRenderParams = PrintRenderParams(),
         enlarger: EnlargerParams = EnlargerParams(),
         scanner: ScannerParams = ScannerParams(),
         io: IOParams = IOParams(),
-        settings: SettingsParams = SettingsParams()
+        settings: SettingsParams = SettingsParams(),
+        stochastic: StochasticParams = StochasticParams()
     ) {
         self.film = film
         self.print = print
         self.camera = camera
         self.filmRender = filmRender
+        self.printRender = printRender
         self.enlarger = enlarger
         self.scanner = scanner
         self.io = io
         self.settings = settings
+        self.stochastic = stochastic
     }
 }
 
@@ -531,19 +576,21 @@ public struct FilmPipeline {
             ),
             lensBlur: params.scanner.lensBlur,
             unsharpMaskSigma: params.scanner.unsharpMaskSigma,
-            unsharpMaskAmount: params.scanner.unsharpMaskAmount
+            unsharpMaskAmount: params.scanner.unsharpMaskAmount,
+            glare: params.printRender.glare
         )
         let filmRenderInputs = FilmRenderInputs(
             dirCouplers: digest.dirCouplers,
             densityCurveGamma: digest.densityCurveGamma,
-            grainDensityMin: params.filmRender.grainDensityMin,
+            grain: digest.grain,
             halation: digest.halation
         )
         self.inputs = Slice1Inputs(
             spectral: spectralInputs,
             enlarger: enlargerInputs,
             scanner: scannerInputs,
-            filmRender: filmRenderInputs
+            filmRender: filmRenderInputs,
+            seed: params.stochastic.seed
         )
     }
 

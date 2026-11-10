@@ -66,6 +66,39 @@ extension JSONValue {
         return params
     }
 
+    /// The grain parameters of a fixture.
+    ///
+    /// Upstream reference: `spektrafilm.runtime.params_schema.GrainParams`.
+    func grainParams(file: StaticString = #filePath, line: UInt = #line) throws -> GrainParams {
+        var params = GrainParams()
+        guard let grain = self["grain"] else { return params }
+        if let active = grain["active"]?.bool { params.active = active }
+        if let value = grain["sublayers_active"]?.bool { params.sublayersActive = value }
+        if let value = grain["particle_area_um2"]?.double { params.particleAreaUM2 = value }
+        if let values = grain["particle_scale"]?.doubles { params.particleScale = values }
+        if let values = grain["particle_scale_layers"]?.doubles { params.particleScaleLayers = values }
+        if let values = grain["density_min"]?.doubles { params.densityMin = values }
+        if let values = grain["uniformity"]?.doubles { params.uniformity = values }
+        if let value = grain["blur"]?.double { params.blur = value }
+        if let value = grain["blur_dye_clouds_um"]?.double { params.blurDyeCloudsUM = value }
+        if let values = grain["micro_structure"]?.doubles { params.microStructure = values }
+        if let value = grain["n_sub_layers"]?.int { params.nSubLayers = value }
+        return params
+    }
+
+    /// The glare parameters of a fixture.
+    ///
+    /// Upstream reference: `spektrafilm.runtime.params_schema.GlareParams`.
+    func glareParams(file: StaticString = #filePath, line: UInt = #line) throws -> GlareParams {
+        var params = GlareParams()
+        guard let glare = self["glare"] else { return params }
+        if let active = glare["active"]?.bool { params.active = active }
+        if let value = glare["percent"]?.double { params.percent = value }
+        if let value = glare["roughness"]?.double { params.roughness = value }
+        if let value = glare["blur"]?.double { params.blur = value }
+        return params
+    }
+
     /// The DIR coupler parameters of a fixture.
     ///
     /// Upstream reference: `spektrafilm.runtime.params_schema.DirCouplersParams`.
@@ -180,10 +213,12 @@ func makePipelineParams(
         filmRender: FilmRenderParams(
             dirCouplers: digest.dirCouplers,
             densityCurveGamma: digest.densityCurveGamma,
-            grainDensityMin: try XCTUnwrap(
-                grain["density_min"]?.doubles, file: file, line: line
-            ),
+            grain: try filmRender.grainParams(file: file, line: line),
             halation: digest.halation
+        ),
+        printRender: PrintRenderParams(
+            glare: try XCTUnwrap(params["print_render"], file: file, line: line)
+                .glareParams(file: file, line: line)
         ),
         enlarger: EnlargerParams(
             illuminant: try XCTUnwrap(

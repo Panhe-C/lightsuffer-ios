@@ -77,7 +77,9 @@ public enum Scanning {
     /// `spektrafilm.runtime.stages.scanning.ScanningStage.scan` and
     /// `ScanningStage._density_to_rgb`.
     ///
-    /// The glare of the print is not ported (it is a stochastic effect).
+    /// The glare of the print is added to the tristimulus values, before the
+    /// conversion to RGB (upstream reference:
+    /// `spektrafilm.model.glare.add_glare`).
     ///
     /// - Parameters:
     ///   - cmy: the densities of the print, three values per pixel.
@@ -98,6 +100,8 @@ public enum Scanning {
     ///   - lensBlur: the radius of the lens blur of the scanner, in pixels.
     ///   - unsharpMaskSigma: the sigma of the unsharp mask, in pixels.
     ///   - unsharpMaskAmount: the amount of the unsharp mask.
+    ///   - glare: the glare of the print (`nil` disables it).
+    ///   - seed: the seed of the random number generator.
     /// - Returns: the encoded output RGB image, three values per pixel.
     public static func scan(
         cmy: [Double],
@@ -113,7 +117,9 @@ public enum Scanning {
         height: Int = 0,
         lensBlur: Double = 0,
         unsharpMaskSigma: Double = 0,
-        unsharpMaskAmount: Double = 0
+        unsharpMaskAmount: Double = 0,
+        glare: GlareParams? = nil,
+        seed: UInt64 = StochasticParams.defaultSeed
     ) -> [Double] {
         scan(
             cmy: cmy,
@@ -130,7 +136,9 @@ public enum Scanning {
             height: height,
             lensBlur: lensBlur,
             unsharpMaskSigma: unsharpMaskSigma,
-            unsharpMaskAmount: unsharpMaskAmount
+            unsharpMaskAmount: unsharpMaskAmount,
+            glare: glare,
+            seed: seed
         )
     }
 
@@ -164,6 +172,8 @@ public enum Scanning {
     ///   - lensBlur: the radius of the lens blur of the scanner, in pixels.
     ///   - unsharpMaskSigma: the sigma of the unsharp mask, in pixels.
     ///   - unsharpMaskAmount: the amount of the unsharp mask.
+    ///   - glare: the glare of the print (`nil` disables it).
+    ///   - seed: the seed of the random number generator.
     /// - Returns: the encoded output RGB image, three values per pixel.
     public static func scan(
         cmy: [Double],
@@ -180,7 +190,9 @@ public enum Scanning {
         height: Int = 0,
         lensBlur: Double = 0,
         unsharpMaskSigma: Double = 0,
-        unsharpMaskAmount: Double = 0
+        unsharpMaskAmount: Double = 0,
+        glare: GlareParams? = nil,
+        seed: UInt64 = StochasticParams.defaultSeed
     ) -> [Double] {
         let logXYZ = cmyToLogXYZ(
             cmy: cmy,
@@ -192,6 +204,25 @@ public enum Scanning {
         )
         var xyz = logXYZ.map { pow(10.0, $0) }
         xyz = colorReference.xyzCorrection(xyz: xyz)
+
+        // The glare of the print, added to the tristimulus values.
+        //
+        // Upstream reference: `spektrafilm.model.glare.add_glare`.
+        if let glare, glare.active, glare.percent > 0 {
+            let illuminantXYZ = Glare.illuminantXYZ(
+                scanIlluminant: scanIlluminant,
+                colourMatchingFunctions: colourMatchingFunctions,
+                normalization: normalization
+            )
+            xyz = Glare.apply(
+                xyz: xyz,
+                illuminantXYZ: illuminantXYZ,
+                glare: glare,
+                width: width,
+                height: height,
+                seed: seed
+            )
+        }
 
         // XYZ -> RGB. The matrix stores the RGB response of every XYZ basis
         // vector in its rows, so the conversion is a row vector product.

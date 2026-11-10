@@ -198,6 +198,11 @@ public struct ScannerInputs: Equatable, Sendable {
     public var unsharpMaskSigma: Double
     /// The amount of the unsharp mask of the scanner.
     public var unsharpMaskAmount: Double
+    /// The glare of the print.
+    ///
+    /// It is `nil` for the direct scan of a film: the upstream engine does
+    /// not apply any glare when the emulsion is scanned directly.
+    public var glare: GlareParams?
 
     public init(
         xyzToRGB: [[Double]],
@@ -207,7 +212,8 @@ public struct ScannerInputs: Equatable, Sendable {
         colorReference: ColorReference = ColorReference(),
         lensBlur: Double = 0,
         unsharpMaskSigma: Double = 0,
-        unsharpMaskAmount: Double = 0
+        unsharpMaskAmount: Double = 0,
+        glare: GlareParams? = nil
     ) {
         self.xyzToRGB = xyzToRGB
         self.srgbToSRGB = srgbToSRGB
@@ -217,6 +223,7 @@ public struct ScannerInputs: Equatable, Sendable {
         self.lensBlur = lensBlur
         self.unsharpMaskSigma = unsharpMaskSigma
         self.unsharpMaskAmount = unsharpMaskAmount
+        self.glare = glare
     }
 
     /// The output gamut compression to apply.
@@ -236,11 +243,11 @@ public struct FilmRenderInputs: Equatable, Sendable {
     public var dirCouplers: DirCouplersParams
     /// The gamma factor of the density curves.
     public var densityCurveGamma: Double
-    /// The minimum density of the grain, per channel.
+    /// The grain of the negative.
     ///
-    /// It defines the black patch of the negative, which the printing stage
-    /// uses for the black reference.
-    public var grainDensityMin: [Double]
+    /// Its minimum density defines the black patch of the negative, which the
+    /// printing stage uses for the black reference.
+    public var grain: GrainParams
     /// The halation and the scatter of the negative.
     public var halation: HalationParams
     /// The size of a pixel of the negative, in micrometres.
@@ -251,13 +258,13 @@ public struct FilmRenderInputs: Equatable, Sendable {
     public init(
         dirCouplers: DirCouplersParams = DirCouplersParams(),
         densityCurveGamma: Double = 1.0,
-        grainDensityMin: [Double] = [0.03, 0.03, 0.03],
+        grain: GrainParams = GrainParams(),
         halation: HalationParams = HalationParams(),
         pixelSizeUM: Double = 0
     ) {
         self.dirCouplers = dirCouplers
         self.densityCurveGamma = densityCurveGamma
-        self.grainDensityMin = grainDensityMin
+        self.grain = grain
         self.halation = halation
         self.pixelSizeUM = pixelSizeUM
     }
@@ -273,17 +280,26 @@ public struct Slice1Inputs: Equatable, Sendable {
     public var scanner: ScannerInputs
     /// The film rendering settings.
     public var filmRender: FilmRenderInputs
+    /// The seed of the random number generator of the stochastic effects.
+    ///
+    /// The upstream engine has no reproducible stochastic path (the grain
+    /// uses a fixed seed and the glare the unseeded global NumPy random
+    /// state); the port makes the seed an explicit parameter, so that a
+    /// render is exactly reproducible.
+    public var seed: UInt64
 
     public init(
         spectral: SpectralInputs,
         enlarger: EnlargerInputs,
         scanner: ScannerInputs,
-        filmRender: FilmRenderInputs = FilmRenderInputs()
+        filmRender: FilmRenderInputs = FilmRenderInputs(),
+        seed: UInt64 = StochasticParams.defaultSeed
     ) {
         self.spectral = spectral
         self.enlarger = enlarger
         self.scanner = scanner
         self.filmRender = filmRender
+        self.seed = seed
     }
 }
 
@@ -489,6 +505,23 @@ public struct Slice1Pipeline {
             )
         }
 
+        // The grain of the negative.
+        //
+        // Upstream reference: `spektrafilm.model.develop.develop` (the grain
+        // is the last step of the development) and
+        // `spektrafilm.model.grain.apply_grain`.
+        density = Grain.apply(
+            densityCMY: density,
+            width: logRaw.width,
+            height: logRaw.height,
+            pixelSizeUM: inputs.filmRender.pixelSizeUM,
+            grain: inputs.filmRender.grain,
+            densityCurves: normalized,
+            densityCurvesLayers: film.data.densityCurvesLayers,
+            positiveFilm: film.info.type == .positive,
+            seed: inputs.seed
+        )
+
         return RGBImage(width: logRaw.width, height: logRaw.height, data: density)
     }
 
@@ -544,7 +577,7 @@ public struct Slice1Pipeline {
 
         // The black and the white patch of the negative, used by the black
         // and white reference of the print.
-        let cmyFilmBlack = inputs.filmRender.grainDensityMin.map { -$0 }
+        let cmyFilmBlack = inputs.filmRender.grain.densityMin.map { -$0 }
         let cmyFilmWhite = (0..<3).map { channel in
             Numerics.nanMax(film.data.densityCurves.map { $0[channel] })
         }
@@ -643,7 +676,9 @@ public struct Slice1Pipeline {
             height: cmyPrint.height,
             lensBlur: inputs.scanner.lensBlur,
             unsharpMaskSigma: inputs.scanner.unsharpMaskSigma,
-            unsharpMaskAmount: inputs.scanner.unsharpMaskAmount
+            unsharpMaskAmount: inputs.scanner.unsharpMaskAmount,
+            glare: inputs.scanner.glare,
+            seed: inputs.seed
         )
         return RGBImage(width: cmyPrint.width, height: cmyPrint.height, data: rgb)
     }

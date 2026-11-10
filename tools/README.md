@@ -54,6 +54,7 @@ For every parameter case the script runs
 | `slice2_output_gamut_off.json` | slice 2 case 4 |
 | `slice4_catalog.json` | the whole catalogue of the upstream engine: the 128 printed looks (16 negatives × 8 print media) and the 20 direct scans, with the digest of every case |
 | `slice5_spatial.json` | the spatial effects: the ten parameter cases (the upstream defaults, every deterministic effect alone and all of them at once), the textured 32 × 32 test image and the reference of the image space helpers |
+| `slice6_stochastic.json` | the stochastic effects: the 16 cases (four stocks × four images), the 64 × 64 test images (a flat patch and a textured one), the parameters of every case and the **summary statistics** of the grain and of the glare over 12 upstream realisations (against the two upstream samplers for the grain) |
 
 Total size is ≈ 2.5 MB (slice 1: ≈ 972 KiB, slice 2: ≈ 232 KiB, slice 4:
 ≈ 378 KiB, slice 5: ≈ 1.06 MB).
@@ -119,7 +120,7 @@ scanner.
 The **grain** and the **glare** are *not* part of them: the grain draws its
 particles from the SciPy binomial and Poisson random variates and the glare
 draws a lognormal from the unseeded NumPy random state (the upstream itself
-is not reproducible there). Both are deferred to a later slice.
+is not reproducible there). Both are deferred to the slice 6 (below).
 
 The test image is a 32 × 32 linear ProPhoto RGB image with a grey ramp,
 saturated and skin-like patches, two highlight spots (one neutral, one warm),
@@ -149,6 +150,50 @@ The file also carries the reference of the image space helpers (the `helpers`
 block): the separable FIR Gaussian, the Young & van Vliet IIR Gaussian, the
 exponential filter (the Gaussian mixture surrogate) and the `reflect`
 boundary of the upstream kernels.
+
+## The slice 6 fixtures (the stochastic effects)
+
+The slice 6 fixtures exercise the two **stochastic** effects of the upstream
+engine: the grain of the negative and the veiling glare of the print.
+
+Neither of them can be reproduced bit for bit, so the fixture stores their
+**summary statistics** over **12 upstream realisations** instead of the
+fields:
+
+* the upstream grain reseeds the global legacy NumPy random state with a
+  fixed seed per channel and sub layer (`[0, 1, 2]`, `+ 10` per sub layer),
+  so the upstream grain is deterministic; the fixture **shifts** those seeds
+  by `1000 · (seed + 1)` to measure the spread of the upstream — the
+  algorithm is not touched;
+* the upstream glare draws from the **unseeded** global NumPy random state,
+  so the fixture seeds it (`numpy.random.seed(seed)`) before every run.
+
+The statistics of a field are the ones the Swift port computes as well: the
+mean and the standard deviation of every channel (`mean_c`, `std_c`), the
+autocorrelation of the centred field at the lags 1, 2, 3, 5 and 8 (`acf_l`,
+the horizontal and the vertical neighbours pooled), the correlation of the
+three channels (`corr_i_j`) and the quantiles 5 %, 25 %, 50 %, 75 % and 95 %
+of the density histogram (`qXX`, the three channels pooled).  Every case
+stores the statistics of the 12 realisations and their aggregate (the mean,
+the spread, the minimum and the maximum).
+
+The grain is stored **twice** per case: against the default upstream path
+(the exact SciPy `poisson` and `binom` generators) and against the fast
+path (`settings.use_fast_stats = True`, the normal approximations of
+`spektrafilm.utils.fast_stats`, the kernels the Swift port reproduces).  The
+difference between the two aggregates measures the error of the normal
+approximation of the fast samplers.
+
+The cases use a **1 mm film format** (a pixel of 15.6 µm on the 64 × 64
+images): the amplitude of the shot noise of the emulsion scales with one
+over the square root of the number of particles a pixel holds, i.e. with the
+area of the pixel, so a 35 mm frame would make the grain a mathematical
+no-op on a 64 × 64 image.
+
+The fixture is generated **serially**, like every other slice (the numba
+kernels of the upstream engine use the GNU OpenMP threading layer and a
+`multiprocessing` pool deadlocks when the workers are forked after the
+kernels have been compiled in the parent process).
 
 ## Number format
 

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import json
 import math
@@ -2040,6 +2041,430 @@ def build_slice5(image: np.ndarray) -> dict:
 
 
 # --------------------------------------------------------------------------
+# slice 6: the stochastic effects (the grain of the negative and the glare of
+# the print)
+# --------------------------------------------------------------------------
+
+#: The size of the slice 6 test images.
+SLICE6_IMAGE_SIZE = 64
+
+#: The film format (in millimetres) of the slice 6 cases.
+#:
+#: The grain of the negative is a *statistical* effect: its amplitude is the
+#: shot noise of the silver halide grains a pixel of the negative holds, i.e.
+#: it scales with one over the square root of the number of particles per
+#: pixel.  The number of particles of a pixel is the area of the pixel (in
+#: square micrometres) divided by the area of a particle (0.2 um^2), so the
+#: grain is only visible when the pixel of the negative is small: on a 64 x 64
+#: image a 35 mm frame gives a pixel of 546 um and the grain is 0.1 % of the
+#: density.  The cases therefore use a narrow film format (1 mm, i.e. a pixel
+#: of 15.6 um), like the slice 5 does for the micrometre scale effects.
+SLICE6_NARROW_FILM_FORMAT_MM = 1.0
+
+#: The lags (in pixels) of the autocorrelation of the grain.
+SLICE6_LAGS = (1, 2, 3, 5, 8)
+
+#: The quantiles of the density histogram.
+SLICE6_QUANTILES = (0.05, 0.25, 0.5, 0.75, 0.95)
+
+#: The upstream seeds of the slice 6 cases.
+#:
+#: The upstream grain reseeds the global NumPy random state with a *fixed*
+#: seed (0, 1 and 2 per channel, plus ten per sub layer), so the upstream
+#: grain is deterministic; the fixture shifts those seeds to measure the
+#: spread of the upstream.  The upstream glare draws from the *unseeded* global
+#: random state, so the fixture seeds it.
+#:
+#: Twelve seeds are used: the spread of the upstream is the reference of the
+#: validation, and the estimate of a standard deviation from twelve samples
+#: has a relative error of about 20 %.
+SLICE6_SEEDS = tuple(range(12))
+
+#: The stocks of the slice 6 cases.
+SLICE6_STOCKS = (
+    {
+        "id": "portra_400",
+        "film": "kodak_portra_400",
+        "print": "kodak_portra_endura",
+        "scan_film": False,
+    },
+    {
+        "id": "ultramax_400",
+        "film": "kodak_ultramax_400",
+        "print": "kodak_portra_endura",
+        "scan_film": False,
+    },
+    {
+        "id": "vision3_500t",
+        "film": "kodak_vision3_500t",
+        "print": "kodak_2383",
+        "scan_film": False,
+    },
+    {
+        "id": "velvia_100",
+        "film": "fujifilm_velvia_100",
+        "print": "kodak_portra_endura",
+        "scan_film": True,
+    },
+)
+
+#: The test images of the slice 6 cases.
+SLICE6_IMAGES = (
+    {"id": "flat_ev_minus2", "kind": "flat", "ev": -2.0},
+    {"id": "flat_ev_0", "kind": "flat", "ev": 0.0},
+    {"id": "flat_ev_plus2", "kind": "flat", "ev": 2.0},
+    {"id": "textured_ev_0", "kind": "textured", "ev": 0.0},
+)
+
+
+def build_slice6_images() -> dict:
+    """The test images of the slice 6 (the stochastic effects).
+
+    * a flat mid grey patch (0.18, linear ProPhoto RGB): the grain of a flat
+      patch is the pure shot noise of the emulsion,
+    * a textured patch: a vertical ramp, a noise floor and two saturated
+      patches.
+    """
+    size = SLICE6_IMAGE_SIZE
+    flat = np.full((size, size, 3), 0.18, dtype=np.float64)
+
+    rng = np.random.default_rng(20261111)
+    ramp = np.logspace(math.log10(0.01), math.log10(2.0), size)[:, None]
+    noise = 10 ** (
+        math.log10(0.002)
+        + rng.random((size, size, 3)) * (math.log10(3.0) - math.log10(0.002))
+    )
+    textured = np.repeat(ramp[:, :, None], size, axis=1) * 0.5 + noise
+    textured[10:20, 10:20, :] = np.array([0.9, 0.2, 0.05])
+    textured[30:40, 30:40, :] = np.array([0.05, 0.4, 0.9])
+
+    return {"flat": flat, "textured": textured}
+
+
+def _slice6_base_params(stock: dict, ev: float, output_gamut_compress: str = "cam16ucs"):
+    """The upstream defaults of a slice 6 case.
+
+    Every parameter keeps its upstream default value; the only changes are
+    the ones the port needs: the auto exposure is off (not ported yet) and
+    the film format is narrow (so that the grain is visible on a 64 x 64
+    image).
+    """
+    params = init_params(film_profile=stock["film"], print_profile=stock["print"])
+
+    params.camera.auto_exposure = False
+    params.camera.film_format_mm = SLICE6_NARROW_FILM_FORMAT_MM
+    params.camera.exposure_compensation_ev = ev
+
+    params.io.scan_film = stock["scan_film"]
+    params.io.crop = False
+    params.io.upscale_factor = 1.0
+    params.io.output_gamut_compress = OutputGamutCompressSpec(
+        algorithm=output_gamut_compress
+    )
+
+    params.print_render.density_curves_morph = replace(
+        params.print_render.density_curves_morph, active=False
+    )
+
+    params.debug.deactivate_spatial_effects = False
+    params.debug.deactivate_stochastic_effects = False
+    params.debug.lut_mode = False
+    params.settings.preview_mode = False
+    params.settings.use_enlarger_lut = False
+    params.settings.use_scanner_lut = False
+
+    return params
+
+
+@contextlib.contextmanager
+def _upstream_grain_seed_offset(offset: int):
+    """Shifts the fixed seeds the upstream grain uses.
+
+    The upstream grain reseeds the global NumPy random state with a fixed
+    seed for every channel and sub layer, so two runs of the upstream engine
+    are bit identical.  To measure the spread of the upstream, the fixture
+    shifts those seeds; the algorithm of the upstream is not touched.
+    """
+    import spektrafilm.model.grain as grain_module
+
+    original = grain_module.layer_particle_model
+
+    def patched(density, *args, **kwargs):
+        seed = kwargs.get("seed")
+        if seed is not None:
+            kwargs["seed"] = seed + offset
+        return original(density, *args, **kwargs)
+
+    grain_module.layer_particle_model = patched
+    try:
+        yield
+    finally:
+        grain_module.layer_particle_model = original
+
+
+def field_statistics(field: np.ndarray) -> dict:
+    """The summary statistics of a field (height x width x 3).
+
+    The statistics are the ones the Swift port computes as well:
+
+    * the mean and the standard deviation of every channel,
+    * the autocorrelation of the field at a few lags (the horizontal and the
+      vertical neighbours are pooled, the field is centred first),
+    * the correlation of the three channels,
+    * the quantiles of the density histogram (the three channels pooled).
+    """
+    channels = field.shape[2]
+    centered = field - field.mean(axis=(0, 1), keepdims=True)
+
+    stats = {}
+    for channel in range(channels):
+        plane = field[:, :, channel]
+        stats[f"mean_{channel}"] = float(plane.mean())
+        stats[f"std_{channel}"] = float(plane.std())
+
+    for lag in SLICE6_LAGS:
+        numerator = 0.0
+        denominator = 0.0
+        for channel in range(channels):
+            plane = centered[:, :, channel]
+            left = plane[:, :-lag]
+            right = plane[:, lag:]
+            numerator += float((left * right).sum())
+            denominator += float((left * left).sum())
+            top = plane[:-lag, :]
+            bottom = plane[lag:, :]
+            numerator += float((top * bottom).sum())
+            denominator += float((top * top).sum())
+        stats[f"acf_{lag}"] = numerator / denominator if denominator > 0 else 0.0
+
+    for first, second in ((0, 1), (0, 2), (1, 2)):
+        a = field[:, :, first].ravel()
+        b = field[:, :, second].ravel()
+        sa = a.std()
+        sb = b.std()
+        covariance = float(((a - a.mean()) * (b - b.mean())).mean())
+        stats[f"corr_{first}_{second}"] = (
+            covariance / (sa * sb) if sa > 0 and sb > 0 else 0.0
+        )
+
+    flat = field.reshape(-1)
+    for quantile in SLICE6_QUANTILES:
+        stats[f"q{int(round(quantile * 100)):02d}"] = float(np.quantile(flat, quantile))
+
+    return stats
+
+
+def aggregate_statistics(runs: list) -> dict:
+    """The mean and the spread of a statistic over the seeds of a case."""
+    if not runs:
+        return {}
+    keys = list(runs[0].keys())
+    aggregate = {}
+    for key in keys:
+        values = np.array([run[key] for run in runs], dtype=np.float64)
+        aggregate[key] = {
+            "mean": float(values.mean()),
+            "std": float(values.std()),
+            "min": float(values.min()),
+            "max": float(values.max()),
+        }
+    return aggregate
+
+
+def run_slice6_case(stock: dict, image_case: dict, image: np.ndarray) -> dict:
+    """Run one slice 6 case and collect the statistics of the two effects."""
+    ev = image_case["ev"]
+
+    # --- the reference (every stochastic effect off) --------------------
+    reference_params = _slice6_base_params(stock, ev)
+    reference_params.film_render.grain.active = False
+    reference_params.print_render.glare.active = False
+    reference_params = digest_params(reference_params)
+    reference_pipeline = SimulationPipeline(reference_params)
+    reference_cmy_film = np.asarray(
+        reference_pipeline.process(image, inject="rgb_in", collect="cmy_film"),
+        dtype=np.float64,
+    )
+    reference_rgb_out = np.asarray(
+        reference_pipeline.process(image, inject="rgb_in", collect="rgb_out"),
+        dtype=np.float64,
+    )
+
+    # --- the grain of the negative --------------------------------------
+    grain_params = _slice6_base_params(stock, ev)
+    grain_params.film_render.grain.active = True
+    grain_params.print_render.glare.active = False
+    grain_params = digest_params(grain_params)
+
+    grain_runs = []
+    grain_fast_runs = []
+    for seed in SLICE6_SEEDS:
+        with _upstream_grain_seed_offset(1000 * (seed + 1)):
+            pipeline = SimulationPipeline(grain_params)
+            cmy_film = np.asarray(
+                pipeline.process(image, inject="rgb_in", collect="cmy_film"),
+                dtype=np.float64,
+            )
+        grain_runs.append(field_statistics(cmy_film - reference_cmy_film))
+
+        # The same run with the fast samplers of the upstream
+        # (`spektrafilm.utils.fast_stats`), which the Swift port reproduces.
+        fast_params = _slice6_base_params(stock, ev)
+        fast_params.film_render.grain.active = True
+        fast_params.print_render.glare.active = False
+        fast_params.settings.use_fast_stats = True
+        fast_params = digest_params(fast_params)
+        with _upstream_grain_seed_offset(1000 * (seed + 1)):
+            pipeline = SimulationPipeline(fast_params)
+            cmy_film_fast = np.asarray(
+                pipeline.process(image, inject="rgb_in", collect="cmy_film"),
+                dtype=np.float64,
+            )
+        grain_fast_runs.append(field_statistics(cmy_film_fast - reference_cmy_film))
+
+    # --- the glare of the print ----------------------------------------
+    glare_runs = []
+    glare_applicable = not stock["scan_film"]
+    if glare_applicable:
+        glare_params = _slice6_base_params(stock, ev)
+        glare_params.film_render.grain.active = False
+        glare_params.print_render.glare.active = True
+        glare_params = digest_params(glare_params)
+        for seed in SLICE6_SEEDS:
+            # The upstream glare draws from the global NumPy random state.
+            np.random.seed(seed)
+            pipeline = SimulationPipeline(glare_params)
+            rgb_out = np.asarray(
+                pipeline.process(image, inject="rgb_in", collect="rgb_out"),
+                dtype=np.float64,
+            )
+            glare_runs.append(field_statistics(rgb_out - reference_rgb_out))
+
+    # The parameters the Swift port replays: both stochastic effects are
+    # active, the test switches the one it does not use off.
+    replay_params = _slice6_base_params(stock, ev)
+    replay_params.film_render.grain.active = True
+    replay_params.print_render.glare.active = True
+    replay_params = digest_params(replay_params)
+
+    return {
+        "id": f"{stock['id']}__{image_case['id']}",
+        "film": stock["film"],
+        "print": stock["print"],
+        "scan_film": stock["scan_film"],
+        "image": image_case["id"],
+        "exposure_compensation_ev": ev,
+        "pixel_size_um": float(
+            SLICE6_NARROW_FILM_FORMAT_MM * 1000 / max(image.shape[0:2])
+        ),
+        "params": params_to_json(replay_params),
+        "grain": {
+            "seeds": grain_runs,
+            "aggregate": aggregate_statistics(grain_runs),
+            "fast_aggregate": aggregate_statistics(grain_fast_runs),
+        },
+        "glare": {
+            "applicable": glare_applicable,
+            "seeds": glare_runs,
+            "aggregate": aggregate_statistics(glare_runs),
+        },
+    }
+
+
+def build_slice6() -> dict:
+    """Build the slice 6 fixture (the stochastic effects)."""
+    images = build_slice6_images()
+    cases = []
+    for stock in SLICE6_STOCKS:
+        for image_case in SLICE6_IMAGES:
+            case_start = time.time()
+            image = images[image_case["kind"]]
+            result = run_slice6_case(stock, image_case, image)
+            cases.append(result)
+            print(
+                f"  slice6 {result['id']:<32} "
+                f"({time.time() - case_start:5.1f} s)"
+            )
+
+    payload = {
+        "format": "lightsuffer-ios slice6 stochastic effects fixture v1",
+        "generated_by": "tools/gen_fixtures.py",
+        "upstream": {
+            "project": UPSTREAM_PROJECT,
+            "url": UPSTREAM_URL,
+            "commit": UPSTREAM_COMMIT,
+            "license": "GPL-3.0-or-later (code) / CC BY-SA 4.0 (profile data)",
+        },
+        "notes": {
+            "float_format": "all floating point values are rounded to 7 significant digits",
+            "grain": (
+                "the grain of the negative (spektrafilm.model.grain.apply_grain) "
+                "is measured on the difference between the cmy_film tap with "
+                "and without the grain: it is the grain field itself, in "
+                "density units."
+            ),
+            "glare": (
+                "the glare of the print (spektrafilm.model.glare.add_glare) is "
+                "measured on the difference between the rgb_out tap with and "
+                "without the glare: it is the visible effect of the glare, in "
+                "the encoded sRGB domain. The upstream does not apply any "
+                "glare to a directly scanned film, so the glare of the slide "
+                "is not applicable."
+            ),
+            "seeds": (
+                "the upstream grain reseeds the global NumPy random state "
+                "with a fixed seed (0, 1, 2 per channel, plus ten per sub "
+                "layer), so the upstream grain is deterministic. The fixture "
+                "shifts those seeds (by 1000 * (seed + 1)) to measure the "
+                "spread of the upstream; the algorithm is not touched. The "
+                "upstream glare draws from the unseeded global random state, "
+                "so the fixture seeds it."
+            ),
+            "fast_aggregate": (
+                "the same grain runs with the fast samplers of the upstream "
+                "(spektrafilm.utils.fast_stats, settings.use_fast_stats = "
+                "True). The Swift port reproduces those samplers, so this is "
+                "the closest reference for the port; the difference between "
+                "the two aggregates measures the error of the normal "
+                "approximation the fast samplers use."
+            ),
+            "film_format": (
+                "the grain is the shot noise of the silver halide grains a "
+                "pixel holds: its amplitude scales with one over the square "
+                "root of the number of particles per pixel, i.e. with the "
+                "area of the pixel. The cases therefore use a 1 mm film "
+                "format (a pixel of 15.6 um on a 64 x 64 image), so that the "
+                "grain is visible."
+            ),
+            "statistics": (
+                "mean_c and std_c: the mean and the standard deviation of the "
+                "field of the channel c. acf_l: the autocorrelation of the "
+                "centred field at the lag l (the horizontal and the vertical "
+                "neighbours pooled). corr_i_j: the correlation of the "
+                "channels i and j. qXX: the quantiles of the density "
+                "histogram (the three channels pooled)."
+            ),
+        },
+        "images": {
+            "size": [SLICE6_IMAGE_SIZE, SLICE6_IMAGE_SIZE, 3],
+            "color_space": "linear ProPhoto RGB",
+            "flat": images["flat"],
+            "textured": images["textured"],
+            "description": (
+                "flat: a flat mid grey patch (0.18). textured: a vertical "
+                "ramp, a noise floor (numpy default_rng(20261111)) and two "
+                "saturated patches."
+            ),
+        },
+        "lags": list(SLICE6_LAGS),
+        "quantiles": list(SLICE6_QUANTILES),
+        "seeds": list(SLICE6_SEEDS),
+        "cases": cases,
+    }
+    return jsonable(payload)
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -2053,7 +2478,7 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--slices",
-        default="1,2,4,5",
+        default="1,2,4,5,6",
         help="the slices to generate, comma separated (default: %(default)s)",
     )
     parser.add_argument(
@@ -2158,6 +2583,18 @@ def main(argv=None) -> int:
         print(
             f"  slice5 {'spatial effects':<28} {os.path.getsize(slice5_path) / 1024:8.1f} KiB  "
             f"({time.time() - slice5_start:5.1f} s, {len(slice5['cases'])} cases)"
+        )
+
+    # --- slice 6: the stochastic effects --------------------------------
+    if "6" in slices:
+        slice6_start = time.time()
+        slice6 = build_slice6()
+        slice6_path = os.path.join(out_dir, "slice6_stochastic.json")
+        _write_json(slice6_path, slice6)
+        written.append(slice6_path)
+        print(
+            f"  slice6 {'stochastic effects':<28} {os.path.getsize(slice6_path) / 1024:8.1f} KiB  "
+            f"({time.time() - slice6_start:5.1f} s, {len(slice6['cases'])} cases)"
         )
 
     total = sum(os.path.getsize(p) for p in written)
