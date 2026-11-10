@@ -1,0 +1,1312 @@
+//
+//  FilmShaders.metal
+//  light suffer胶片 — iOS app
+//
+//  The Metal compute kernels of the film simulation.
+//
+//  The kernels implement the very same computation as the pure Swift plan
+//  evaluator of `FilmPhysics` (`FilmPlanEvaluator`), on the very same
+//  numbers: the plan of the render is uploaded into the buffers below and
+//  every kernel reads it.
+//
+//  The pipeline of a render:
+//
+//    rgb_in ──▶ raw ──▶ log_e_film ──▶ cmy_film ──▶ log_e_print ──▶ cmy_print ──▶ rgb_out
+//
+//  The spatial effects (the diffusion filters, the lens blurs, the
+//  halation, the diffusion of the DIR couplers and the unsharp mask) are
+//  the separable and the two dimensional convolutions of the pass chain.
+//
+//  film modeling powered by spektrafilm
+//  https://github.com/andreavolpato/spektrafilm
+//
+//  This file is part of a GPLv3 licensed project; see LICENSE at the repo root.
+//
+
+#include <metal_stdlib>
+
+using namespace metal;
+
+#define FILM_PI 3.141592653589793
+// The number of threads of the two stage maximum reduction.
+#define FILM_REDUCE_THREADS 1024
+
+// MARK: - The parameters of the plan
+
+/// The parameters of a render.
+///
+/// The layout is mirrored **exactly** by the `FilmPlanParams` structure of
+/// the Swift side (`MetalPlan.swift`): every member is four bytes wide, so
+/// the two structures have the same size and the same offsets.
+struct FilmPlanParams {
+    uint width;
+    uint height;
+    uint tcLUTSize;
+    uint wavelengthCount;
+    uint filmCurveCount;
+    uint printCurveCount;
+    uint cMaxLightnessCount;
+    uint cMaxHueCount;
+    float filmCurveStart;
+    float filmCurveStep;
+    float filmCurveBeforeStart;
+    float filmCurveBeforeStep;
+    float printCurveStart;
+    float printCurveStep;
+    float exposureScale;
+    float filmingScale;
+    float couplerActive;
+    float couplerPositive;
+    float exposureFactor;
+    float printExposure;
+    float printingCorrection;
+    float scanNormalization;
+    float gamutActive;
+    float lightnessActive;
+    float gamutKneeThreshold;
+    float gamutKneeLimit;
+    float gamutKneePower;
+    float lightnessKneeThreshold;
+    float lightnessKneeLimit;
+    float lightnessKneePower;
+    float cam16LA;
+    float cam16Yb;
+    float cam16WhiteJp;
+    float whiteX;
+    float whiteY;
+    float whiteZ;
+    float correctionSlope;
+    float correctionOffset;
+    float correctionActive;
+    float inputCCTF;
+    float outputEncoded;
+    float cMaxLightnessStart;
+    float cMaxLightnessStep;
+    float cMaxHueStart;
+    float cMaxHueStep;
+    float boostEV;
+    float boostRange;
+    float protectEV;
+};
+
+/// The parameters of the convolutions.
+struct FilmBlurParams {
+    uint width;
+    uint height;
+    uint radius;
+    uint reserved;
+    float weightA;
+    float weightB;
+    float weightC;
+    float scatterFraction;
+};
+
+/// The parameters of the linear combinations.
+struct FilmCombineParams {
+    uint width;
+    uint height;
+    float weightA;
+    float weightB;
+    float weightC;
+    float weightD;
+};
+
+/// The parameters of the exposure (the linear to log10 conversion).
+struct FilmExposureParams {
+    uint width;
+    uint height;
+    float scale;
+    float offset;
+};
+
+// MARK: - The helpers
+
+/// The decoding of an input value (0: none, 1: sRGB, 2: ProPhoto RGB).
+inline float filmDecodeInput(float value, int cctf) {
+    if (cctf == 1) {
+        if (value <= 0.04045) {
+            return value / 12.92;
+        }
+        return pow((value + 0.055) / 1.055, 2.4);
+    }
+    if (cctf == 2) {
+        const float threshold = 16.0 * pow(16.0, 1.8 / (1.0 - 1.8));
+        if (value < threshold) {
+            return value / 16.0;
+        }
+        const float magnitude = pow(abs(value), 1.8);
+        return value < 0.0 ? -magnitude : magnitude;
+    }
+    return value;
+}
+
+/// The sRGB encoding of a linear value.
+inline float filmSRGBEncode(float value) {
+    if (value <= 0.0031308) {
+        return 12.92 * value;
+    }
+    return 1.055 * pow(value, 1.0 / 2.4) - 0.055;
+}
+
+/// The Mitchell-Netravali cubic kernel weight (B = C = 1/3).
+inline float filmMitchellWeight(float t) {
+    const float x = abs(t);
+    const float b = 1.0 / 3.0;
+    const float c = 1.0 / 3.0;
+    if (x < 1.0) {
+        return (1.0 / 6.0) * (
+            (12.0 - 9.0 * b - 6.0 * c) * x * x * x
+            + (-18.0 + 12.0 * b + 6.0 * c) * x * x
+            + (6.0 - 2.0 * b)
+        );
+    }
+    if (x < 2.0) {
+        return (1.0 / 6.0) * (
+            (-b - 6.0 * c) * x * x * x
+            + (6.0 * b + 30.0 * c) * x * x
+            + (-12.0 * b - 48.0 * c) * x
+            + (8.0 * b + 24.0 * c)
+        );
+    }
+    return 0.0;
+}
+
+/// The reflected index of the cubic interpolation (the upstream `safe_index`).
+inline int filmSafeIndex(int index, int length) {
+    if (index < 0) {
+        return -index;
+    }
+    if (index >= length) {
+        return 2 * (length - 1) - index;
+    }
+    return index;
+}
+
+/// The `reflect` boundary of the Gaussian filter of the upstream
+/// (SciPy's `reflect` mode: the edge sample is repeated).
+inline int filmReflectEdge(int index, int count) {
+    if (count <= 0) {
+        return 0;
+    }
+    const int period = 2 * count;
+    int folded = index % period;
+    if (folded < 0) {
+        folded += period;
+    }
+    if (folded < count) {
+        return folded;
+    }
+    return period - 1 - folded;
+}
+
+/// The `numpy.pad(..., mode="reflect")` boundary of the diffusion filter
+/// (the half sample symmetric reflection).
+inline int filmNumpyReflect(int index, int count) {
+    if (count <= 1) {
+        return 0;
+    }
+    const int period = 2 * (count - 1);
+    int folded = index % period;
+    if (folded < 0) {
+        folded += period;
+    }
+    if (folded >= count) {
+        folded = period - folded;
+    }
+    return folded;
+}
+
+/// The cubic lookup of the hanatos 2025 table.
+inline float3 filmTCLookup(
+    device const float *lut,
+    uint size,
+    float u,
+    float v
+) {
+    if (size < 2) {
+        return float3(0.0);
+    }
+    const float maxIndex = float(size - 1);
+    const float cu = clamp(u, 0.0, 1.0) * maxIndex;
+    const float cv = clamp(v, 0.0, 1.0) * maxIndex;
+
+    uint uBase = 0;
+    float uFraction = 0.0;
+    if (cu >= maxIndex) {
+        uBase = size - 2;
+        uFraction = 1.0;
+    } else {
+        uBase = uint(floor(cu));
+        uFraction = cu - float(uBase);
+    }
+    uint vBase = 0;
+    float vFraction = 0.0;
+    if (cv >= maxIndex) {
+        vBase = size - 2;
+        vFraction = 1.0;
+    } else {
+        vBase = uint(floor(cv));
+        vFraction = cv - float(vBase);
+    }
+
+    float weightsU[4];
+    float weightsV[4];
+    weightsU[0] = filmMitchellWeight(uFraction + 1.0);
+    weightsU[1] = filmMitchellWeight(uFraction);
+    weightsU[2] = filmMitchellWeight(uFraction - 1.0);
+    weightsU[3] = filmMitchellWeight(uFraction - 2.0);
+    weightsV[0] = filmMitchellWeight(vFraction + 1.0);
+    weightsV[1] = filmMitchellWeight(vFraction);
+    weightsV[2] = filmMitchellWeight(vFraction - 1.0);
+    weightsV[3] = filmMitchellWeight(vFraction - 2.0);
+
+    float r = 0.0;
+    float g = 0.0;
+    float b = 0.0;
+    float weightSum = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        const int ui = filmSafeIndex(int(uBase) - 1 + i, int(size));
+        for (int j = 0; j < 4; ++j) {
+            const int vj = filmSafeIndex(int(vBase) - 1 + j, int(size));
+            const float weight = weightsU[i] * weightsV[j];
+            weightSum += weight;
+            const uint index = (uint(ui) * size + uint(vj)) * 3;
+            r += weight * lut[index];
+            g += weight * lut[index + 1];
+            b += weight * lut[index + 2];
+        }
+    }
+    if (weightSum != 0.0) {
+        r /= weightSum;
+        g /= weightSum;
+        b /= weightSum;
+    }
+    return float3(r, g, b);
+}
+
+/// The evaluation of a characteristic curve on its uniform log exposure grid.
+inline float filmSampleCurve(
+    device const float *curve,
+    uint count,
+    float start,
+    float step,
+    float x,
+    uint channel
+) {
+    if (count == 0) {
+        return 0.0;
+    }
+    if (isnan(x)) {
+        return curve[channel * count];
+    }
+    if (x <= start) {
+        return curve[channel * count];
+    }
+    const float last = start + step * float(count - 1);
+    if (x >= last) {
+        return curve[channel * count + count - 1];
+    }
+    const float position = (x - start) / step;
+    int index = int(floor(position));
+    if (index < 0) {
+        index = 0;
+    }
+    if (index > int(count) - 2) {
+        index = int(count) - 2;
+    }
+    const float fraction = position - float(index);
+    const float low = curve[channel * count + uint(index)];
+    const float high = curve[channel * count + uint(index) + 1];
+    return low + fraction * (high - low);
+}
+
+// MARK: - The CAM16 colour appearance model
+
+/// The signed power `spow(x, p) = sign(x) · |x| ** p`.
+inline float filmSpow(float x, float p) {
+    const float magnitude = pow(abs(x), p);
+    return x < 0.0 ? -magnitude : magnitude;
+}
+
+/// The luminance level adaptation factor `F_L`.
+inline float filmLuminanceLevelAdaptationFactor(float LA) {
+    const float k = 1.0 / (5.0 * LA + 1.0);
+    const float k4 = pow(k, 4.0);
+    return 0.2 * k4 * (5.0 * LA)
+        + 0.1 * pow(1.0 - k4, 2.0) * filmSpow(5.0 * LA, 1.0 / 3.0);
+}
+
+/// The forward post-adaptation non-linear response compression.
+inline float3 filmResponseCompressionForward(float3 rgb, float FL) {
+    const float cx = filmSpow(FL * abs(rgb.x) / 100.0, 0.42);
+    const float cy = filmSpow(FL * abs(rgb.y) / 100.0, 0.42);
+    const float cz = filmSpow(FL * abs(rgb.z) / 100.0, 0.42);
+    const float rx = (400.0 * (rgb.x < 0.0 ? -1.0 : 1.0) * cx) / (27.13 + cx) + 0.1;
+    const float ry = (400.0 * (rgb.y < 0.0 ? -1.0 : 1.0) * cy) / (27.13 + cy) + 0.1;
+    const float rz = (400.0 * (rgb.z < 0.0 ? -1.0 : 1.0) * cz) / (27.13 + cz) + 0.1;
+    return float3(rx, ry, rz);
+}
+
+/// The inverse post-adaptation non-linear response compression.
+inline float3 filmResponseCompressionInverse(float3 rgb, float FL) {
+    float rx = 0.0;
+    float ry = 0.0;
+    float rz = 0.0;
+    const float ax = abs(rgb.x - 0.1);
+    const float ay = abs(rgb.y - 0.1);
+    const float az = abs(rgb.z - 0.1);
+    rx = (rgb.x - 0.1 < 0.0 ? -1.0 : 1.0) * 100.0 / FL
+        * filmSpow((27.13 * ax) / (400.0 - ax), 1.0 / 0.42);
+    ry = (rgb.y - 0.1 < 0.0 ? -1.0 : 1.0) * 100.0 / FL
+        * filmSpow((27.13 * ay) / (400.0 - ay), 1.0 / 0.42);
+    rz = (rgb.z - 0.1 < 0.0 ? -1.0 : 1.0) * 100.0 / FL
+        * filmSpow((27.13 * az) / (400.0 - az), 1.0 / 0.42);
+    return float3(rx, ry, rz);
+}
+
+/// The achromatic response.
+inline float filmAchromaticResponse(float3 rgb, float Nbb) {
+    return (2.0 * rgb.x + rgb.y + (1.0 / 20.0) * rgb.z - 0.305) * Nbb;
+}
+
+/// The hue angle, in degrees.
+inline float filmHueAngle(float a, float b) {
+    float angle = atan2(b, a) * (180.0 / FILM_PI);
+    angle = fmod(angle, 360.0);
+    if (angle < 0.0) {
+        angle += 360.0;
+    }
+    return angle;
+}
+
+/// The eccentricity factor.
+inline float filmEccentricityFactor(float h) {
+    return 0.25 * (cos(2.0 + h * FILM_PI / 180.0) + 3.8);
+}
+
+/// The multiplication of the CAT16 cone response matrix with a vector.
+inline float3 filmCAM16ConeResponse(float3 xyz) {
+    return float3(
+        0.401288 * xyz.x + 0.650173 * xyz.y - 0.051461 * xyz.z,
+        -0.250268 * xyz.x + 1.204414 * xyz.y + 0.045854 * xyz.z,
+        -0.002079 * xyz.x + 0.048952 * xyz.y + 0.953127 * xyz.z
+    );
+}
+
+/// The multiplication of the inverse CAT16 cone response matrix with a
+/// vector.
+inline float3 filmCAM16InverseConeResponse(float3 rgb) {
+    return float3(
+        1.86206786 * rgb.x - 1.01125463 * rgb.y + 0.14918678 * rgb.z,
+        0.38752654 * rgb.x + 0.62144744 * rgb.y - 0.00897399 * rgb.z,
+        -0.01584150 * rgb.x - 0.03412294 * rgb.y + 1.04996444 * rgb.z
+    );
+}
+
+/// The CAM16 correlates of an XYZ triplet (the scale 100 domain).
+///
+/// The returns are `J`, `C`, `M` (the colourfulness) and the hue angle `h`
+/// (in degrees).
+inline float4 filmCAM16Forward(
+    float3 xyz,
+    float3 xyzWhite,
+    float LA,
+    float Yb
+) {
+    const float Yw = xyzWhite.y;
+    const float3 rgbWhite = filmCAM16ConeResponse(xyzWhite);
+
+    const float D = clamp(
+        1.0 * (1.0 - (1.0 / 3.6) * exp((-LA - 42.0) / 92.0)),
+        0.0,
+        1.0
+    );
+    const float n = Yb / Yw;
+    const float FL = filmLuminanceLevelAdaptationFactor(LA);
+    const float Nbb = 0.725 * pow(1.0 / n, 0.2);
+    const float Ncb = Nbb;
+    const float z = 1.48 + sqrt(n);
+
+    const float3 dRGB = float3(
+        D * Yw / rgbWhite.x + 1.0 - D,
+        D * Yw / rgbWhite.y + 1.0 - D,
+        D * Yw / rgbWhite.z + 1.0 - D
+    );
+    const float3 rgbWhiteCompressed = filmResponseCompressionForward(dRGB * rgbWhite, FL);
+    const float aw = filmAchromaticResponse(rgbWhiteCompressed, Nbb);
+
+    const float3 rgb = filmCAM16ConeResponse(xyz);
+    const float3 rgbCompressed = filmResponseCompressionForward(dRGB * rgb, FL);
+
+    const float a = rgbCompressed.x - 12.0 * rgbCompressed.y / 11.0 + rgbCompressed.z / 11.0;
+    const float b = (rgbCompressed.x + rgbCompressed.y - 2.0 * rgbCompressed.z) / 9.0;
+    const float h = filmHueAngle(a, b);
+    const float et = filmEccentricityFactor(h);
+    const float A = filmAchromaticResponse(rgbCompressed, Nbb);
+
+    const float J = 100.0 * filmSpow(A / aw, 0.69 * z);
+    const float Q = (4.0 / 0.69) * sqrt(J / 100.0) * (aw + 4.0) * filmSpow(FL, 0.25);
+    const float t = ((50000.0 / 13.0) * 1.0 * Ncb)
+        * (et * sqrt(a * a + b * b)
+            / (rgbCompressed.x + rgbCompressed.y + 21.0 * rgbCompressed.z / 20.0));
+    const float C = filmSpow(t, 0.9) * filmSpow(J / 100.0, 0.5)
+        * filmSpow(1.64 - pow(0.29, n), 0.73);
+    const float M = C * filmSpow(FL, 0.25);
+
+    return float4(J, C, M, h);
+}
+
+/// The XYZ tristimulus values of a CAM16 specification (the scale 100
+/// domain).
+inline float3 filmCAM16Inverse(
+    float J,
+    float C,
+    float h,
+    float3 xyzWhite,
+    float LA,
+    float Yb
+) {
+    const float Yw = xyzWhite.y;
+    const float3 rgbWhite = filmCAM16ConeResponse(xyzWhite);
+
+    const float D = clamp(
+        1.0 * (1.0 - (1.0 / 3.6) * exp((-LA - 42.0) / 92.0)),
+        0.0,
+        1.0
+    );
+    const float n = Yb / Yw;
+    const float FL = filmLuminanceLevelAdaptationFactor(LA);
+    const float Nbb = 0.725 * pow(1.0 / n, 0.2);
+    const float Ncb = Nbb;
+    const float z = 1.48 + sqrt(n);
+
+    const float3 dRGB = float3(
+        D * Yw / rgbWhite.x + 1.0 - D,
+        D * Yw / rgbWhite.y + 1.0 - D,
+        D * Yw / rgbWhite.z + 1.0 - D
+    );
+    const float3 rgbWhiteCompressed = filmResponseCompressionForward(dRGB * rgbWhite, FL);
+    const float aw = filmAchromaticResponse(rgbWhiteCompressed, Nbb);
+
+    const float JPrime = max(J, 1e-6);
+    const float t = filmSpow(
+        C / (sqrt(JPrime / 100.0) * filmSpow(1.64 - pow(0.29, n), 0.73)),
+        1.0 / 0.9
+    );
+    const float et = filmEccentricityFactor(h);
+    const float A = aw * filmSpow(J / 100.0, 1.0 / (0.69 * z));
+
+    const float P1 = (50000.0 / 13.0) * 1.0 * Ncb * et / t;
+    const float P2 = A / Nbb + 0.305;
+    const float P3 = 21.0 / 20.0;
+
+    const float hr = h * (FILM_PI / 180.0);
+    const float sinHR = sin(hr);
+    const float cosHR = cos(hr);
+    float a = 0.0;
+    float b = 0.0;
+    if (abs(sinHR) >= abs(cosHR)) {
+        const float P4 = P1 / sinHR;
+        const float nValue = P2 * (2.0 + P3) * (460.0 / 1403.0);
+        b = nValue / (
+            P4 + (2.0 + P3) * (220.0 / 1403.0) * (cosHR / sinHR)
+                - (27.0 / 1403.0) + P3 * (6300.0 / 1403.0)
+        );
+        a = b * (cosHR / sinHR);
+    } else {
+        const float P5 = P1 / cosHR;
+        const float nValue = P2 * (2.0 + P3) * (460.0 / 1403.0);
+        a = nValue / (
+            P5 + (2.0 + P3) * (220.0 / 1403.0)
+                - ((27.0 / 1403.0) - P3 * (6300.0 / 1403.0)) * (sinHR / cosHR)
+        );
+        b = a * (sinHR / cosHR);
+    }
+    if (t == 0.0) {
+        a = 0.0;
+        b = 0.0;
+    }
+
+    const float3 rgbA = float3(
+        (460.0 * P2 + 451.0 * a + 288.0 * b) / 1403.0,
+        (460.0 * P2 - 891.0 * a - 261.0 * b) / 1403.0,
+        (460.0 * P2 - 220.0 * a - 6300.0 * b) / 1403.0
+    );
+
+    const float3 rgbCompressed = filmResponseCompressionInverse(rgbA, FL);
+    const float3 rgb = rgbCompressed / dRGB;
+    return filmCAM16InverseConeResponse(rgb);
+}
+
+/// The CAM16-UCS coordinates of an XYZ triplet (the scale 1 domain).
+inline float3 filmXYZToCAM16UCS(
+    float3 xyz,
+    float3 xyzWhite,
+    float LA,
+    float Yb
+) {
+    const float4 spec = filmCAM16Forward(xyz * 100.0, xyzWhite * 100.0, LA, Yb);
+    const float J = spec.x;
+    const float M = spec.z;
+    const float h = spec.w;
+
+    const float c1 = 0.007;
+    const float c2 = 0.0228;
+    const float Jp = ((1.0 + 100.0 * c1) * J) / (1.0 + c1 * J);
+    const float Mp = (1.0 / c2) * log(1.0 + c2 * M);
+    const float hr = h * (FILM_PI / 180.0);
+    return float3(Jp, Mp * cos(hr), Mp * sin(hr));
+}
+
+/// The XYZ tristimulus values of a CAM16-UCS triplet (the scale 1 domain).
+inline float3 filmCAM16UCStoXYZ(
+    float3 jab,
+    float3 xyzWhite,
+    float LA,
+    float Yb
+) {
+    const float c1 = 0.007;
+    const float c2 = 0.0228;
+    const float Jp = jab.x;
+    const float Mp = sqrt(jab.y * jab.y + jab.z * jab.z);
+    const float J = -Jp / (c1 * Jp - 1.0 - 100.0 * c1);
+    const float M = (exp(Mp * c2) - 1.0) / c2;
+    const float h = atan2(jab.z, jab.y) * (180.0 / FILM_PI);
+    const float FL = filmLuminanceLevelAdaptationFactor(LA);
+    const float C = M / filmSpow(FL, 0.25);
+    const float hue = h < 0.0 ? h + 360.0 : h;
+    return filmCAM16Inverse(J, C, hue, xyzWhite * 100.0, LA, Yb) / 100.0;
+}
+
+// MARK: - The kernels of the per pixel chain
+
+/// The spectral upsampling: the camera image to the raw response.
+kernel void filmSpectralUpsample(
+    device const float *rgbIn [[buffer(0)]],
+    device float *rawOut [[buffer(1)]],
+    device const float *matrix [[buffer(2)]],
+    device const float *tcLUT [[buffer(3)]],
+    constant FilmPlanParams &params [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    const int cctf = int(params.inputCCTF);
+
+    const float r = filmDecodeInput(rgbIn[pixel * 3], cctf);
+    const float g = filmDecodeInput(rgbIn[pixel * 3 + 1], cctf);
+    const float b = filmDecodeInput(rgbIn[pixel * 3 + 2], cctf);
+
+    const float3 xyz = float3(
+        matrix[0] * r + matrix[1] * g + matrix[2] * b,
+        matrix[3] * r + matrix[4] * g + matrix[5] * b,
+        matrix[6] * r + matrix[7] * g + matrix[8] * b
+    );
+
+    float luminance = xyz.x + xyz.y + xyz.z;
+    if (isnan(luminance)) {
+        luminance = 0.0;
+    }
+    const float denominator = max(luminance, 1e-10);
+    const float x = xyz.x / denominator;
+    const float y = xyz.y / denominator;
+    const float u = clamp((1.0 - x) * (1.0 - x), 0.0, 1.0);
+    const float v = clamp(y / max(1.0 - x, 1e-10), 0.0, 1.0);
+
+    const float3 response = filmTCLookup(tcLUT, params.tcLUTSize, u, v);
+    rawOut[pixel * 3] = response.x * luminance * params.exposureScale;
+    rawOut[pixel * 3 + 1] = response.y * luminance * params.exposureScale;
+    rawOut[pixel * 3 + 2] = response.z * luminance * params.exposureScale;
+}
+
+/// The first stage of the maximum reduction.
+kernel void filmReduceMaxPartial(
+    device const float *values [[buffer(0)]],
+    device float *partials [[buffer(1)]],
+    constant FilmPlanParams &params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]],
+    uint threads [[threads_per_group]]
+) {
+    const uint total = params.width * params.height * 3;
+    float maximum = -INFINITY;
+    for (uint index = gid; index < total; index += threads) {
+        maximum = max(maximum, values[index]);
+    }
+    partials[gid] = maximum;
+}
+
+/// The second stage of the maximum reduction.
+kernel void filmReduceMaxFinal(
+    device const float *partials [[buffer(0)]],
+    device float *result [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid != 0) {
+        return;
+    }
+    float maximum = -INFINITY;
+    for (uint index = 0; index < FILM_REDUCE_THREADS; ++index) {
+        maximum = max(maximum, partials[index]);
+    }
+    result[0] = maximum;
+}
+
+/// The highlight boost of the negative.
+kernel void filmBoostHighlights(
+    device const float *rawIn [[buffer(0)]],
+    device float *rawOut [[buffer(1)]],
+    device const float *maximum [[buffer(2)]],
+    constant FilmPlanParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    const float maxRaw = maximum[0];
+    const float rawX0 = min(max(0.184 * pow(2.0, params.protectEV), 0.0), maxRaw);
+    const float a = pow(28.0, 1.0 - params.boostRange);
+    const float x0 = rawX0 / maxRaw;
+    const float denominator = exp(a * (1.0 - x0)) - a * (1.0 - x0) - 1.0;
+    const float k = (pow(2.0, params.boostEV) - 1.0) / denominator;
+    const float inverseMaxRaw = 1.0 / maxRaw;
+    const float boostScale = k * maxRaw;
+
+    for (uint channel = 0; channel < 3; ++channel) {
+        const float value = rawIn[pixel * 3 + channel];
+        if (value <= rawX0) {
+            rawOut[pixel * 3 + channel] = value;
+        } else {
+            const float dx = (value - rawX0) * inverseMaxRaw;
+            rawOut[pixel * 3 + channel] = value
+                + boostScale * (exp(a * dx) - a * dx - 1.0);
+        }
+    }
+}
+
+/// The linear to log10 conversion of an exposure.
+kernel void filmLinearToLog(
+    device const float *src [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    constant FilmExposureParams &params [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    for (uint channel = 0; channel < 3; ++channel) {
+        const float value = src[pixel * 3 + channel] * params.scale + params.offset;
+        dst[pixel * 3 + channel] = log10(max(value, 0.0) + 1e-10);
+    }
+}
+
+/// The evaluation of the characteristic curves of the film.
+kernel void filmFilmDensity(
+    device const float *exposureIn [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    device const float *curve [[buffer(2)]],
+    constant FilmPlanParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    for (uint channel = 0; channel < 3; ++channel) {
+        dst[pixel * 3 + channel] = filmSampleCurve(
+            curve,
+            params.filmCurveCount,
+            params.filmCurveStart,
+            params.filmCurveStep,
+            exposureIn[pixel * 3 + channel],
+            channel
+        );
+    }
+}
+
+/// The evaluation of the characteristic curves of the film, with the
+/// correction of the DIR couplers.
+kernel void filmFilmDensityCoupled(
+    device const float *exposureIn [[buffer(0)]],
+    device const float *correctionIn [[buffer(1)]],
+    device float *dst [[buffer(2)]],
+    device const float *curve [[buffer(3)]],
+    constant FilmPlanParams &params [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    for (uint channel = 0; channel < 3; ++channel) {
+        const float exposure = exposureIn[pixel * 3 + channel]
+            - correctionIn[pixel * 3 + channel];
+        dst[pixel * 3 + channel] = filmSampleCurve(
+            curve,
+            params.filmCurveCount,
+            params.filmCurveBeforeStart,
+            params.filmCurveBeforeStep,
+            exposure,
+            channel
+        );
+    }
+}
+
+/// The correction the released inhibitors of the DIR couplers cause.
+kernel void filmCouplerCorrection(
+    device const float *cmyIn [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    device const float *coupler [[buffer(2)]],
+    constant FilmPlanParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    float sr = 0.0;
+    float sg = 0.0;
+    float sb = 0.0;
+    if (params.couplerPositive > 0.5) {
+        sr = coupler[9] - cmyIn[pixel * 3];
+        sg = coupler[10] - cmyIn[pixel * 3 + 1];
+        sb = coupler[11] - cmyIn[pixel * 3 + 2];
+    } else {
+        sr = cmyIn[pixel * 3];
+        sg = cmyIn[pixel * 3 + 1];
+        sb = cmyIn[pixel * 3 + 2];
+    }
+    for (uint receiver = 0; receiver < 3; ++receiver) {
+        const float amount = sr * coupler[receiver]
+            + sg * coupler[3 + receiver]
+            + sb * coupler[6 + receiver];
+        dst[pixel * 3 + receiver] = amount;
+    }
+}
+
+/// The exposure of the paper.
+kernel void filmPrintingExposure(
+    device const float *cmyIn [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    device const float *filmChannelDensity [[buffer(2)]],
+    device const float *filmBaseDensity [[buffer(3)]],
+    device const float *printSensitivity [[buffer(4)]],
+    device const float *printIlluminant [[buffer(5)]],
+    device const float *preflash [[buffer(6)]],
+    constant FilmPlanParams &params [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    const uint wavelengths = params.wavelengthCount;
+    const float cr = cmyIn[pixel * 3];
+    const float cg = cmyIn[pixel * 3 + 1];
+    const float cb = cmyIn[pixel * 3 + 2];
+
+    float totalR = 0.0;
+    float totalG = 0.0;
+    float totalB = 0.0;
+    for (uint wavelength = 0; wavelength < wavelengths; ++wavelength) {
+        float density = filmBaseDensity[wavelength];
+        density += cr * filmChannelDensity[wavelength * 3];
+        density += cg * filmChannelDensity[wavelength * 3 + 1];
+        density += cb * filmChannelDensity[wavelength * 3 + 2];
+        float value = pow(10.0, -density) * printIlluminant[wavelength];
+        if (isnan(value)) {
+            value = 0.0;
+        }
+        totalR += value * printSensitivity[wavelength * 3];
+        totalG += value * printSensitivity[wavelength * 3 + 1];
+        totalB += value * printSensitivity[wavelength * 3 + 2];
+    }
+    dst[pixel * 3] = max(totalR * params.exposureFactor + preflash[0], 0.0) + 1e-10;
+    dst[pixel * 3 + 1] = max(totalG * params.exposureFactor + preflash[1], 0.0) + 1e-10;
+    dst[pixel * 3 + 2] = max(totalB * params.exposureFactor + preflash[2], 0.0) + 1e-10;
+}
+
+/// The evaluation of the characteristic curves of the paper.
+kernel void filmPrintDensity(
+    device const float *exposureIn [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    device const float *curve [[buffer(2)]],
+    constant FilmPlanParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    for (uint channel = 0; channel < 3; ++channel) {
+        dst[pixel * 3 + channel] = filmSampleCurve(
+            curve,
+            params.printCurveCount,
+            params.printCurveStart,
+            params.printCurveStep,
+            exposureIn[pixel * 3 + channel],
+            channel
+        );
+    }
+}
+
+/// The tristimulus values of the scanned print.
+kernel void filmScanXYZ(
+    device const float *cmyIn [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    device const float *printChannelDensity [[buffer(2)]],
+    device const float *printBaseDensity [[buffer(3)]],
+    device const float *scanIlluminant [[buffer(4)]],
+    device const float *cmfs [[buffer(5)]],
+    constant FilmPlanParams &params [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    const uint wavelengths = params.wavelengthCount;
+    const float cr = cmyIn[pixel * 3];
+    const float cg = cmyIn[pixel * 3 + 1];
+    const float cb = cmyIn[pixel * 3 + 2];
+
+    float x = 0.0;
+    float y = 0.0;
+    float z = 0.0;
+    for (uint wavelength = 0; wavelength < wavelengths; ++wavelength) {
+        float density = printBaseDensity[wavelength];
+        density += cr * printChannelDensity[wavelength * 3];
+        density += cg * printChannelDensity[wavelength * 3 + 1];
+        density += cb * printChannelDensity[wavelength * 3 + 2];
+        float value = pow(10.0, -density) * scanIlluminant[wavelength];
+        if (isnan(value)) {
+            value = 0.0;
+        }
+        x += value * cmfs[wavelength * 3];
+        y += value * cmfs[wavelength * 3 + 1];
+        z += value * cmfs[wavelength * 3 + 2];
+    }
+    const float normalisation = params.scanNormalization;
+    float3 xyz = float3(x / normalisation, y / normalisation, z / normalisation);
+    xyz = max(xyz, 0.0) + 1e-10;
+
+    if (params.correctionActive > 0.5) {
+        const float corrected = clamp(
+            params.correctionSlope * xyz.y + params.correctionOffset,
+            0.0,
+            1.0
+        );
+        const float scale = corrected / (xyz.y + 1e-10);
+        xyz = xyz * scale;
+    }
+    dst[pixel * 3] = xyz.x;
+    dst[pixel * 3 + 1] = xyz.y;
+    dst[pixel * 3 + 2] = xyz.z;
+}
+
+/// The conversion of the tristimulus values into the linear RGB values.
+kernel void filmXYZToRGB(
+    device const float *xyzIn [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    device const float *matrix [[buffer(2)]],
+    constant FilmPlanParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    const float x = xyzIn[pixel * 3];
+    const float y = xyzIn[pixel * 3 + 1];
+    const float z = xyzIn[pixel * 3 + 2];
+    dst[pixel * 3] = x * matrix[0] + y * matrix[3] + z * matrix[6];
+    dst[pixel * 3 + 1] = x * matrix[1] + y * matrix[4] + z * matrix[7];
+    dst[pixel * 3 + 2] = x * matrix[2] + y * matrix[5] + z * matrix[8];
+}
+
+/// The Reinhard knee of the gamut compression.
+inline float filmReinhardKnee(float d, float threshold, float limit, float power) {
+    if (d <= threshold) {
+        return d;
+    }
+    const float scale = limit - threshold;
+    const float x = (d - threshold) / scale;
+    const float y = x / pow(1.0 + pow(x, power), 1.0 / power);
+    return threshold + scale * y;
+}
+
+/// The maximum in-gamut chroma at a given lightness and hue.
+inline float filmCMaxLookup(
+    device const float *cMax,
+    uint lightnessCount,
+    uint hueCount,
+    float lightnessStart,
+    float lightnessStep,
+    float hueStart,
+    float hueStep,
+    float lightness,
+    float hue
+) {
+    if (hueCount == 0 || lightnessCount < 2) {
+        return 0.0;
+    }
+    const float lightnessEnd = lightnessStart + lightnessStep * float(lightnessCount - 1);
+    const float clampedLightness = clamp(lightness, lightnessStart, lightnessEnd);
+
+    const float hueIndex = (hue - hueStart) / hueStep;
+    const float hueFloor = floor(hueIndex);
+    int hueLow = int(hueFloor) % int(hueCount);
+    if (hueLow < 0) {
+        hueLow += int(hueCount);
+    }
+    const int hueHigh = (hueLow + 1) % int(hueCount);
+    const float hueFraction = hueIndex - hueFloor;
+
+    const float lightnessIndex = (clampedLightness - lightnessStart)
+        / (lightnessEnd - lightnessStart) * float(lightnessCount - 1);
+    const float lightnessFloor = floor(lightnessIndex);
+    const int lightnessLow = clamp(int(lightnessFloor), 0, int(lightnessCount) - 2);
+    const int lightnessHigh = lightnessLow + 1;
+    const float lightnessFraction = lightnessIndex - float(lightnessLow);
+
+    const uint h0 = uint(hueLow);
+    const uint h1 = uint(hueHigh);
+    const uint l0 = uint(lightnessLow);
+    const uint l1 = uint(lightnessHigh);
+    const float v00 = cMax[l0 * hueCount + h0];
+    const float v01 = cMax[l0 * hueCount + h1];
+    const float v10 = cMax[l1 * hueCount + h0];
+    const float v11 = cMax[l1 * hueCount + h1];
+    return v00 * (1.0 - lightnessFraction) * (1.0 - hueFraction)
+        + v01 * (1.0 - lightnessFraction) * hueFraction
+        + v10 * lightnessFraction * (1.0 - hueFraction)
+        + v11 * lightnessFraction * hueFraction;
+}
+
+/// The output gamut compression (the CAM16-UCS chroma reduction).
+kernel void filmGamutCompress(
+    device const float *rgbIn [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    device const float *rgbToXYZ [[buffer(2)]],
+    device const float *xyzToRGB [[buffer(3)]],
+    device const float *cMax [[buffer(4)]],
+    constant FilmPlanParams &params [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    if (params.gamutActive < 0.5) {
+        const uint pixel = gid.y * params.width + gid.x;
+        dst[pixel * 3] = rgbIn[pixel * 3];
+        dst[pixel * 3 + 1] = rgbIn[pixel * 3 + 1];
+        dst[pixel * 3 + 2] = rgbIn[pixel * 3 + 2];
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    const float r = rgbIn[pixel * 3];
+    const float g = rgbIn[pixel * 3 + 1];
+    const float b = rgbIn[pixel * 3 + 2];
+
+    const float3 xyz = float3(
+        rgbToXYZ[0] * r + rgbToXYZ[1] * g + rgbToXYZ[2] * b,
+        rgbToXYZ[3] * r + rgbToXYZ[4] * g + rgbToXYZ[5] * b,
+        rgbToXYZ[6] * r + rgbToXYZ[7] * g + rgbToXYZ[8] * b
+    );
+
+    const float3 whiteXYZ = float3(params.whiteX, params.whiteY, params.whiteZ);
+    float3 jab = filmXYZToCAM16UCS(xyz, whiteXYZ, params.cam16LA, params.cam16Yb);
+
+    if (params.lightnessActive > 0.5) {
+        const float normalised = jab.x / params.cam16WhiteJp;
+        jab.x = filmReinhardKnee(
+            normalised,
+            params.lightnessKneeThreshold,
+            params.lightnessKneeLimit,
+            params.lightnessKneePower
+        ) * params.cam16WhiteJp;
+    }
+
+    const float chroma = sqrt(jab.y * jab.y + jab.z * jab.z);
+    const float hue = atan2(jab.z, jab.y);
+    const float maximum = filmCMaxLookup(
+        cMax,
+        params.cMaxLightnessCount,
+        params.cMaxHueCount,
+        params.cMaxLightnessStart,
+        params.cMaxLightnessStep,
+        params.cMaxHueStart,
+        params.cMaxHueStep,
+        jab.x,
+        hue
+    );
+    const float safeMaximum = max(maximum, 1e-9);
+    const float normalised = chroma / safeMaximum;
+    const float compressed = filmReinhardKnee(
+        normalised,
+        params.gamutKneeThreshold,
+        params.gamutKneeLimit,
+        params.gamutKneePower
+    );
+    const float newChroma = compressed * safeMaximum;
+    const float3 newJab = float3(
+        jab.x,
+        newChroma * cos(hue),
+        newChroma * sin(hue)
+    );
+    const float3 newXYZ = filmCAM16UCStoXYZ(
+        newJab,
+        whiteXYZ,
+        params.cam16LA,
+        params.cam16Yb
+    );
+    dst[pixel * 3] = xyzToRGB[0] * newXYZ.x + xyzToRGB[1] * newXYZ.y + xyzToRGB[2] * newXYZ.z;
+    dst[pixel * 3 + 1] = xyzToRGB[3] * newXYZ.x + xyzToRGB[4] * newXYZ.y
+        + xyzToRGB[5] * newXYZ.z;
+    dst[pixel * 3 + 2] = xyzToRGB[6] * newXYZ.x + xyzToRGB[7] * newXYZ.y
+        + xyzToRGB[8] * newXYZ.z;
+}
+
+/// The output transfer function.
+kernel void filmEncodeOutput(
+    device const float *src [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    device const float *matrix [[buffer(2)]],
+    constant FilmPlanParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    const float r = src[pixel * 3];
+    const float g = src[pixel * 3 + 1];
+    const float b = src[pixel * 3 + 2];
+    const float3 value = float3(
+        matrix[0] * r + matrix[1] * g + matrix[2] * b,
+        matrix[3] * r + matrix[4] * g + matrix[5] * b,
+        matrix[6] * r + matrix[7] * g + matrix[8] * b
+    );
+    if (params.outputEncoded > 0.5) {
+        dst[pixel * 3] = filmSRGBEncode(value.x);
+        dst[pixel * 3 + 1] = filmSRGBEncode(value.y);
+        dst[pixel * 3 + 2] = filmSRGBEncode(value.z);
+    } else {
+        dst[pixel * 3] = value.x;
+        dst[pixel * 3 + 1] = value.y;
+        dst[pixel * 3 + 2] = value.z;
+    }
+}
+
+// MARK: - The kernels of the spatial effects
+
+/// The horizontal pass of the separable Gaussian filter.
+kernel void filmBlurHorizontal(
+    device const float *src [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    device const float *kernel [[buffer(2)]],
+    constant FilmBlurParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const int radius = int(params.radius);
+    const int length = 2 * radius + 1;
+    const uint pixel = gid.y * params.width + gid.x;
+    const int column = int(gid.x);
+
+    float s0 = 0.0;
+    float s1 = 0.0;
+    float s2 = 0.0;
+    for (int offset = -radius; offset <= radius; ++offset) {
+        const int source = filmReflectEdge(column + offset, int(params.width));
+        const uint index = (gid.y * params.width + uint(source)) * 3;
+        const float w0 = kernel[uint(0 * length + (offset + radius))];
+        const float w1 = kernel[uint(1 * length + (offset + radius))];
+        const float w2 = kernel[uint(2 * length + (offset + radius))];
+        s0 += src[index] * w0;
+        s1 += src[index + 1] * w1;
+        s2 += src[index + 2] * w2;
+    }
+    dst[pixel * 3] = s0;
+    dst[pixel * 3 + 1] = s1;
+    dst[pixel * 3 + 2] = s2;
+}
+
+/// The vertical pass of the separable Gaussian filter.
+kernel void filmBlurVertical(
+    device const float *src [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    device const float *kernel [[buffer(2)]],
+    constant FilmBlurParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const int radius = int(params.radius);
+    const int length = 2 * radius + 1;
+    const uint pixel = gid.y * params.width + gid.x;
+    const int row = int(gid.y);
+
+    float s0 = 0.0;
+    float s1 = 0.0;
+    float s2 = 0.0;
+    for (int offset = -radius; offset <= radius; ++offset) {
+        const int source = filmReflectEdge(row + offset, int(params.height));
+        const uint index = (uint(source) * params.width + gid.x) * 3;
+        const float w0 = kernel[uint(0 * length + (offset + radius))];
+        const float w1 = kernel[uint(1 * length + (offset + radius))];
+        const float w2 = kernel[uint(2 * length + (offset + radius))];
+        s0 += src[index] * w0;
+        s1 += src[index + 1] * w1;
+        s2 += src[index + 2] * w2;
+    }
+    dst[pixel * 3] = s0;
+    dst[pixel * 3 + 1] = s1;
+    dst[pixel * 3 + 2] = s2;
+}
+
+/// The two dimensional convolution of the diffusion filter.
+kernel void filmDiffusionFilter(
+    device const float *src [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    device const float *psf [[buffer(2)]],
+    constant FilmBlurParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const int radius = int(params.radius);
+    const int shape = 2 * radius + 1;
+    const uint pixel = gid.y * params.width + gid.x;
+
+    float s0 = 0.0;
+    float s1 = 0.0;
+    float s2 = 0.0;
+    for (int u = 0; u < shape; ++u) {
+        const int sourceRow = filmNumpyReflect(int(gid.y) + radius - u, int(params.height));
+        for (int v = 0; v < shape; ++v) {
+            const int sourceColumn = filmNumpyReflect(int(gid.x) + radius - v, int(params.width));
+            const uint index = (uint(sourceRow) * params.width + uint(sourceColumn)) * 3;
+            const uint kernelBase = uint(u * shape + v);
+            s0 += src[index] * psf[kernelBase];
+            s1 += src[index + 1] * psf[kernelBase + uint(shape * shape)];
+            s2 += src[index + 2] * psf[kernelBase + uint(2 * shape * shape)];
+        }
+    }
+    const float scatter = params.scatterFraction;
+    dst[pixel * 3] = (1.0 - scatter) * src[pixel * 3] + scatter * s0;
+    dst[pixel * 3 + 1] = (1.0 - scatter) * src[pixel * 3 + 1] + scatter * s1;
+    dst[pixel * 3 + 2] = (1.0 - scatter) * src[pixel * 3 + 2] + scatter * s2;
+}
+
+/// The linear combination of two images.
+kernel void filmCombine2(
+    device const float *a [[buffer(0)]],
+    device const float *b [[buffer(1)]],
+    device float *dst [[buffer(2)]],
+    constant FilmCombineParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    dst[pixel * 3] = params.weightA * a[pixel * 3] + params.weightB * b[pixel * 3];
+    dst[pixel * 3 + 1] = params.weightA * a[pixel * 3 + 1]
+        + params.weightB * b[pixel * 3 + 1];
+    dst[pixel * 3 + 2] = params.weightA * a[pixel * 3 + 2]
+        + params.weightB * b[pixel * 3 + 2];
+}
+
+/// The linear combination of three images.
+kernel void filmCombine3(
+    device const float *a [[buffer(0)]],
+    device const float *b [[buffer(1)]],
+    device const float *c [[buffer(2)]],
+    device float *dst [[buffer(3)]],
+    constant FilmCombineParams &params [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    dst[pixel * 3] = params.weightA * a[pixel * 3]
+        + params.weightB * b[pixel * 3]
+        + params.weightC * c[pixel * 3];
+    dst[pixel * 3 + 1] = params.weightA * a[pixel * 3 + 1]
+        + params.weightB * b[pixel * 3 + 1]
+        + params.weightC * c[pixel * 3 + 1];
+    dst[pixel * 3 + 2] = params.weightA * a[pixel * 3 + 2]
+        + params.weightB * b[pixel * 3 + 2]
+        + params.weightC * c[pixel * 3 + 2];
+}
+
+/// The combination of the in emulsion scatter.
+///
+/// `weightA`, `weightB` and `weightC` are the weights of the exponential
+/// tail (one per channel) and `weightD` is the amount of the scatter.
+kernel void filmScatterCombine(
+    device const float *src [[buffer(0)]],
+    device const float *core [[buffer(1)]],
+    device const float *tail [[buffer(2)]],
+    device float *dst [[buffer(3)]],
+    constant FilmCombineParams &params [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    const float amount = params.weightD;
+    for (uint channel = 0; channel < 3; ++channel) {
+        float weight = params.weightA;
+        if (channel == 1) {
+            weight = params.weightB;
+        } else if (channel == 2) {
+            weight = params.weightC;
+        }
+        const float scattered = (1.0 - weight) * core[pixel * 3 + channel]
+            + weight * tail[pixel * 3 + channel];
+        dst[pixel * 3 + channel] = (1.0 - amount) * src[pixel * 3 + channel]
+            + amount * scattered;
+    }
+}
+
+/// The combination of the back reflection halation.
+///
+/// `weightA`, `weightB` and `weightC` are the strengths of the halation
+/// (one per channel) and `weightD` tells whether the result is renormalised.
+kernel void filmHalationCombine(
+    device const float *src [[buffer(0)]],
+    device const float *blur [[buffer(1)]],
+    device float *dst [[buffer(2)]],
+    constant FilmCombineParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    const float renormalise = params.weightD;
+    for (uint channel = 0; channel < 3; ++channel) {
+        float amount = params.weightA;
+        if (channel == 1) {
+            amount = params.weightB;
+        } else if (channel == 2) {
+            amount = params.weightC;
+        }
+        float value = src[pixel * 3 + channel] + amount * blur[pixel * 3 + channel];
+        if (renormalise > 0.5) {
+            value /= (1.0 + amount);
+        }
+        dst[pixel * 3 + channel] = value;
+    }
+}

@@ -129,7 +129,11 @@ public struct ColorReference: Equatable, Sendable {
     /// The slope and the offset of the black / white correction.
     ///
     /// Upstream reference: `ColorReferenceService._correction_fucntion`.
-    private func correctionFunction() -> (slope: Double, offset: Double)? {
+    ///
+    /// The method is public so that the render plan (the precomputed data
+    /// of the GPU) can apply the very same correction; the computation is
+    /// unchanged.
+    public func correctionFunction() -> (slope: Double, offset: Double)? {
         guard !isIdentity else { return nil }
         guard let yBlack, let yWhite else { return nil }
         var whiteLevel = self.whiteLevel

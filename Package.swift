@@ -6,6 +6,11 @@
 // The `FilmPhysics` target is deliberately free of any Apple-only framework
 // so that the numerical core can be built and tested on Linux (the CI box)
 // as well as on macOS / iOS.
+//
+// The `FilmPhysicsMetal` target is the GPU port of the same pipeline: every
+// file of it is wrapped in `#if canImport(Metal)`, so the target compiles to
+// nothing on Linux (the CPU reference is built and tested there) and the
+// Metal Shading Language source is compiled at runtime.
 
 import PackageDescription
 
@@ -17,6 +22,7 @@ let package = Package(
     ],
     products: [
         .library(name: "FilmPhysics", targets: ["FilmPhysics"]),
+        .library(name: "FilmPhysicsMetal", targets: ["FilmPhysicsMetal"]),
     ],
     targets: [
         .target(
@@ -28,12 +34,26 @@ let package = Package(
                 .copy("Resources/CHANGELOG.txt"),
             ]
         ),
+        .target(
+            name: "FilmPhysicsMetal",
+            dependencies: ["FilmPhysics"],
+            resources: [
+                // The Metal Shading Language source is copied as a resource
+                // and compiled at runtime (`makeLibrary(source:options:)`);
+                // SwiftPM does not compile the `.metal` files.
+                .copy("Shaders"),
+            ]
+        ),
         .testTarget(
             name: "FilmPhysicsTests",
             dependencies: ["FilmPhysics"],
             resources: [
                 .copy("Fixtures")
             ]
+        ),
+        .testTarget(
+            name: "FilmPhysicsMetalTests",
+            dependencies: ["FilmPhysicsMetal", "FilmPhysics"]
         ),
     ]
 )
