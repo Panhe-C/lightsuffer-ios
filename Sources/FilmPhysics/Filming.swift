@@ -56,26 +56,77 @@ public enum Filming {
     ///
     /// ```
     /// raw      = raw · 2 ** exposure_compensation_ev
+    /// raw      = boost_highlights(raw, boost_ev, boost_range, protect_ev)
+    /// raw      = diffusion_filter(raw, camera.diffusion_filter)
+    /// raw      = gaussian_blur(raw, camera.lens_blur_um)
+    /// raw      = halation(raw, film_render.halation)
     /// raw     *= black_white_filming_exposure_correction()
     /// log_raw  = log10(max(raw, 0) + 1e-10)
     /// ```
     ///
-    /// The highlight boost (`boost_highlights`), the diffusion filter, the
-    /// lens blur and the halation are inactive at the upstream defaults.
-    ///
     /// - Parameters:
     ///   - raw: the raw responses of the negative.
+    ///   - width: the width of the image, in pixels.
+    ///   - height: the height of the image, in pixels.
     ///   - exposureCompensationEV: the exposure compensation of the camera.
+    ///   - camera: the parameters of the camera (the lens blur and the
+    ///     diffusion filter).
+    ///   - halation: the parameters of the halation and of the scatter.
+    ///   - pixelSizeUM: the size of a pixel of the negative, in micrometres.
     ///   - blackWhiteFilmingExposureCorrection: the black / white correction
     ///     of the exposure (1.0 when the correction is inactive).
     /// - Returns: the log10 exposures, three interleaved values per pixel.
     public static func expose(
         raw: [Double],
+        width: Int,
+        height: Int,
         exposureCompensationEV: Double,
+        camera: CameraParams = CameraParams(),
+        halation: HalationParams = HalationParams(),
+        pixelSizeUM: Double = 0,
         blackWhiteFilmingExposureCorrection: Double = 1.0
     ) -> [Double] {
-        let scale = pow(2.0, exposureCompensationEV) * blackWhiteFilmingExposureCorrection
-        return raw.map { value in
+        var exposed = raw.map { $0 * pow(2.0, exposureCompensationEV) }
+
+        // The highlight boost reconstructs the irradiance that hit the
+        // emulsion before the sensor clipped it.
+        exposed = Halation.boostHighlights(
+            raw: exposed,
+            boostEV: halation.boostEV,
+            boostRange: halation.boostRange,
+            protectEV: halation.protectEV
+        )
+
+        // The diffusion filter of the camera.
+        exposed = DiffusionFilter.apply(
+            image: exposed,
+            width: width,
+            height: height,
+            params: camera.diffusionFilter,
+            pixelSizeUM: pixelSizeUM
+        )
+
+        // The lens blur of the camera.
+        if camera.lensBlurUM > 0, pixelSizeUM > 0 {
+            let sigma = camera.lensBlurUM / pixelSizeUM
+            if sigma > 0 {
+                exposed = SpatialEffects.gaussianFilter(
+                    rgb: exposed, width: width, height: height, sigma: sigma
+                )
+            }
+        }
+
+        // The scatter and the back reflection halation.
+        exposed = Halation.apply(
+            raw: exposed,
+            width: width,
+            height: height,
+            params: halation,
+            pixelSizeUM: pixelSizeUM
+        )
+
+        let scale = blackWhiteFilmingExposureCorrection
+        return exposed.map { value in
             log10(Swift.max(value * scale, 0.0) + 1e-10)
         }
     }

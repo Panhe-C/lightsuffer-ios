@@ -91,11 +91,16 @@ final class CatalogParityTests: XCTestCase {
         var dirCouplers = DirCouplersParams()
         dirCouplers.diffusionSizeUM = 0.0
 
+        // The reference fixtures of the catalogue run without the spatial
+        // effects: the halation and the scatter of the negative are off.
+        var filmRender = FilmRenderParams(dirCouplers: dirCouplers)
+        filmRender.halation.active = false
+
         return PipelineParams(
             film: filmProfile,
             print: printProfile,
             camera: CameraParams(autoExposure: false),
-            filmRender: FilmRenderParams(dirCouplers: dirCouplers),
+            filmRender: filmRender,
             scanner: ScannerParams(unsharpMaskSigma: 0, unsharpMaskAmount: 0),
             io: IOParams(scanFilm: scanFilm)
         )
@@ -180,18 +185,18 @@ final class CatalogParityTests: XCTestCase {
             )
             for index in 0..<3 {
                 XCTAssertLessThanOrEqual(
-                    abs(digest.filmRender.halationFirstSigmaUM[index] - referenceSigma[index]),
+                    abs(digest.filmRender.halation.halationFirstSigmaUM[index] - referenceSigma[index]),
                     tolerance(
                         for: referenceSigma[index],
-                        produced: digest.filmRender.halationFirstSigmaUM[index]
+                        produced: digest.filmRender.halation.halationFirstSigmaUM[index]
                     ),
                     "\(id): the halation sigma \(index)"
                 )
                 XCTAssertLessThanOrEqual(
-                    abs(digest.filmRender.halationStrength[index] - referenceStrength[index]),
+                    abs(digest.filmRender.halation.halationStrength[index] - referenceStrength[index]),
                     tolerance(
                         for: referenceStrength[index],
-                        produced: digest.filmRender.halationStrength[index]
+                        produced: digest.filmRender.halation.halationStrength[index]
                     ),
                     "\(id): the halation strength \(index)"
                 )

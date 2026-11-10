@@ -21,7 +21,7 @@ Sources read on the box:
 
 Reshaped phases:
 - **P1 — Physical core on Linux:** SwiftPM `FilmPhysics` (pure Swift CPU reference of the spektrafilm pipeline). Slice 1: profile loading, negative development for one stock, print on one paper, scan, validated against Python `simulate()` tap fixtures (mean ΔE2000 < 0.5). Then: spectral upsampling (hanatos2025), all stocks × prints, couplers, enlarger filters/preflash, chemistry morph, gamut compression.
-- **P2 — Spatial effects (CPU):** halation/scatter, grain, DIR-coupler diffusion, diffusion filters, glare, blur, unsharp mask.
+- **P2 — Spatial effects (CPU):** halation/scatter, grain, DIR-coupler diffusion, diffusion filters, glare, blur, unsharp mask. *Status 2026-11-10: the deterministic effects are ported and parity tested (slice 5, mean ΔE2000 ≈ 0.0011); the grain and the glare are stochastic and are deferred to the next slice.*
 - **P3 — Metal port** of P1–P2 with parity tests vs the CPU reference on the macOS CI simulator.
 - **P4 — App shell:** SwiftUI, photo/RAW input, all parameters (basic/advanced tiers), export, borders via FrameCore (lightsuffer-border-mac dependency).
 - **P5 — Release** per a later distribution decision.

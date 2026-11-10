@@ -99,7 +99,10 @@ final class StockCatalogTests: XCTestCase {
         XCTAssertEqual(params.print.info.stock, "kodak_portra_endura")
         XCTAssertFalse(params.io.scanFilm, "a negative is printed by default")
         XCTAssertFalse(params.camera.autoExposure)
-        XCTAssertEqual(params.scanner.unsharpMaskSigma, 0)
+        // The unsharp mask of the scanner keeps its upstream default now
+        // that it is ported.
+        XCTAssertEqual(params.scanner.unsharpMaskSigma, 0.7)
+        XCTAssertEqual(params.scanner.unsharpMaskAmount, 0.7)
 
         // The digest of the stock is applied: the DIR coupler chemistry of a
         // negative and the neutral print filters of the pair.
@@ -107,8 +110,8 @@ final class StockCatalogTests: XCTestCase {
         XCTAssertEqual(params.filmRender.dirCouplers.gammaInterlayerRToGB, [0.353, 0.302])
         XCTAssertEqual(params.filmRender.dirCouplers.gammaInterlayerGToRB, [0.154, 0.353])
         XCTAssertEqual(params.filmRender.dirCouplers.gammaInterlayerBToRG, [0.168, 0.226])
-        XCTAssertEqual(params.filmRender.halationFirstSigmaUM, [65, 65, 65])
-        XCTAssertEqual(params.filmRender.halationStrength, [0.015, 0.005, 0])
+        XCTAssertEqual(params.filmRender.halation.halationFirstSigmaUM, [65, 65, 65])
+        XCTAssertEqual(params.filmRender.halation.halationStrength, [0.015, 0.005, 0])
         XCTAssertEqual(params.enlarger.cFilterNeutral, 0, accuracy: 1e-9)
         XCTAssertEqual(params.enlarger.mFilterNeutral, 51.56801468495496, accuracy: 1e-6)
         XCTAssertEqual(params.enlarger.yFilterNeutral, 52.53400422349596, accuracy: 1e-6)
@@ -132,8 +135,14 @@ final class StockCatalogTests: XCTestCase {
             )
             let twice = Digest.digest(params)
             XCTAssertEqual(twice.filmRender.dirCouplers, params.filmRender.dirCouplers)
-            XCTAssertEqual(twice.filmRender.halationFirstSigmaUM, params.filmRender.halationFirstSigmaUM)
-            XCTAssertEqual(twice.filmRender.halationStrength, params.filmRender.halationStrength)
+            XCTAssertEqual(
+                twice.filmRender.halation.halationFirstSigmaUM,
+                params.filmRender.halation.halationFirstSigmaUM
+            )
+            XCTAssertEqual(
+                twice.filmRender.halation.halationStrength,
+                params.filmRender.halation.halationStrength
+            )
             XCTAssertEqual(twice.enlarger.cFilterNeutral, params.enlarger.cFilterNeutral)
             XCTAssertEqual(twice.enlarger.mFilterNeutral, params.enlarger.mFilterNeutral)
             XCTAssertEqual(twice.enlarger.yFilterNeutral, params.enlarger.yFilterNeutral)
@@ -145,12 +154,12 @@ final class StockCatalogTests: XCTestCase {
         var params = try StockCatalog.pipelineParams(film: "kodak_portra_400")
         params.filmRender.dirCouplers.gammaSamelayerRGB = [0.2, 0.2, 0.2]
         params.enlarger.mFilterNeutral = 12.0
-        params.filmRender.halationStrength = [0.5, 0.5, 0.5]
+        params.filmRender.halation.halationStrength = [0.5, 0.5, 0.5]
 
         let digested = Digest.digest(params)
         XCTAssertEqual(digested.filmRender.dirCouplers.gammaSamelayerRGB, [0.2, 0.2, 0.2])
         XCTAssertEqual(digested.enlarger.mFilterNeutral, 12.0)
-        XCTAssertEqual(digested.filmRender.halationStrength, [0.5, 0.5, 0.5])
+        XCTAssertEqual(digested.filmRender.halation.halationStrength, [0.5, 0.5, 0.5])
     }
 
     /// Every stock of the catalogue can be simulated.

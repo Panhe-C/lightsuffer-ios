@@ -15,8 +15,8 @@ back — not a set of baked LUTs.
 
 | Phase | Scope | State |
 |---|---|---|
-| P1 | `FilmPhysics`: pure-Swift port of the spektrafilm pipeline (CPU reference), validated tap by tap against the Python engine | **in progress** (slices 1 and 2 ported: profile loading, the hanatos 2025 spectral upsampling and the whole camera → print → scan chain, negative development with DIR couplers, enlarger printing, print development, scanning and the cam16ucs gamut compression — parity with the Python engine, mean ΔE2000 ≈ 0.0021) |
-| P2 | Spatial effects (halation, grain, DIR-coupler diffusion, diffusion filters, glare, blur, unsharp) | not started |
+| P1 | `FilmPhysics`: pure-Swift port of the spektrafilm pipeline (CPU reference), validated tap by tap against the Python engine | **in progress** (slices 1, 2 and 4 ported: profile loading, the hanatos 2025 spectral upsampling and the whole camera → print → scan chain, negative development with DIR couplers, enlarger printing, print development, scanning, the cam16ucs gamut compression and the whole stock catalogue — parity with the Python engine, mean ΔE2000 ≈ 0.0021) |
+| P2 | Spatial effects (halation, grain, DIR-coupler diffusion, diffusion filters, glare, blur, unsharp) | **in progress** (slice 5 ported: the highlight boost, the in-emulsion scatter, the back-reflection halation, the DIR-coupler diffusion, the four diffusion-filter families, the lens blurs and the unsharp mask — parity with the Python engine, mean ΔE2000 ≈ 0.0011. The **grain** and the **glare** are stochastic and are deferred to the next slice) |
 | P3 | Metal port of the engine, parity-tested against the CPU reference | not started |
 | P4 | SwiftUI app shell (photo/RAW input, all parameters, export, borders) | not started |
 | P5 | Release | not started |
@@ -50,6 +50,13 @@ Sources/FilmPhysics/              pure-Swift physical engine (CPU reference)
   CAM16.swift                     the CAM16 / CAM16-UCS appearance model
   SpectralUpsampling.swift        the hanatos 2025 spectral upsampling and its tc LUT
   Filming.swift                   the filming stage (camera image → log exposure)
+  SpatialEffects.swift            the image space filters (separable Gaussian, the
+                                  Young & van Vliet IIR, the exponential surrogate,
+                                  the unsharp mask)
+  DiffusionFilter.swift           the diffusion filters of the camera and of the
+                                  enlarger (the four families and their PSF)
+  Halation.swift                  the highlight boost, the in emulsion scatter and
+                                  the back reflection halation
   GamutCompression.swift          the input and the output gamut compression
   Illuminants.swift               the illuminant spectra and their chromaticity
   NeutralPrintFilters.swift       the neutral print filter database lookup
@@ -73,6 +80,11 @@ Tests/FilmPhysicsTests/           Swift test target
   Slice2ParityTests.swift         whole pipeline parity (rgb_in → rgb_out) + the
                                   tc LUT, the CAM16-UCS model, the gamut compressor
   Slice1ParityTests.swift         tap by tap parity with the Python engine
+  SpatialParityTests.swift        parity of the spatial effects (the halation, the
+                                  highlight boost, the DIR coupler diffusion, the
+                                  diffusion filters, the lens blurs, the unsharp
+                                  mask) and of the image space helpers
+  CatalogParityTests.swift        the whole stock catalogue (148 looks)
   ProfileLoaderTests.swift        the loaded profile vs. the digested fixture data
   ColourTests.swift               sRGB / CIELAB / CIEDE2000 (Sharma test data)
   NumericsTests.swift             the numeric helpers
@@ -111,6 +123,18 @@ validates the ported slices against the reference fixtures:
   (`cmy_film`, `log_e_print`, `cmy_print`, `rgb_out`) is compared with the
   reference. Measured: max abs error ≈ 1e-6 on the density taps and a mean
   ΔE2000 of ≈ 0.0025 on the scanned image (gate: < 0.5).
+* `SpatialParityTests` — the deterministic spatial effects (the highlight
+  boost, the in-emulsion scatter, the back-reflection halation, the spatial
+  diffusion of the DIR-coupler inhibitors, the diffusion filters of the
+  camera and of the enlarger, the lens blurs and the unsharp mask) are
+  compared with the reference on ten parameter cases (the upstream
+  defaults, every effect alone and everything at once). Measured: a mean
+  ΔE2000 of 0.00093 – 0.00155 and a max ΔE2000 of 0.0022 – 0.0114 (gates:
+  mean < 0.5, tightened to mean < 0.01 and max < 0.05). The image space
+  helpers (the FIR and the Young & van Vliet Gaussian, the exponential
+  surrogate and the `reflect` boundary) match the reference to ≈ 8e-08.
+* `CatalogParityTests` — the whole stock catalogue (the 148 looks of the
+  upstream engine) is compared with the reference.
 * `ProfileLoaderTests` — the loaded profile data vs. the digested fixture
   data (max relative difference ≤ 1e-6).
 * `ColourTests` — the sRGB transfer function, the CIELAB conversion and the

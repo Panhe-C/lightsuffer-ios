@@ -105,7 +105,8 @@ final class Slice1ParityTests: XCTestCase {
         let filmRenderInputs = FilmRenderInputs(
             dirCouplers: digest.dirCouplers,
             densityCurveGamma: digest.densityCurveGamma,
-            grainDensityMin: try XCTUnwrap(grainParams["density_min"]?.doubles)
+            grainDensityMin: try XCTUnwrap(grainParams["density_min"]?.doubles),
+            pixelSizeUM: try XCTUnwrap(derived["pixel_size_um"]?.double)
         )
 
         return Slice1Inputs(

@@ -69,6 +69,11 @@ from opt_einsum import contract  # noqa: E402
 
 from spektrafilm.config import SPECTRAL_SHAPE, STANDARD_OBSERVER_CMFS  # noqa: E402
 from spektrafilm.model.color_filters import custom_dichroic_filters  # noqa: E402
+from spektrafilm.model.diffusion import (  # noqa: E402
+    _bloom_max_lambda_um,
+    _strength_to_scatter,
+    diffusion_filter_psf,
+)
 from spektrafilm.model.couplers import (  # noqa: E402
     compute_density_curves_before_dir_couplers,
     compute_dir_couplers_matrix,
@@ -78,6 +83,11 @@ from spektrafilm.profiles.io import load_profile  # noqa: E402
 from spektrafilm.runtime.params_builder import digest_params, init_params  # noqa: E402
 from spektrafilm.runtime.pipeline import SimulationPipeline  # noqa: E402
 from spektrafilm.utils.conversions import density_to_light  # noqa: E402
+from spektrafilm.utils.fast_gaussian_filter import (  # noqa: E402
+    _reflect,
+    fast_exponential_filter,
+    fast_gaussian_filter,
+)
 from spektrafilm.utils.gamut_compression import OutputGamutCompressSpec, compress_rgb  # noqa: E402
 from spektrafilm.utils.morph_curves import (  # noqa: E402
     _evaluate_fitted_density,
@@ -1462,6 +1472,574 @@ def case_key(case):
 
 
 # --------------------------------------------------------------------------
+# slice 5: the spatial effects (halation, diffusion filters, DIR coupler
+# diffusion, the lens blurs and the unsharp mask)
+# --------------------------------------------------------------------------
+
+#: The size of the (small) slice 5 test image.
+SLICE5_IMAGE_SIZE = 32
+
+#: The film format (in millimetres) of the cases whose effects live on the
+#: micrometre scale.
+#:
+#: The upstream parameters of the scatter, of the halation and of the
+#: inhibitor diffusion are expressed in micrometres of the *film*; the size
+#: of a pixel of the negative is ``film_format_mm * 1000 / max(height,
+#: width)``.  On a 32 x 32 test image a 35 mm frame gives a pixel of
+#: 1093.75 um, i.e. every micrometre scale effect is far below one pixel
+#: (and therefore a mathematical no-op).  The cases that exercise those
+#: effects therefore use a narrow film format, so that the upstream
+#: parameters land on a meaningful number of pixels.
+SLICE5_NARROW_FILM_FORMAT_MM = 1.0
+
+
+def build_slice5_test_image() -> np.ndarray:
+    """The deterministic linear ProPhoto RGB test image of the slice 5 (32 x 32).
+
+    The image carries everything the spatial effects work on:
+
+    * row 0: a neutral grey ramp, log spaced 0.002 .. 4.0,
+    * row 1: saturated colour patches (and a mid grey),
+    * row 2: skin like colour patches,
+    * row 3: mixed patches (black, white, 50 % grey, 18 % grey, ...),
+    * rows 4-11: a dark field with a neutral highlight spot (8x) and a warm
+      highlight spot (the red weighted halation),
+    * rows 12-31: a smooth vertical ramp on the left half and a textured
+      field on the right half, separated by a hard vertical edge (a factor
+      of four).
+    """
+    size = SLICE5_IMAGE_SIZE
+    img = np.zeros((size, size, 3), dtype=np.float64)
+
+    grey = np.logspace(math.log10(0.002), math.log10(4.0), size)
+    img[0, :, :] = grey[:, None]
+
+    saturated = np.array(
+        [
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (1.0, 1.0, 0.0),
+            (1.0, 0.0, 1.0),
+            (0.0, 1.0, 1.0),
+            (0.9, 0.1, 0.0),
+            (0.0, 0.9, 0.1),
+        ],
+        dtype=np.float64,
+    )
+    img[1, 0:8, :] = saturated
+    img[1, 8:16, :] = saturated[::-1]
+    img[1, 16:, :] = 0.18
+
+    skin = np.array(
+        [
+            (0.72, 0.55, 0.45),
+            (0.60, 0.42, 0.33),
+            (0.85, 0.68, 0.57),
+            (0.45, 0.30, 0.24),
+            (0.95, 0.78, 0.66),
+            (0.55, 0.38, 0.30),
+            (0.78, 0.62, 0.50),
+            (0.35, 0.22, 0.18),
+        ],
+        dtype=np.float64,
+    )
+    img[2, 0:8, :] = skin
+    img[2, 8:16, :] = skin[::-1]
+    img[2, 16:, :] = 0.05
+
+    mixed = np.array(
+        [
+            (0.0, 0.0, 0.0),
+            (1.0, 1.0, 1.0),
+            (0.5, 0.5, 0.5),
+            (0.184, 0.184, 0.184),
+            (0.9, 0.9, 0.05),
+            (0.05, 0.9, 0.9),
+            (0.02, 0.02, 0.02),
+            (2.0, 2.0, 2.0),
+        ],
+        dtype=np.float64,
+    )
+    img[3, 0:8, :] = mixed
+    img[3, 8:16, :] = mixed[::-1]
+    img[3, 16:, :] = 0.1
+
+    # A dark field with the two highlight spots.
+    img[4:12, :, :] = 0.004
+    img[5:10, 5:10, :] = 8.0
+    img[5:10, 18:24, 0] = 8.0
+    img[5:10, 18:24, 1] = 5.0
+    img[5:10, 18:24, 2] = 2.0
+
+    # A smooth ramp on the left half and a textured field on the right half
+    # (separated by a hard vertical edge).
+    rng = np.random.default_rng(20261110)
+    texture = 10 ** (
+        math.log10(0.002)
+        + rng.random((size - 12, size, 3)) * (math.log10(3.0) - math.log10(0.002))
+    )
+    ramp = np.logspace(math.log10(0.01), math.log10(2.0), size - 12)[:, None]
+    img[12:, 0:16, :] = np.repeat(ramp[:, :, None], 16, axis=1)
+    img[12:, 16:, :] = texture[:, 16:, :] * 4.0
+
+    return img
+
+
+def _slice5_base_params(output_gamut_compress: str = "cam16ucs"):
+    """The upstream defaults of a slice 5 case.
+
+    Only the *stochastic* effects (the grain and the glare) and the auto
+    exposure are switched off: the grain needs the SciPy binomial and
+    Poisson random variates and the glare needs a seeded lognormal, both of
+    which are deferred to a later slice.  Every spatial effect keeps its
+    upstream default value.
+    """
+    params = init_params(film_profile=FILM_PROFILE, print_profile=PRINT_PROFILE)
+
+    # --- the stochastic effects (deferred) ------------------------------
+    params.film_render.grain.active = False
+    params.print_render.glare.active = False
+    params.film_render.glare.active = False
+
+    # --- the auto exposure (not ported) --------------------------------
+    params.camera.auto_exposure = False
+
+    # --- the print density curve morph (off at the upstream default) ---
+    params.print_render.density_curves_morph = replace(
+        params.print_render.density_curves_morph, active=False
+    )
+
+    # --- io -------------------------------------------------------------
+    params.io.scan_film = False
+    params.io.crop = False
+    params.io.upscale_factor = 1.0
+    params.io.output_gamut_compress = OutputGamutCompressSpec(
+        algorithm=output_gamut_compress
+    )
+
+    # --- debug / settings ----------------------------------------------
+    params.debug.deactivate_spatial_effects = False
+    params.debug.deactivate_stochastic_effects = False
+    params.debug.lut_mode = False
+    params.settings.use_enlarger_lut = False
+    params.settings.use_scanner_lut = False
+    params.settings.preview_mode = False
+
+    return params
+
+
+def _slice5_disable_spatial_effects(params):
+    """Switches every spatial effect off (the reference of the single effect
+    cases)."""
+    params.film_render.halation.active = False
+    params.film_render.dir_couplers.diffusion_size_um = 0.0
+    params.camera.lens_blur_um = 0.0
+    params.camera.diffusion_filter.active = False
+    params.enlarger.diffusion_filter.active = False
+    params.enlarger.lens_blur = 0.0
+    params.scanner.lens_blur = 0.0
+    params.scanner.unsharp_mask = (0.0, 0.0)
+
+
+def _slice5_halation(params):
+    """The scatter and the back reflection halation, with a visible strength.
+
+    The micrometre scale of the upstream parameters is brought onto the
+    pixels of the test image with a narrow film format (1 mm) and with the
+    spatial scale knobs of the upstream (which multiply the image plane
+    widths of the kernels).
+    """
+    _slice5_disable_spatial_effects(params)
+    params.camera.film_format_mm = SLICE5_NARROW_FILM_FORMAT_MM
+    params.film_render.halation.active = True
+    params.film_render.halation.scatter_amount = 1.0
+    params.film_render.halation.scatter_spatial_scale = 20.0
+    params.film_render.halation.halation_amount = 2.0
+    params.film_render.halation.halation_spatial_scale = 1.0
+
+
+def _slice5_highlight_boost(params):
+    """The highlight boost of the halation group (the upstream default is
+    boost_ev = 0, i.e. inactive)."""
+    _slice5_disable_spatial_effects(params)
+    params.film_render.halation.active = True
+    params.film_render.halation.boost_ev = 6.0
+    params.film_render.halation.boost_range = 0.3
+    params.film_render.halation.protect_ev = 4.0
+
+
+def _slice5_dir_coupler_diffusion(params):
+    """The spatial diffusion of the DIR coupler inhibitors."""
+    _slice5_disable_spatial_effects(params)
+    params.camera.film_format_mm = SLICE5_NARROW_FILM_FORMAT_MM
+    params.film_render.dir_couplers.diffusion_size_um = 20.0
+    params.film_render.dir_couplers.diffusion_tail_um = 200.0
+    params.film_render.dir_couplers.diffusion_tail_weight = 0.06
+
+
+def _slice5_camera_diffusion_filter(params):
+    """The diffusion filter of the camera (the black pro mist family, the
+    upstream default family)."""
+    _slice5_disable_spatial_effects(params)
+    params.camera.diffusion_filter.active = True
+    params.camera.diffusion_filter.filter_family = "black_pro_mist"
+    params.camera.diffusion_filter.strength = 1.0
+    params.camera.diffusion_filter.spatial_scale = 8.0
+
+
+def _slice5_enlarger_diffusion_filter(params):
+    """The diffusion filter of the enlarger."""
+    _slice5_disable_spatial_effects(params)
+    params.enlarger.diffusion_filter.active = True
+    params.enlarger.diffusion_filter.filter_family = "black_pro_mist"
+    params.enlarger.diffusion_filter.strength = 1.0
+    params.enlarger.diffusion_filter.spatial_scale = 8.0
+
+
+def _slice5_camera_lens_blur(params):
+    """The lens blur of the camera."""
+    _slice5_disable_spatial_effects(params)
+    params.camera.film_format_mm = SLICE5_NARROW_FILM_FORMAT_MM
+    params.camera.lens_blur_um = 60.0
+
+
+def _slice5_scanner_blur_unsharp(params):
+    """The lens blur and the unsharp mask of the scanner."""
+    _slice5_disable_spatial_effects(params)
+    params.scanner.lens_blur = 1.5
+    params.scanner.unsharp_mask = (0.7, 0.7)
+
+
+def _slice5_all_effects(params):
+    """Every deterministic spatial effect at once."""
+    _slice5_halation(params)
+    params.film_render.halation.boost_ev = 6.0
+    params.film_render.dir_couplers.diffusion_size_um = 20.0
+    params.film_render.dir_couplers.diffusion_tail_um = 200.0
+    params.film_render.dir_couplers.diffusion_tail_weight = 0.06
+    params.camera.diffusion_filter.active = True
+    params.camera.diffusion_filter.filter_family = "black_pro_mist"
+    params.camera.diffusion_filter.strength = 1.0
+    params.camera.diffusion_filter.spatial_scale = 0.25
+    params.enlarger.diffusion_filter.active = True
+    params.enlarger.diffusion_filter.filter_family = "black_pro_mist"
+    params.enlarger.diffusion_filter.strength = 1.0
+    params.enlarger.diffusion_filter.spatial_scale = 0.25
+    params.camera.lens_blur_um = 60.0
+    params.scanner.lens_blur = 1.5
+    params.scanner.unsharp_mask = (0.7, 0.7)
+
+
+SLICE5_CASES = (
+    {
+        "name": "baseline",
+        "title": "Every spatial effect switched off",
+        "description": (
+            "The reference of the single effect cases: the scatter and the "
+            "halation off, the DIR couplers active but per pixel (no "
+            "inhibitor diffusion), the camera and the enlarger diffusion "
+            "filters off, the lens blurs off and the unsharp mask off."
+        ),
+        "apply": _slice5_disable_spatial_effects,
+        "taps": ("rgb_out",),
+    },
+    {
+        "name": "defaults_grain_off",
+        "title": "The upstream defaults, with the grain off",
+        "description": (
+            "The upstream defaults of init_params(): the scatter and the "
+            "halation active (with the stock preset of Portra 400), the DIR "
+            "couplers active with their default 20 um inhibitor diffusion, "
+            "the unsharp mask of the scanner at its default (0.7, 0.7). The "
+            "grain and the glare are switched off (they are stochastic) and "
+            "so is the auto exposure (not ported). On a 35 mm frame of a "
+            "32 x 32 image a pixel is 1093.75 um, so the micrometre scale "
+            "effects are below one pixel."
+        ),
+        "apply": lambda p: None,
+        "taps": ("rgb_out", "log_e_film", "cmy_film"),
+    },
+    {
+        "name": "halation",
+        "title": "The scatter and the back reflection halation",
+        "description": (
+            "The scatter (a Gaussian core and an exponential tail) and the "
+            "back reflection halation (three Gaussians with sqrt(k) spaced "
+            "widths) of the negative, with the upstream parameters on a 1 mm "
+            "film format (a pixel is 31.25 um) and with the spatial scale "
+            "of the scatter multiplied by 20 so that both kernels cover "
+            "several pixels."
+        ),
+        "apply": _slice5_halation,
+        "taps": ("rgb_out", "log_e_film"),
+    },
+    {
+        "name": "highlight_boost",
+        "title": "The highlight boost",
+        "description": (
+            "The boost that reconstructs the pre clip irradiance of the "
+            "negative (boost_ev = 6, the upstream default range of 0.3 and "
+            "the upstream default protection of 4 stops). The upstream "
+            "default of boost_ev is 0, i.e. the boost is inactive."
+        ),
+        "apply": _slice5_highlight_boost,
+        "taps": ("rgb_out", "log_e_film"),
+    },
+    {
+        "name": "dir_coupler_diffusion",
+        "title": "The spatial diffusion of the DIR coupler inhibitors",
+        "description": (
+            "The inhibitors released by the emulsion layers diffuse into the "
+            "neighbourhood (a Gaussian of 20 um and an exponential tail of "
+            "200 um with a weight of 0.06, the upstream defaults) before "
+            "they reduce the development of the neighbouring pixels. The "
+            "case uses a 1 mm film format so that the diffusion covers "
+            "several pixels."
+        ),
+        "apply": _slice5_dir_coupler_diffusion,
+        "taps": ("rgb_out", "cmy_film"),
+    },
+    {
+        "name": "camera_diffusion_filter",
+        "title": "The diffusion filter of the camera",
+        "description": (
+            "The black pro mist family (the upstream default family) at a "
+            "strength of 1.0 and a spatial scale of 8. The filter "
+            "redistributes the light between the unscattered and the "
+            "scattered population, with a per channel point spread "
+            "function."
+        ),
+        "apply": _slice5_camera_diffusion_filter,
+        "taps": ("rgb_out", "log_e_film"),
+    },
+    {
+        "name": "enlarger_diffusion_filter",
+        "title": "The diffusion filter of the enlarger",
+        "description": (
+            "The same filter as the camera case, but applied on the exposure "
+            "of the paper."
+        ),
+        "apply": _slice5_enlarger_diffusion_filter,
+        "taps": ("rgb_out", "log_e_print"),
+    },
+    {
+        "name": "camera_lens_blur",
+        "title": "The lens blur of the camera",
+        "description": (
+            "The 60 um lens blur of the camera, on a 1 mm film format (a "
+            "pixel is 31.25 um, so the blur is 1.92 pixels wide)."
+        ),
+        "apply": _slice5_camera_lens_blur,
+        "taps": ("rgb_out", "log_e_film"),
+    },
+    {
+        "name": "scanner_blur_unsharp",
+        "title": "The lens blur and the unsharp mask of the scanner",
+        "description": (
+            "The lens blur of the scanner (1.5 pixels) and its unsharp mask "
+            "(the upstream default of 0.7 pixels and 0.7 of amount), "
+            "applied on the linear RGB of the scan, after the output gamut "
+            "compression and before the output transfer function."
+        ),
+        "apply": _slice5_scanner_blur_unsharp,
+        "taps": ("rgb_out",),
+    },
+    {
+        "name": "all_effects",
+        "title": "Every deterministic spatial effect at once",
+        "description": (
+            "The scatter, the halation, the highlight boost, the DIR coupler "
+            "diffusion, the camera and the enlarger diffusion filters, the "
+            "lens blur of the camera and the lens blur and the unsharp mask "
+            "of the scanner, all at once."
+        ),
+        "apply": _slice5_all_effects,
+        "taps": ("rgb_out", "log_e_film", "cmy_film", "log_e_print"),
+    },
+)
+
+
+def build_slice5_helpers() -> dict:
+    """The reference of the image space helpers.
+
+    The port reimplements the separable FIR Gaussian (below three pixels),
+    the Young & van Vliet recursive Gaussian (above), the Gaussian mixture
+    surrogate of the exponential PSF and the `reflect` boundary of SciPy;
+    the reference holds what the upstream kernels return.
+    """
+    width, height = 12, 10
+    rng = np.random.default_rng(4242)
+    plane = rng.random((height, width))
+
+    gaussians = []
+    for sigma in (0.0, 0.4, 0.7, 1.0, 2.5, 3.0, 4.5, 8.0):
+        filtered = np.asarray(fast_gaussian_filter(plane, sigma), dtype=np.float64)
+        gaussians.append({"sigma": float(sigma), "filtered": filtered})
+
+    exponentials = []
+    for decay in (0.5, 1.0, 3.0, 7.5):
+        filtered = np.asarray(
+            fast_exponential_filter(plane, decay), dtype=np.float64
+        )
+        exponentials.append({"decay": float(decay), "filtered": filtered})
+
+    reflect = [float(_reflect(index, 7)) for index in range(-12, 13)]
+
+    return {
+        "width": width,
+        "height": height,
+        "plane": plane.reshape(-1),
+        "gaussians": gaussians,
+        "exponentials": exponentials,
+        "reflect": reflect,
+        "notes": {
+            "plane": "a deterministic random plane (numpy default_rng(4242))",
+            "gaussians": (
+                "fast_gaussian_filter(plane, sigma) of the upstream: the "
+                "separable FIR below three pixels and the Young & van Vliet "
+                "recursion above, both with the reflect boundary."
+            ),
+            "exponentials": (
+                "fast_exponential_filter(plane, decay) of the upstream: the "
+                "Gaussian mixture surrogate of the isotropic 2D exponential "
+                "PSF."
+            ),
+            "reflect": "the _reflect helper of the upstream for an axis of 7 samples",
+        },
+    }
+
+
+def build_slice5_diffusion_filters() -> list:
+    """The reference of the point spread functions of the diffusion filters.
+
+    Every family of the upstream is evaluated with and without a warmth
+    bias, so that the per channel redistribution of the halo (the warm rim
+    around the practical lights) is validated as well.
+    """
+    entries = []
+    for family in ("glimmerglass", "black_pro_mist", "pro_mist", "cinebloom"):
+        for warmth in (0.0, 1.0):
+            psf = diffusion_filter_psf(
+                (13, 13),
+                family=family,
+                spatial_scale=1.0,
+                pixel_size_um=100.0,
+                halo_warmth=warmth,
+                overrides=None,
+            )
+            entries.append(
+                {
+                    "family": family,
+                    "halo_warmth": float(warmth),
+                    "spatial_scale": 1.0,
+                    "pixel_size_um": 100.0,
+                    "shape": [13, 13],
+                    "psf": np.asarray(psf, dtype=np.float64),
+                    "scatter_fraction": float(_strength_to_scatter(1.0, family)),
+                    "bloom_max_lambda_um": float(_bloom_max_lambda_um(family, None)),
+                }
+            )
+    return entries
+
+
+def run_slice5_case(case, image):
+    """Run one slice 5 case and collect its taps."""
+    params = _slice5_base_params()
+    case["apply"](params)
+    params = digest_params(params)
+
+    pipeline = SimulationPipeline(params)
+
+    taps = {}
+    for tap in case["taps"]:
+        value = pipeline.process(image, inject="rgb_in", collect=tap)
+        taps[tap] = np.asarray(value, dtype=np.float64)
+
+    pixel_size_um = float(
+        params.camera.film_format_mm * 1000 / np.max(image.shape[0:2])
+    )
+
+    return {
+        "id": case["name"],
+        "title": case["title"],
+        "description": case["description"],
+        "params": params_to_json(params),
+        "pixel_size_um": pixel_size_um,
+        "taps": taps,
+    }
+
+
+def build_slice5(image: np.ndarray) -> dict:
+    """Build the slice 5 fixture (the spatial effects)."""
+    cases = []
+    for case in SLICE5_CASES:
+        case_start = time.time()
+        result = run_slice5_case(case, image)
+        cases.append(result)
+        print(
+            f"  slice5 {case['name']:<28} "
+            f"({time.time() - case_start:5.1f} s)"
+        )
+
+    payload = {
+        "format": "lightsuffer-ios slice5 spatial effects fixture v1",
+        "generated_by": "tools/gen_fixtures.py",
+        "upstream": {
+            "project": UPSTREAM_PROJECT,
+            "url": UPSTREAM_URL,
+            "commit": UPSTREAM_COMMIT,
+            "license": "GPL-3.0-or-later (code) / CC BY-SA 4.0 (profile data)",
+        },
+        "notes": {
+            "float_format": "all floating point values are rounded to 7 significant digits",
+            "spatial_effects": (
+                "the deterministic spatial effects of the upstream engine: "
+                "the highlight boost, the in emulsion scatter, the back "
+                "reflection halation, the spatial diffusion of the DIR "
+                "coupler inhibitors, the diffusion filters of the camera and "
+                "of the enlarger, the lens blurs of the camera and of the "
+                "scanner and the unsharp mask of the scanner."
+            ),
+            "deferred": (
+                "the grain and the glare are NOT part of this fixture: the "
+                "grain needs the SciPy binomial and Poisson random variates "
+                "and the glare needs a seeded lognormal, both of which are "
+                "deferred to a later slice."
+            ),
+            "film_format": (
+                "the micrometre scale effects (the scatter, the halation and "
+                "the inhibitor diffusion) need a pixel of a meaningful size: "
+                "on a 32 x 32 image a 35 mm frame gives a pixel of "
+                "1093.75 um and the effects are below one pixel. The cases "
+                "that exercise them use a 1 mm film format (31.25 um per "
+                "pixel) and, for the scatter, the spatial scale knob of the "
+                "upstream."
+            ),
+        },
+        "test_image": {
+            "size": [SLICE5_IMAGE_SIZE, SLICE5_IMAGE_SIZE, 3],
+            "color_space": "linear ProPhoto RGB",
+            "description": (
+                "row 0: a neutral grey ramp log spaced 0.002..4.0; row 1: "
+                "saturated colour patches; row 2: skin like colour patches; "
+                "row 3: mixed patches (black, white, 50 % grey, 18 % grey, "
+                "...); rows 4-11: a dark field with a neutral highlight spot "
+                "and a warm highlight spot; rows 12-31: a smooth vertical "
+                "ramp on the left half and a textured field (numpy "
+                "default_rng(20261110)) on the right half, separated by a "
+                "hard vertical edge"
+            ),
+            "data": image,
+        },
+        "helpers": build_slice5_helpers(),
+        "diffusion_filters": build_slice5_diffusion_filters(),
+        "cases": cases,
+    }
+    return jsonable(payload)
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -1475,7 +2053,7 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--slices",
-        default="1,2,4",
+        default="1,2,4,5",
         help="the slices to generate, comma separated (default: %(default)s)",
     )
     parser.add_argument(
@@ -1568,6 +2146,18 @@ def main(argv=None) -> int:
         print(
             f"  slice4 {'catalogue':<28} {os.path.getsize(slice4_path) / 1024:8.1f} KiB  "
             f"({time.time() - slice4_start:5.1f} s, {len(slice4['cases'])} cases)"
+        )
+
+    # --- slice 5: the spatial effects ----------------------------------
+    if "5" in slices:
+        slice5_start = time.time()
+        slice5 = build_slice5(build_slice5_test_image())
+        slice5_path = os.path.join(out_dir, "slice5_spatial.json")
+        _write_json(slice5_path, slice5)
+        written.append(slice5_path)
+        print(
+            f"  slice5 {'spatial effects':<28} {os.path.getsize(slice5_path) / 1024:8.1f} KiB  "
+            f"({time.time() - slice5_start:5.1f} s, {len(slice5['cases'])} cases)"
         )
 
     total = sum(os.path.getsize(p) for p in written)

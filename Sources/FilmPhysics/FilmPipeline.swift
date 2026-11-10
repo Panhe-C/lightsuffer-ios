@@ -25,15 +25,27 @@ public struct CameraParams: Equatable, Sendable {
     public var autoExposure: Bool
     /// The radius of the lens blur, in micrometres.
     public var lensBlurUM: Double
+    /// The width of the film frame, in millimetres.
+    ///
+    /// It defines the size of a pixel of the negative, i.e. the scale of
+    /// every spatial effect of the film (the scatter, the halation, the
+    /// inhibitor diffusion and the diffusion filter).
+    public var filmFormatMM: Double
+    /// The diffusion filter of the camera.
+    public var diffusionFilter: DiffusionFilterParams
 
     public init(
         exposureCompensationEV: Double = 0.0,
         autoExposure: Bool = true,
-        lensBlurUM: Double = 0.0
+        lensBlurUM: Double = 0.0,
+        filmFormatMM: Double = 35.0,
+        diffusionFilter: DiffusionFilterParams = DiffusionFilterParams()
     ) {
         self.exposureCompensationEV = exposureCompensationEV
         self.autoExposure = autoExposure
         self.lensBlurUM = lensBlurUM
+        self.filmFormatMM = filmFormatMM
+        self.diffusionFilter = diffusionFilter
     }
 }
 
@@ -60,7 +72,12 @@ public struct EnlargerParams: Equatable, Sendable {
     /// The neutral cyan filter, in Kodak CC units.
     public var cFilterNeutral: Double
     /// The radius of the lens blur of the enlarger.
+    ///
+    /// The upstream engine never reads this parameter (the enlarger blur is
+    /// dead code upstream), but the port keeps it for the API parity.
     public var lensBlur: Double
+    /// The diffusion filter of the enlarger.
+    public var diffusionFilter: DiffusionFilterParams
     /// The preflash exposure of the enlarger.
     public var preflashExposure: Double
     /// The shift of the yellow filter of the preflash.
@@ -79,6 +96,7 @@ public struct EnlargerParams: Equatable, Sendable {
         mFilterNeutral: Double = 65,
         cFilterNeutral: Double = 0,
         lensBlur: Double = 0.0,
+        diffusionFilter: DiffusionFilterParams = DiffusionFilterParams(),
         preflashExposure: Double = 0.0,
         preflashYFilterShift: Double = 0.0,
         preflashMFilterShift: Double = 0.0
@@ -93,6 +111,7 @@ public struct EnlargerParams: Equatable, Sendable {
         self.mFilterNeutral = mFilterNeutral
         self.cFilterNeutral = cFilterNeutral
         self.lensBlur = lensBlur
+        self.diffusionFilter = diffusionFilter
         self.preflashExposure = preflashExposure
         self.preflashYFilterShift = preflashYFilterShift
         self.preflashMFilterShift = preflashMFilterShift
@@ -147,29 +166,24 @@ public struct FilmRenderParams: Equatable, Sendable {
     public var densityCurveGamma: Double
     /// The minimum density of the grain, per channel.
     public var grainDensityMin: [Double]
-    /// The sigma of the first halation bounce, per channel.
+    /// The halation and the scatter of the negative.
     ///
-    /// The digest of the stock sets it (65 µm for a still triacetate base,
-    /// 50 µm for a PET cine base).
-    public var halationFirstSigmaUM: [Double]
-    /// The strength of the halation, per channel.
-    ///
-    /// The digest of the stock sets it from the anti-halation layer of the
-    /// emulsion.
-    public var halationStrength: [Double]
+    /// The digest of the stock sets the width of the first halation bounce
+    /// (65 µm for a still triacetate base, 50 µm for a PET cine base) and
+    /// the strength of the halation (from the anti-halation layer of the
+    /// emulsion).
+    public var halation: HalationParams
 
     public init(
         dirCouplers: DirCouplersParams = DirCouplersParams(),
         densityCurveGamma: Double = 1.0,
         grainDensityMin: [Double] = [0.03, 0.03, 0.03],
-        halationFirstSigmaUM: [Double] = [65, 65, 65],
-        halationStrength: [Double] = [0.05, 0.015, 0]
+        halation: HalationParams = HalationParams()
     ) {
         self.dirCouplers = dirCouplers
         self.densityCurveGamma = densityCurveGamma
         self.grainDensityMin = grainDensityMin
-        self.halationFirstSigmaUM = halationFirstSigmaUM
-        self.halationStrength = halationStrength
+        self.halation = halation
     }
 }
 
@@ -332,9 +346,12 @@ public struct FilmTaps: Equatable, Sendable {
 /// rgb_in ──▶ log_e_film ──▶ cmy_film ──▶ log_e_print ──▶ cmy_print ──▶ rgb_out
 /// ```
 ///
-/// The spatial and the stochastic effects (grain, halation, diffusion
-/// filters, glare, blur, unsharp mask) are not part of this slice; the
-/// pipeline runs the exact spectral path.
+/// The deterministic spatial effects (the highlight boost, the in emulsion
+/// scatter, the back reflection halation, the spatial diffusion of the DIR
+/// coupler inhibitors, the diffusion filters of the camera and of the
+/// enlarger, the lens blurs and the unsharp mask) are part of the pipeline;
+/// the two stochastic effects (the grain and the glare of the print) are
+/// deferred to a later slice.
 public struct FilmPipeline {
 
     /// The parameters of the pipeline.
@@ -357,15 +374,6 @@ public struct FilmPipeline {
         }
         guard params.camera.autoExposure == false else {
             throw PipelineError.invalidInputs("the auto exposure is not ported yet")
-        }
-        guard params.camera.lensBlurUM == 0,
-              params.enlarger.lensBlur == 0,
-              params.scanner.lensBlur == 0
-        else {
-            throw PipelineError.invalidInputs("the lens blurs are not ported yet")
-        }
-        guard params.scanner.unsharpMaskSigma == 0, params.scanner.unsharpMaskAmount == 0 else {
-            throw PipelineError.invalidInputs("the unsharp mask is not ported yet")
         }
         guard RGBColourspace.named(params.io.inputColorSpace) != nil else {
             throw PipelineError.invalidInputs(
@@ -520,12 +528,16 @@ public struct FilmPipeline {
                 whiteLevel: params.scanner.whiteLevel,
                 blackCorrection: params.scanner.blackCorrection,
                 whiteCorrection: params.scanner.whiteCorrection
-            )
+            ),
+            lensBlur: params.scanner.lensBlur,
+            unsharpMaskSigma: params.scanner.unsharpMaskSigma,
+            unsharpMaskAmount: params.scanner.unsharpMaskAmount
         )
         let filmRenderInputs = FilmRenderInputs(
             dirCouplers: digest.dirCouplers,
             densityCurveGamma: digest.densityCurveGamma,
-            grainDensityMin: params.filmRender.grainDensityMin
+            grainDensityMin: params.filmRender.grainDensityMin,
+            halation: digest.halation
         )
         self.inputs = Slice1Inputs(
             spectral: spectralInputs,
@@ -558,6 +570,23 @@ public struct FilmPipeline {
             illuminants: illuminants,
             colourMatchingFunctions: colourMatchingFunctions
         )
+
+        // --- the spatial scale of the film ------------------------------
+        // The size of a pixel of the negative defines the scale of every
+        // spatial effect of the film (the scatter, the halation, the
+        // inhibitor diffusion and the diffusion filter).
+        //
+        // Upstream reference:
+        // `spektrafilm.runtime.services.resize.ResizingService.crop_and_rescale`.
+        let pixelSizeUM = Halation.pixelSizeUM(
+            filmFormatMM: params.camera.filmFormatMM,
+            width: rgbIn.width,
+            height: rgbIn.height
+        )
+        var stageInputs = inputs
+        stageInputs.filmRender.pixelSizeUM = pixelSizeUM
+        stageInputs.enlarger.pixelSizeUM = pixelSizeUM
+        stageInputs.enlarger.diffusionFilter = params.enlarger.diffusionFilter
 
         // --- the filming stage ------------------------------------------
         let raw = Filming.rawFromRGB(
@@ -592,14 +621,19 @@ public struct FilmPipeline {
         )
         let logEFilm = Filming.expose(
             raw: raw,
+            width: rgbIn.width,
+            height: rgbIn.height,
             exposureCompensationEV: params.camera.exposureCompensationEV,
+            camera: params.camera,
+            halation: params.filmRender.halation,
+            pixelSizeUM: pixelSizeUM,
             blackWhiteFilmingExposureCorrection: filmingCorrection
         )
         let logEFilmImage = RGBImage(width: rgbIn.width, height: rgbIn.height, data: logEFilm)
 
         // --- the printing and the scanning stages -----------------------
         let pipeline = try Slice1Pipeline(
-            film: params.film, print: params.print, inputs: inputs
+            film: params.film, print: params.print, inputs: stageInputs
         )
         if params.io.scanFilm {
             // The direct scan path: the negative is scanned directly, the

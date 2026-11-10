@@ -33,10 +33,11 @@ public struct DirCouplersParams: Equatable, Sendable {
     public var gammaInterlayerGToRB: [Double]
     /// The inter layer inhibition of the B layer onto the R and G layers.
     public var gammaInterlayerBToRG: [Double]
-    /// The spatial diffusion size of the inhibitors, in micrometres.
+    /// The spatial diffusion of the inhibitors, in micrometres.
     ///
-    /// The spatial diffusion is a phase 2 feature: slice 1 runs the couplers
-    /// per pixel, i.e. with a diffusion size of zero.
+    /// The inhibitors diffuse into the neighbourhood before they reduce the
+    /// development of the surrounding pixels; the diffusion is a spatial
+    /// effect and needs the size of a pixel of the negative.
     public var diffusionSizeUM: Double
     /// The spatial diffusion tail size of the inhibitors, in micrometres.
     public var diffusionTailUM: Double
@@ -198,8 +199,12 @@ public enum Couplers {
     /// Computes the exposure correction the released inhibitors cause.
     ///
     /// Upstream reference:
-    /// `spektrafilm.model.couplers.compute_exposure_correction_dir_couplers`
-    /// (without the spatial diffusion, which is a phase 2 feature).
+    /// `spektrafilm.model.couplers.compute_exposure_correction_dir_couplers`.
+    ///
+    /// The inhibitors are released by the layers that develop and they
+    /// diffuse into the neighbourhood: the correction term is blurred with
+    /// a Gaussian and with an exponential tail before it is subtracted from
+    /// the log exposure.
     ///
     /// - Parameters:
     ///   - logRaw: the log exposure of the negative, three values per pixel.
@@ -208,6 +213,13 @@ public enum Couplers {
     ///   - matrix: the inhibitor matrix, scaled by the coupler amount.
     ///   - positive: whether the emulsion is a positive (slide) stock.
     ///   - highExposureCouplersShift: the extra inhibition at high density.
+    ///   - width: the width of the image, in pixels (the diffusion needs it).
+    ///   - height: the height of the image, in pixels.
+    ///   - diffusionSizePixel: the sigma of the Gaussian diffusion of the
+    ///     inhibitors, in pixels (zero disables the diffusion).
+    ///   - diffusionTailSizePixel: the decay constant of the exponential
+    ///     tail of the diffusion, in pixels.
+    ///   - diffusionTailWeight: the weight of the exponential tail.
     /// - Returns: the corrected log exposure, three values per pixel.
     public static func exposureCorrection(
         logRaw: [Double],
@@ -215,13 +227,18 @@ public enum Couplers {
         densityMax: [Double],
         matrix: [[Double]],
         positive: Bool,
-        highExposureCouplersShift: Double = 0.0
+        highExposureCouplersShift: Double = 0.0,
+        width: Int = 0,
+        height: Int = 0,
+        diffusionSizePixel: Double = 0,
+        diffusionTailSizePixel: Double = 0,
+        diffusionTailWeight: Double = 0
     ) -> [Double] {
         let pixels = logRaw.count / 3
-        var corrected = [Double](repeating: 0, count: logRaw.count)
+        var correction = [Double](repeating: 0, count: logRaw.count)
         for pixel in 0..<pixels {
             for receiver in 0..<3 {
-                var correction = 0.0
+                var amount = 0.0
                 for donor in 0..<3 {
                     var silver = densityCMY[pixel * 3 + donor]
                     if positive {
@@ -230,10 +247,32 @@ public enum Couplers {
                     if highExposureCouplersShift != 0 {
                         silver += highExposureCouplersShift * silver * silver
                     }
-                    correction += silver * matrix[donor][receiver]
+                    amount += silver * matrix[donor][receiver]
                 }
-                corrected[pixel * 3 + receiver] = logRaw[pixel * 3 + receiver] - correction
+                correction[pixel * 3 + receiver] = amount
             }
+        }
+
+        // The spatial diffusion of the inhibitors.
+        if diffusionSizePixel > 0, width > 0, height > 0 {
+            let gaussian = SpatialEffects.gaussianFilter(
+                rgb: correction, width: width, height: height, sigma: diffusionSizePixel
+            )
+            let tail = SpatialEffects.exponentialFilter(
+                rgb: correction,
+                width: width,
+                height: height,
+                decayConstant: [diffusionTailSizePixel]
+            )
+            for index in 0..<correction.count {
+                correction[index] = (1.0 - diffusionTailWeight) * gaussian[index]
+                    + diffusionTailWeight * tail[index]
+            }
+        }
+
+        var corrected = [Double](repeating: 0, count: logRaw.count)
+        for index in 0..<logRaw.count {
+            corrected[index] = logRaw[index] - correction[index]
         }
         return corrected
     }

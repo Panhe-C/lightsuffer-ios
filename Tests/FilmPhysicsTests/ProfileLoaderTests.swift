@@ -248,12 +248,12 @@ final class ProfileLoaderTests: XCTestCase {
 
         // The halation baseline of the stock.
         try assertMatches(
-            digest.halationFirstSigmaUM,
+            digest.halation.halationFirstSigmaUM,
             halation["halation_first_sigma_um"],
             "halation.halation_first_sigma_um"
         )
         try assertMatches(
-            digest.halationStrength,
+            digest.halation.halationStrength,
             halation["halation_strength"],
             "halation.halation_strength"
         )

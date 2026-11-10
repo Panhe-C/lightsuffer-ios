@@ -77,8 +77,7 @@ public enum Scanning {
     /// `spektrafilm.runtime.stages.scanning.ScanningStage.scan` and
     /// `ScanningStage._density_to_rgb`.
     ///
-    /// The blur, the unsharp mask, the glare and the output gamut compression
-    /// are not part of slice 1.
+    /// The glare of the print is not ported (it is a stochastic effect).
     ///
     /// - Parameters:
     ///   - cmy: the densities of the print, three values per pixel.
@@ -94,6 +93,11 @@ public enum Scanning {
     ///   - colorReference: the black / white reference of the print.
     ///   - outputGamutCompress: the output gamut compression (`nil` or the
     ///     `"off"` algorithm leaves the values untouched).
+    ///   - width: the width of the image, in pixels.
+    ///   - height: the height of the image, in pixels.
+    ///   - lensBlur: the radius of the lens blur of the scanner, in pixels.
+    ///   - unsharpMaskSigma: the sigma of the unsharp mask, in pixels.
+    ///   - unsharpMaskAmount: the amount of the unsharp mask.
     /// - Returns: the encoded output RGB image, three values per pixel.
     public static func scan(
         cmy: [Double],
@@ -104,7 +108,12 @@ public enum Scanning {
         xyzToRGB: [[Double]],
         srgbToSRGB: [[Double]],
         colorReference: ColorReference = ColorReference(),
-        outputGamutCompress: OutputGamutCompressSpec? = nil
+        outputGamutCompress: OutputGamutCompressSpec? = nil,
+        width: Int = 0,
+        height: Int = 0,
+        lensBlur: Double = 0,
+        unsharpMaskSigma: Double = 0,
+        unsharpMaskAmount: Double = 0
     ) -> [Double] {
         scan(
             cmy: cmy,
@@ -116,7 +125,12 @@ public enum Scanning {
             xyzToRGB: xyzToRGB,
             srgbToSRGB: srgbToSRGB,
             colorReference: colorReference,
-            outputGamutCompress: outputGamutCompress
+            outputGamutCompress: outputGamutCompress,
+            width: width,
+            height: height,
+            lensBlur: lensBlur,
+            unsharpMaskSigma: unsharpMaskSigma,
+            unsharpMaskAmount: unsharpMaskAmount
         )
     }
 
@@ -145,6 +159,11 @@ public enum Scanning {
     ///   - colorReference: the black / white reference.
     ///   - outputGamutCompress: the output gamut compression (`nil` or the
     ///     `"off"` algorithm leaves the values untouched).
+    ///   - width: the width of the image, in pixels.
+    ///   - height: the height of the image, in pixels.
+    ///   - lensBlur: the radius of the lens blur of the scanner, in pixels.
+    ///   - unsharpMaskSigma: the sigma of the unsharp mask, in pixels.
+    ///   - unsharpMaskAmount: the amount of the unsharp mask.
     /// - Returns: the encoded output RGB image, three values per pixel.
     public static func scan(
         cmy: [Double],
@@ -156,7 +175,12 @@ public enum Scanning {
         xyzToRGB: [[Double]],
         srgbToSRGB: [[Double]],
         colorReference: ColorReference = ColorReference(),
-        outputGamutCompress: OutputGamutCompressSpec? = nil
+        outputGamutCompress: OutputGamutCompressSpec? = nil,
+        width: Int = 0,
+        height: Int = 0,
+        lensBlur: Double = 0,
+        unsharpMaskSigma: Double = 0,
+        unsharpMaskAmount: Double = 0
     ) -> [Double] {
         let logXYZ = cmyToLogXYZ(
             cmy: cmy,
@@ -195,6 +219,29 @@ public enum Scanning {
                 spec: outputGamutCompress,
                 outputColourSpace: .sRGB
             )
+        }
+
+        // The lens blur and the unsharp mask of the scanner, applied on the
+        // linear RGB values, after the output gamut compression and before
+        // the output transfer function.
+        //
+        // Upstream reference:
+        // `spektrafilm.runtime.stages.scanning.ScanningStage._apply_blur_and_unsharp`.
+        if width > 0, height > 0 {
+            if lensBlur > 0 {
+                rgb = SpatialEffects.gaussianFilter(
+                    rgb: rgb, width: width, height: height, sigma: lensBlur
+                )
+            }
+            if unsharpMaskSigma > 0, unsharpMaskAmount > 0 {
+                rgb = SpatialEffects.unsharpMask(
+                    rgb: rgb,
+                    width: width,
+                    height: height,
+                    sigma: unsharpMaskSigma,
+                    amount: unsharpMaskAmount
+                )
+            }
         }
 
         // The output transfer function first applies the sRGB to sRGB matrix

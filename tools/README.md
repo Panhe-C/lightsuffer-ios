@@ -52,8 +52,17 @@ For every parameter case the script runs
 | `slice2_srgb_input.json` | slice 2 case 2 |
 | `slice2_camera_ev_minus1.json` | slice 2 case 3 |
 | `slice2_output_gamut_off.json` | slice 2 case 4 |
+| `slice4_catalog.json` | the whole catalogue of the upstream engine: the 128 printed looks (16 negatives × 8 print media) and the 20 direct scans, with the digest of every case |
+| `slice5_spatial.json` | the spatial effects: the ten parameter cases (the upstream defaults, every deterministic effect alone and all of them at once), the textured 32 × 32 test image and the reference of the image space helpers |
 
-Total size is ≈ 1.2 MB (slice 1: ≈ 972 KiB, slice 2: ≈ 232 KiB).
+Total size is ≈ 2.5 MB (slice 1: ≈ 972 KiB, slice 2: ≈ 232 KiB, slice 4:
+≈ 378 KiB, slice 5: ≈ 1.06 MB).
+
+The script runs the cases **serially**: the numba kernels of the upstream
+engine use the GNU OpenMP threading layer and a `multiprocessing` pool
+deadlocks when the workers are forked after the kernels have been compiled
+in the parent process (`--processes 1` is the default and does not use a
+pool at all).
 
 ### The slice 2 fixtures
 
@@ -97,6 +106,49 @@ stochastic effects off, the input gamut compression at the upstream default
 The hanatos 2025 tc LUT is the one of `slice1_common.json` (it only depends
 on the film sensitivity, the hanatos 2025 adaptation and the input gamut
 compression).
+
+## The slice 5 fixtures (the spatial effects)
+
+The slice 5 fixtures exercise the **deterministic** spatial effects of the
+upstream engine: the highlight boost, the in-emulsion scatter, the
+back-reflection halation, the spatial diffusion of the DIR-coupler
+inhibitors, the diffusion filters of the camera and of the enlarger, the
+lens blur of the camera and the lens blur and the unsharp mask of the
+scanner.
+
+The **grain** and the **glare** are *not* part of them: the grain draws its
+particles from the SciPy binomial and Poisson random variates and the glare
+draws a lognormal from the unseeded NumPy random state (the upstream itself
+is not reproducible there). Both are deferred to a later slice.
+
+The test image is a 32 × 32 linear ProPhoto RGB image with a grey ramp,
+saturated and skin-like patches, two highlight spots (one neutral, one warm),
+a smooth gradient and a textured field separated by a hard edge.
+
+The micrometre scale effects (the scatter, the halation and the inhibitor
+diffusion) need a pixel of a meaningful size: on a 32 × 32 image a 35 mm
+frame gives a pixel of 1093.75 µm, i.e. every one of those effects is below
+one pixel (and therefore a mathematical no-op). The cases that exercise them
+therefore use a **1 mm film format** (31.25 µm per pixel) and, for the
+scatter, the `scatter_spatial_scale` knob of the upstream.
+
+| Case | What it exercises |
+|---|---|
+| `baseline` | every spatial effect switched off (the reference of the single effect cases) |
+| `defaults_grain_off` | the upstream defaults, with the grain (and the glare) off |
+| `halation` | the in-emulsion scatter and the back-reflection halation |
+| `highlight_boost` | the boost that reconstructs the pre-clip irradiance |
+| `dir_coupler_diffusion` | the spatial diffusion of the DIR-coupler inhibitors |
+| `camera_diffusion_filter` | the diffusion filter of the camera (the black pro mist family) |
+| `enlarger_diffusion_filter` | the diffusion filter of the enlarger |
+| `camera_lens_blur` | the lens blur of the camera |
+| `scanner_blur_unsharp` | the lens blur and the unsharp mask of the scanner |
+| `all_effects` | every deterministic spatial effect at once |
+
+The file also carries the reference of the image space helpers (the `helpers`
+block): the separable FIR Gaussian, the Young & van Vliet IIR Gaussian, the
+exponential filter (the Gaussian mixture surrogate) and the `reflect`
+boundary of the upstream kernels.
 
 ## Number format
 

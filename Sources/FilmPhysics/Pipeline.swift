@@ -129,6 +129,12 @@ public struct EnlargerInputs: Equatable, Sendable {
     public var normalizePrintExposure: Bool
     /// The preflash exposure of the enlarger.
     public var preflashExposure: Double
+    /// The diffusion filter of the enlarger.
+    public var diffusionFilter: DiffusionFilterParams
+    /// The size of a pixel of the negative, in micrometres.
+    ///
+    /// It defines the image plane scale of the diffusion filter.
+    public var pixelSizeUM: Double
     /// The spectral density of the mid grey reference of the negative.
     ///
     /// The upstream engine computes it from the 0.184 grey patch during the
@@ -146,6 +152,8 @@ public struct EnlargerInputs: Equatable, Sendable {
         printExposureCompensation: Bool = true,
         normalizePrintExposure: Bool = true,
         preflashExposure: Double = 0,
+        diffusionFilter: DiffusionFilterParams = DiffusionFilterParams(),
+        pixelSizeUM: Double = 0,
         densitySpectralMidgray: [Double] = [],
         densitySpectralMidgrayComp: [Double]? = nil
     ) {
@@ -156,6 +164,8 @@ public struct EnlargerInputs: Equatable, Sendable {
         self.printExposureCompensation = printExposureCompensation
         self.normalizePrintExposure = normalizePrintExposure
         self.preflashExposure = preflashExposure
+        self.diffusionFilter = diffusionFilter
+        self.pixelSizeUM = pixelSizeUM
         self.densitySpectralMidgray = densitySpectralMidgray
         self.densitySpectralMidgrayComp = densitySpectralMidgrayComp
     }
@@ -182,19 +192,31 @@ public struct ScannerInputs: Equatable, Sendable {
     public var outputGamutCompressSpec: OutputGamutCompressSpec?
     /// The black and white reference of the print.
     public var colorReference: ColorReference
+    /// The radius of the lens blur of the scanner, in pixels.
+    public var lensBlur: Double
+    /// The sigma of the unsharp mask of the scanner, in pixels.
+    public var unsharpMaskSigma: Double
+    /// The amount of the unsharp mask of the scanner.
+    public var unsharpMaskAmount: Double
 
     public init(
         xyzToRGB: [[Double]],
         srgbToSRGB: [[Double]],
         outputGamutCompress: String = "off",
         outputGamutCompressSpec: OutputGamutCompressSpec? = nil,
-        colorReference: ColorReference = ColorReference()
+        colorReference: ColorReference = ColorReference(),
+        lensBlur: Double = 0,
+        unsharpMaskSigma: Double = 0,
+        unsharpMaskAmount: Double = 0
     ) {
         self.xyzToRGB = xyzToRGB
         self.srgbToSRGB = srgbToSRGB
         self.outputGamutCompress = outputGamutCompress
         self.outputGamutCompressSpec = outputGamutCompressSpec
         self.colorReference = colorReference
+        self.lensBlur = lensBlur
+        self.unsharpMaskSigma = unsharpMaskSigma
+        self.unsharpMaskAmount = unsharpMaskAmount
     }
 
     /// The output gamut compression to apply.
@@ -219,15 +241,25 @@ public struct FilmRenderInputs: Equatable, Sendable {
     /// It defines the black patch of the negative, which the printing stage
     /// uses for the black reference.
     public var grainDensityMin: [Double]
+    /// The halation and the scatter of the negative.
+    public var halation: HalationParams
+    /// The size of a pixel of the negative, in micrometres.
+    ///
+    /// It defines the image plane scale of the inhibitor diffusion.
+    public var pixelSizeUM: Double
 
     public init(
         dirCouplers: DirCouplersParams = DirCouplersParams(),
         densityCurveGamma: Double = 1.0,
-        grainDensityMin: [Double] = [0.03, 0.03, 0.03]
+        grainDensityMin: [Double] = [0.03, 0.03, 0.03],
+        halation: HalationParams = HalationParams(),
+        pixelSizeUM: Double = 0
     ) {
         self.dirCouplers = dirCouplers
         self.densityCurveGamma = densityCurveGamma
         self.grainDensityMin = grainDensityMin
+        self.halation = halation
+        self.pixelSizeUM = pixelSizeUM
     }
 }
 
@@ -427,12 +459,27 @@ public struct Slice1Pipeline {
             let densityMax = (0..<3).map { channel in
                 Numerics.nanMax(normalized.map { $0[channel] })
             }
+            // The spatial diffusion of the inhibitors.
+            //
+            // Upstream reference:
+            // `spektrafilm.model.couplers.apply_density_correction_dir_couplers`.
+            var diffusionSizePixel = 0.0
+            var diffusionTailSizePixel = 0.0
+            if couplers.diffusionSizeUM > 0, inputs.filmRender.pixelSizeUM > 0 {
+                diffusionSizePixel = couplers.diffusionSizeUM / inputs.filmRender.pixelSizeUM
+                diffusionTailSizePixel = couplers.diffusionTailUM / inputs.filmRender.pixelSizeUM
+            }
             let correctedLogRaw = Couplers.exposureCorrection(
                 logRaw: logRaw.data,
                 densityCMY: density,
                 densityMax: densityMax,
                 matrix: matrix,
-                positive: positive
+                positive: positive,
+                width: logRaw.width,
+                height: logRaw.height,
+                diffusionSizePixel: diffusionSizePixel,
+                diffusionTailSizePixel: diffusionTailSizePixel,
+                diffusionTailWeight: couplers.diffusionTailWeight
             )
             density = DensityCurves.interpolateExposureToDensity(
                 logExposureRGB: correctedLogRaw,
@@ -548,9 +595,22 @@ public struct Slice1Pipeline {
         )
 
         let blackWhiteCorrection = colorReference.printingExposureCorrection(printProfile: print)
-        let exposure = logRawPrint.map { value -> Double in
-            let raw = pow(10.0, value) * inputs.enlarger.printExposure * blackWhiteCorrection
-            return log10(Swift.max(raw, 0.0) + 1e-10)
+        // The diffusion filter of the enlarger, applied on the exposure of
+        // the paper.
+        //
+        // Upstream reference:
+        // `spektrafilm.runtime.stages.printing.PrintingStage.expose`.
+        let scattered = DiffusionFilter.apply(
+            image: logRawPrint.map { value -> Double in
+                pow(10.0, value) * inputs.enlarger.printExposure * blackWhiteCorrection
+            },
+            width: cmyFilm.width,
+            height: cmyFilm.height,
+            params: inputs.enlarger.diffusionFilter,
+            pixelSizeUM: inputs.enlarger.pixelSizeUM
+        )
+        let exposure = scattered.map { raw -> Double in
+            log10(Swift.max(raw, 0.0) + 1e-10)
         }
         return RGBImage(width: cmyFilm.width, height: cmyFilm.height, data: exposure)
     }
@@ -578,7 +638,12 @@ public struct Slice1Pipeline {
             xyzToRGB: inputs.scanner.xyzToRGB,
             srgbToSRGB: inputs.scanner.srgbToSRGB,
             colorReference: colorReference,
-            outputGamutCompress: inputs.scanner.resolvedOutputGamutCompress
+            outputGamutCompress: inputs.scanner.resolvedOutputGamutCompress,
+            width: cmyPrint.width,
+            height: cmyPrint.height,
+            lensBlur: inputs.scanner.lensBlur,
+            unsharpMaskSigma: inputs.scanner.unsharpMaskSigma,
+            unsharpMaskAmount: inputs.scanner.unsharpMaskAmount
         )
         return RGBImage(width: cmyPrint.width, height: cmyPrint.height, data: rgb)
     }
@@ -604,7 +669,12 @@ public struct Slice1Pipeline {
             xyzToRGB: inputs.scanner.xyzToRGB,
             srgbToSRGB: inputs.scanner.srgbToSRGB,
             colorReference: colorReference,
-            outputGamutCompress: inputs.scanner.resolvedOutputGamutCompress
+            outputGamutCompress: inputs.scanner.resolvedOutputGamutCompress,
+            width: cmyFilm.width,
+            height: cmyFilm.height,
+            lensBlur: inputs.scanner.lensBlur,
+            unsharpMaskSigma: inputs.scanner.unsharpMaskSigma,
+            unsharpMaskAmount: inputs.scanner.unsharpMaskAmount
         )
         return RGBImage(width: cmyFilm.width, height: cmyFilm.height, data: rgb)
     }

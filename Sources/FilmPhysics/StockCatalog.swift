@@ -418,7 +418,12 @@ extension StockCatalog {
     /// The parameters are the upstream defaults of
     /// `spektrafilm.runtime.params_schema.RuntimePhotoParams`, with the
     /// features that are not ported yet switched off (the auto exposure of
-    /// the camera, the lens blurs and the unsharp mask of the scanner).
+    /// the camera). The deterministic spatial effects keep their upstream
+    /// defaults (the halation and the scatter of the negative are active,
+    /// the DIR couplers diffuse their inhibitors over 20 um and the scanner
+    /// applies its unsharp mask); the two stochastic effects (the grain and
+    /// the glare of the print) are deferred to a later slice and are not
+    /// applied.
     /// The stock specific digest is applied, exactly like the upstream
     /// `digest_params` does when a stock is selected.
     ///
@@ -448,7 +453,6 @@ extension StockCatalog {
             film: filmProfile,
             print: printProfile,
             camera: CameraParams(autoExposure: false),
-            scanner: ScannerParams(unsharpMaskSigma: 0, unsharpMaskAmount: 0),
             io: IOParams(scanFilm: scanned)
         )
         return Digest.digest(params)

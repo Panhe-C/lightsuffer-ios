@@ -141,11 +141,11 @@ public enum Digest {
         guard params.film.isFilm else { return params }
         let key = "\(params.film.info.use.rawValue)|\(params.film.info.antihalation.rawValue)"
         guard let preset = halationPresets[key] else { return params }
-        if params.filmRender.halationFirstSigmaUM == FilmRenderParams().halationFirstSigmaUM {
-            params.filmRender.halationFirstSigmaUM = preset.sigma
+        if params.filmRender.halation.halationFirstSigmaUM == HalationParams().halationFirstSigmaUM {
+            params.filmRender.halation.halationFirstSigmaUM = preset.sigma
         }
-        if params.filmRender.halationStrength == FilmRenderParams().halationStrength {
-            params.filmRender.halationStrength = preset.strength
+        if params.filmRender.halation.halationStrength == HalationParams().halationStrength {
+            params.filmRender.halation.halationStrength = preset.strength
         }
         return params
     }
@@ -201,11 +201,11 @@ public enum Digest {
         if profile.info.support == .film {
             let key = "\(profile.info.use.rawValue)|\(profile.info.antihalation.rawValue)"
             if let preset = halationPresets[key] {
-                if digest.halationFirstSigmaUM == FilmRenderParams().halationFirstSigmaUM {
-                    digest.halationFirstSigmaUM = preset.sigma
+                if digest.halation.halationFirstSigmaUM == HalationParams().halationFirstSigmaUM {
+                    digest.halation.halationFirstSigmaUM = preset.sigma
                 }
-                if digest.halationStrength == FilmRenderParams().halationStrength {
-                    digest.halationStrength = preset.strength
+                if digest.halation.halationStrength == HalationParams().halationStrength {
+                    digest.halation.halationStrength = preset.strength
                 }
             }
         }
