@@ -241,7 +241,7 @@ public final class MetalBackend: FilmRenderBackend {
     /// - Returns: the scanned print.
     public func render(_ image: RGBImage, params: PipelineParams) throws -> RGBImage {
         let plan = try FilmRenderPlan.build(params: params)
-        return try render(image, plan: plan).rgbOut
+        return try render(image, plan: plan, collectTaps: false).rgbOut
     }
 
     /// Renders an image with a precomputed plan.
@@ -251,6 +251,21 @@ public final class MetalBackend: FilmRenderBackend {
     ///   - plan: the precomputed data of the render.
     /// - Returns: the taps of the render.
     public func render(_ image: RGBImage, plan: FilmRenderPlan) throws -> MetalRenderTaps {
+        try render(image, plan: plan, collectTaps: true)
+    }
+
+    /// Renders an image with a precomputed plan.
+    ///
+    /// - Parameters:
+    ///   - image: the camera image, in the input colourspace of the plan.
+    ///   - plan: the precomputed data of the render.
+    ///   - collectTaps: whether the intermediate taps are read back (the
+    ///     read back of the taps is a measurable part of the time of a
+    ///     render, so the timing runs skip it).
+    /// - Returns: the taps of the render.
+    private func render(
+        _ image: RGBImage, plan: FilmRenderPlan, collectTaps: Bool
+    ) throws -> MetalRenderTaps {
         guard let library else {
             throw initializationError ?? MetalBackendError.noDevice
         }
@@ -811,6 +826,13 @@ public final class MetalBackend: FilmRenderBackend {
             values[index] = Double(contents[index])
         }
         let rgbOut = RGBImage(width: width, height: height, data: values)
+        guard collectTaps else {
+            let empty = RGBImage(width: 0, height: 0, data: [])
+            return MetalRenderTaps(
+                logEFilm: empty, cmyFilm: empty, logEPrint: empty, cmyPrint: empty,
+                rgbOut: rgbOut
+            )
+        }
         return MetalRenderTaps(
             logEFilm: readBack(logEFilm, width: width, height: height),
             cmyFilm: readBack(cmyFilm, width: width, height: height),

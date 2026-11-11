@@ -131,6 +131,19 @@ final class MetalParityTests: XCTestCase {
                 + "\(maxDifference(cpu.rgbOut.data, gpu.rgbOut.data))")
             XCTAssertLessThan(error.mean, 0.5, "\(name): the mean dE2000 of the GPU")
 
+            // The taps of the chain, one by one.
+            let logEFilm = maxDifference(cpu.logEFilm.data, gpu.logEFilm.data)
+            let cmyFilm = maxDifference(cpu.cmyFilm.data, gpu.cmyFilm.data)
+            let logEPrint = maxDifference(cpu.logEPrint.data, gpu.logEPrint.data)
+            let cmyPrint = maxDifference(cpu.cmyPrint.data, gpu.cmyPrint.data)
+            print("METAL-PARITY slice2 \(name): the taps, max abs error: "
+                + "log_e_film \(logEFilm), cmy_film \(cmyFilm), "
+                + "log_e_print \(logEPrint), cmy_print \(cmyPrint)")
+            XCTAssertLessThan(logEFilm, 1e-3, "\(name): log_e_film")
+            XCTAssertLessThan(cmyFilm, 1e-3, "\(name): cmy_film")
+            XCTAssertLessThan(logEPrint, 1e-3, "\(name): log_e_print")
+            XCTAssertLessThan(cmyPrint, 1e-3, "\(name): cmy_print")
+
             // The GPU against the executable specification of the kernels
             // (the `Float32` plan evaluator): the two must agree to the
             // rounding of the arithmetic.
@@ -360,16 +373,14 @@ final class MetalParityTests: XCTestCase {
             scanner: ScannerParams(unsharpMaskSigma: 0, unsharpMaskAmount: 0)
         )
 
-        let plan = try FilmRenderPlan.build(params: params)
-
         // The warm up.
-        _ = try backend.render(image, plan: plan)
+        _ = try backend.render(image, params: params)
 
         var gpuTimes: [Double] = []
         var cpuTimes: [Double] = []
         for _ in 0..<3 {
             let start = Date()
-            _ = try backend.render(image, plan: plan)
+            _ = try backend.render(image, params: params)
             gpuTimes.append(Date().timeIntervalSince(start))
 
             let cpuStart = Date()

@@ -884,9 +884,10 @@ swift build
 swift test
 ```
 
-The whole suite (77 tests) runs in **3 min 50 s** in the debug build (one
-test skips on Linux: the Metal availability one); the timing of the grain is
-measured with
+The whole suite (77 tests) runs in **4 to 6 min** in the debug build (one
+test skips on Linux: the Metal availability one; the two heaviest families
+are the statistical validation of the grain, §3.4, and the 148 looks of the
+catalogue); the timing of the grain is measured with
 
 ```
 swift test -c release --filter testTheGrainOfALargeImageIsFast
@@ -1104,7 +1105,7 @@ twelve): the tolerance of the gate accounts for it
 | the `Float32` specification of the kernels against the CPU pipeline | the Metal kernels against the `Float32` specification (a max abs error below 1e-3) |
 | the static analysis of the shading language: the kernel names are unique, every dispatched kernel exists, the buffer indices are contiguous, the structures have the layout of their Swift counterparts, there is no `double` (`MetalSourceTests`) | the spatial effects on the GPU (the halation, the diffusion filters, the lens blurs, the unsharp mask) |
 | the counter based grain against the grain of the CPU and against the upstream (`GrainCounterTests`) | the grain of the GPU against the grain of the CPU (the statistical gate) |
-| the compilation of the package and of the test targets on Linux | the timing of the GPU against the CPU (a 1024 × 1024 image, the median of three runs after a warm up) |
+| the compilation of the package and of the test targets on Linux | the timing of the GPU against the CPU (a 1024 × 1024 image, the median of three runs after a warm up) — note that the CPU side of that measurement costs about **85 s per run** in a debug build (the release build is about twenty times faster) |
 
 **Nothing on Metal is validated until the CI runs it on a real Metal
 device**: the MSL source, the Swift/Metal API calls and the buffer layouts
