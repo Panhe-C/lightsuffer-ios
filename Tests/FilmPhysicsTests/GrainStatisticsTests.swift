@@ -186,6 +186,123 @@ final class GrainStatisticsTests: XCTestCase {
         )
     }
 
+    // MARK: - The exact samplers
+
+    /// The exact samplers of the port match the default upstream path.
+    ///
+    /// The **exact** samplers (the inversion of the cumulative
+    /// distribution, started at the mode of the distribution) draw from the
+    /// very same distributions as the SciPy generators of the default path
+    /// of the upstream (`scipy.stats.poisson.rvs` and
+    /// `scipy.stats.binom.rvs`).  The comparison is therefore made with the
+    /// **default** aggregate of the fixture, with the plain statistical gate
+    /// and **no allowance at all**.
+    ///
+    /// This is the counterpart of the comparison of the fast samplers: the
+    /// fast samplers reproduce the upstream fast path, whose inversion
+    /// underflows for the dense layers of the emulsion (see §3.4 of
+    /// `docs/PORTING.md`), and the exact samplers reproduce the upstream
+    /// default path.
+    func testTheExactSamplersMatchTheUpstreamDefaultStatistics() throws {
+        let fixture = try slice6Fixture()
+        let cases = try XCTUnwrap(fixture["cases"]?.arrayElements)
+        let lags = try XCTUnwrap(fixture["lags"]?.doubles).map { Int($0) }
+        let quantileLevels = try XCTUnwrap(fixture["quantiles"]?.doubles)
+        let upstreamSeeds = try XCTUnwrap(fixture["seeds"]?.arrayElements).count
+
+        // The family of the comparisons: the family of the slice 6 and the
+        // comparisons of this test (the gate is *not* loosened: the family
+        // grows, so the critical value grows).
+        var family = try slice6FamilySize(fixture)
+        for entry in cases {
+            family += entry["grain"]?["aggregate"]?.entryCount ?? 0
+        }
+        let gate = StatisticalGate(
+            comparisons: family,
+            upstreamSeeds: upstreamSeeds,
+            portSeeds: portSeeds.count
+        )
+
+        var comparisons: [StatisticComparison] = []
+
+        for entry in cases {
+            let id = try XCTUnwrap(entry["id"]?.string)
+            let params = try slice6Params(entry)
+            let image = try slice6Image(fixture, kind: try slice6ImageKind(entry))
+            let film = try cachedProfile(stock: try XCTUnwrap(entry["film"]?.string))
+
+            // The developed densities of the negative (the grain replaces
+            // them, so the field of the effect is the grain minus the
+            // densities).
+            var plain = params
+            plain.filmRender.grain.active = false
+            let density = try FilmPipeline(params: plain).process(rgbIn: image).cmyFilm.data
+
+            let pixelSizeUM = Halation.pixelSizeUM(
+                filmFormatMM: params.camera.filmFormatMM,
+                width: image.width,
+                height: image.height
+            )
+            let normalised = DensityCurves.normalized(film.data.densityCurves)
+
+            // The realisations of the grain, with the exact samplers.
+            var runs: [[String: Double]] = []
+            for seed in portSeeds {
+                let grain = Grain.apply(
+                    densityCMY: density,
+                    width: image.width,
+                    height: image.height,
+                    pixelSizeUM: pixelSizeUM,
+                    grain: params.filmRender.grain,
+                    densityCurves: normalised,
+                    densityCurvesLayers: film.data.densityCurvesLayers,
+                    positiveFilm: film.info.type == .positive,
+                    seed: seed,
+                    sampler: .exact
+                )
+                runs.append(fieldStatistics(
+                    subtract(grain, density),
+                    width: image.width,
+                    height: image.height,
+                    lags: lags,
+                    quantileLevels: quantileLevels
+                ).asDictionary(lags: lags, quantileLevels: quantileLevels))
+            }
+            let statistics = averageStatistics(runs)
+
+            // The **default** aggregate of the upstream (the exact SciPy
+            // generators): the plain statistical gate, with no allowance.
+            let aggregate = try XCTUnwrap(entry["grain"]?["aggregate"])
+            for (key, value) in statistics {
+                let comparison = compareStatistic(
+                    caseID: id,
+                    statistic: key,
+                    port: value,
+                    upstream: try XCTUnwrap(aggregate[key]),
+                    samplerDifference: 0,
+                    gate: gate
+                )
+                comparisons.append(comparison)
+                XCTAssertLessThanOrEqual(
+                    comparison.deviation,
+                    comparison.tolerance,
+                    "\(id): the grain statistic \(key) (the exact samplers "
+                        + "against the default upstream path): the deviation "
+                        + "\(comparison.deviation) is above the tolerance "
+                        + "\(comparison.tolerance) (z = \(comparison.z))"
+                )
+            }
+        }
+
+        printStatisticalSummary(
+            title: "slice6 grain (the exact samplers of the CPU against the upstream)",
+            reference: "the upstream default samplers (the exact SciPy generators)",
+            gate: gate,
+            comparisons: comparisons,
+            samplerDifference: false
+        )
+    }
+
     // MARK: - The determinism
 
     /// A fixed seed gives the same image twice.

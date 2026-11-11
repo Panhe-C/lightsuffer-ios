@@ -139,6 +139,10 @@ public enum Grain {
     ///     the profile, `[sample][channel][layer]`.
     ///   - positiveFilm: `true` for a slide (a positive emulsion).
     ///   - seed: the seed of the random number generator.
+    ///   - sampler: the sampler of the variates of the particles: the fast
+    ///     kernels of the upstream (the default, the algorithm the port
+    ///     reproduces) or the exact generators of the default path of the
+    ///     upstream.
     /// - Returns: the densities with the grain, three interleaved values per
     ///   pixel.
     public static func apply(
@@ -150,7 +154,8 @@ public enum Grain {
         densityCurves: [[Double]],
         densityCurvesLayers: [[[Double]]],
         positiveFilm: Bool,
-        seed: UInt64
+        seed: UInt64,
+        sampler: GrainSampler = .fast
     ) -> [Double] {
         guard grain.active else { return densityCMY }
         guard !densityCMY.isEmpty, width > 0, height > 0 else { return densityCMY }
@@ -178,7 +183,8 @@ public enum Grain {
                 pixelSizeUM: pixelSizeUM,
                 grain: grain,
                 densityMaxCurves: densityMaxCurves,
-                seed: seed
+                seed: seed,
+                sampler: sampler
             )
         }
 
@@ -197,7 +203,8 @@ public enum Grain {
             densityCurves: densityCurves,
             densityCurvesLayers: densityCurvesLayers,
             positiveFilm: positiveFilm,
-            seed: seed
+            seed: seed,
+            sampler: sampler
         )
     }
 
@@ -213,7 +220,8 @@ public enum Grain {
         pixelSizeUM: Double,
         grain: GrainParams,
         densityMaxCurves: [Double],
-        seed: UInt64
+        seed: UInt64,
+        sampler: GrainSampler
     ) -> [Double] {
         let densityMin = grain.densityMin
         // The maximum density of every channel, with the minimum density of
@@ -259,7 +267,8 @@ public enum Grain {
                     seed: StochasticSeed.grainLayer(seed: seed, channel: channel, layer: layer),
                     blurParticle: 0,
                     width: width,
-                    height: height
+                    height: height,
+                    sampler: sampler
                 )
                 for pixel in 0..<pixels {
                     output[pixel * channels + channel] += grainPlane[pixel]
@@ -307,7 +316,8 @@ public enum Grain {
         densityCurves: [[Double]],
         densityCurvesLayers: [[[Double]]],
         positiveFilm: Bool,
-        seed: UInt64
+        seed: UInt64,
+        sampler: GrainSampler
     ) -> [Double] {
         let pixels = width * height
         let densityMin = grain.densityMin
@@ -411,7 +421,8 @@ public enum Grain {
                     seed: StochasticSeed.grainLayer(seed: seed, channel: channel, layer: layer),
                     blurParticle: grain.blurDyeCloudsUM,
                     width: width,
-                    height: height
+                    height: height,
+                    sampler: sampler
                 )
                 for pixel in 0..<pixels {
                     output[pixel * channels + channel] += grainPlane[pixel]
@@ -469,7 +480,8 @@ public enum Grain {
         seed: UInt64,
         blurParticle: Double,
         width: Int,
-        height: Int
+        height: Int,
+        sampler: GrainSampler = .fast
     ) -> [Double] {
         let count = density.count
         var generator = RandomGenerator(seed: seed)
@@ -490,13 +502,17 @@ public enum Grain {
         // array before the binomial variates).
         var nParticles = [Int](repeating: 0, count: count)
         for index in 0..<count {
-            nParticles[index] = generator.poisson(nParticlesPerPixel / saturation[index])
+            nParticles[index] = sampler == .exact
+                ? generator.poissonExact(nParticlesPerPixel / saturation[index])
+                : generator.poisson(nParticlesPerPixel / saturation[index])
         }
 
         // The number of particles that develop.
         var grain = [Double](repeating: 0, count: count)
         for index in 0..<count {
-            let variate = generator.binomial(n: nParticles[index], p: probability[index])
+            let variate = sampler == .exact
+                ? generator.binomialExact(n: nParticles[index], p: probability[index])
+                : generator.binomial(n: nParticles[index], p: probability[index])
             grain[index] = Double(variate) * odParticle * saturation[index]
         }
 

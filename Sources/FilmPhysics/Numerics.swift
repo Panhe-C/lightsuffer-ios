@@ -265,7 +265,11 @@ public enum Numerics {
     ///
     /// Only `a = 0.5` is needed (`logGamma(0.5) = log(sqrt(pi))`), the
     /// Lanczos approximation covers the general case.
-    private static func logGamma(_ z: Double) -> Double {
+    ///
+    /// It is public because the exact samplers of the grain
+    /// (``ExactSamplers``) compute the probability of the mode of their
+    /// distributions in log space.
+    public static func logGamma(_ z: Double) -> Double {
         let coefficients: [Double] = [
             676.5203681218851, -1259.1392167224028, 771.32342877765313,
             -176.61502916214059, 12.507343278686905, -0.13857109526572012,

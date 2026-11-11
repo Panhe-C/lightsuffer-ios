@@ -650,6 +650,149 @@ the algorithm the port reproduces — are 0.35 σ, 0.76 σ, 0.35 σ and 0.13 σ
 of the spread of the upstream fast path, i.e. the port follows the fast
 kernels and the model difference is entirely the one of the samplers.)
 
+#### The raw comparison: an unresolved discrepancy, not a parity
+
+The comparison with the upstream **default** path is reported **twice** by
+the validation, and the two numbers must not be confused:
+
+* the **raw** comparison has **no allowance at all**: the tolerance is the
+  plain statistical gate, and the statistics above it are a **real
+  discrepancy** between the two upstream paths — the fast samplers and the
+  exact samplers do **not** draw from the same distribution;
+* the **adjusted** comparison adds the measured difference between the two
+  upstream paths (the `Δ` of the table above) to the tolerance in
+  quadrature: it says that the port follows the fast kernels, and that the
+  difference with the default path is the one the two upstream paths have
+  between themselves.
+
+The raw comparison **fails**, and it is documented as a failure:
+
+| Comparison | max \|z\| | the deviation / the upstream σ | The statistics above the gate (`k` = 8.3045 for the counter based grain, 7.8362 for the CPU grain) |
+|---|---|---|---|
+| the **counter based** grain (the fast samplers) against the upstream **default** path, raw | **11.3590** (`ultramax_400__flat_ev_plus2`, `mean_0`) | 0.00113864 / 0.000200482 | `mean_0` (11.3590), `q25` (11.2779), `q50` (8.3631) |
+| the **CPU** grain (the fast samplers) against the upstream **default** path, raw | **12.9549** (`ultramax_400__flat_ev_plus2`, `q25`) | 0.000812973 / 0.000154 | `q25` (12.9549), `q50` (10.9646), `mean_0` (10.6721), `q75` (9.1404) |
+
+The list of the statistics above the gate is explicit in the tests
+(`GrainCounterTests.samplerDifferenceExceptions` and
+`GrainStatisticsTests.modelDifferenceExceptions`): the tests fail when it
+changes, so that the discrepancy is reviewed and never silently absorbed.
+
+The cause of the discrepancy is **not** a statistical approximation: it is
+an **underflow** in the inversion of the upstream fast kernel.  The next
+section documents it, and the **exact sampler mode** of the port resolves
+it.
+
+#### The investigation: the underflow of the upstream fast inversion
+
+The upstream fast kernel (`spektrafilm.utils.fast_stats.fast_binomial`)
+draws the binomial variate in three ways:
+
+* a direct simulation below 25 trials (exact),
+* a **normal approximation** when the variance of the distribution is above
+  ten (unbiased: the rounding of a symmetric variate is symmetric and the
+  clipping at the support is negligible),
+* the **inversion of the cumulative distribution** otherwise.
+
+The inversion starts with `prob = (1 - p) ** n`, in double precision:
+
+```python
+u = np.random.rand()
+cdf = 0.0
+prob = (1.0 - p_val) ** n_val      # ← underflows to zero
+k = 0
+while cdf < u and k <= n_val:
+    cdf += prob                     # ← stays zero
+    ...
+    k += 1
+flat_result[i] = k - 1             # ← n: every particle develops
+```
+
+`n` is the number of particles of the pixel, i.e. the *Poisson* variate of
+the layer, and `p` the probability of development of a particle.  For the
+dense layers of the emulsion of a high exposure case, `n` is of the order of
+a thousand and `p` is above 0.99: `(1 - p) ** n` then underflows to zero
+(`n · log10(1 - p) < -308`), the cumulative distribution never accumulates,
+the loop runs until `k > n` and the kernel returns **n**, the maximum of
+the distribution: **every particle of the layer develops**.
+
+The measurement (the upstream, run with the two samplers, twelve seeds, the
+case `ultramax_400__flat_ev_plus2`, the means of the `cmy_film` field of the
+grain):
+
+| Path | `mean_0` | `mean_1` | `mean_2` |
+|---|---|---|---|
+| the default path (the exact SciPy generators) | −0.0033528 | −0.0005093 | −0.0018297 |
+| the fast path (`use_fast_stats = True`) | −0.0024192 | +0.0000538 | −0.0004733 |
+
+The bisection (the upstream, the same case, the same seeds, one sampler at
+a time replaced by its exact counterpart):
+
+| The Poisson | The binomial | `mean_0` |
+|---|---|---|
+| fast | fast | −0.0022917 |
+| exact | fast | −0.0023163 |
+| fast | exact | −0.0032780 |
+| exact | exact | −0.0033528 |
+
+**The binomial is the whole difference**: the exact Poisson changes nothing
+(0.00002 in the mean), the exact binomial reproduces the default path.
+
+The per layer measurement of the upstream (the mean of the number of
+developed particles, the same run):
+
+| Layer | the number of particles `n` | `p` | the variance `n p (1-p)` | the fast kernel | the exact generator | the difference |
+|---|---|---|---|---|---|---|
+| cyan, layer 0 | 3768 | 0.99828 | 6.49 (the inversion) | 3767.981 (= `n`) | 3761.479 | **+6.50** |
+| magenta, layer 0 | 11403 | 0.99931 | 7.88 (the inversion) | 11402.792 (= `n`) | 11394.912 | **+7.88** |
+| yellow, layer 0 | 1776 | 0.99757 | 4.30 (the inversion) | 1775.750 (= `n`) | 1771.455 | **+4.30** |
+| the six other layers | 283 … 11403 | 0.035 … 0.760 | 13 … 193 (the normal approximation) | the exact value | the exact value | ≤ 0.26 (the noise of the measurement) |
+
+The three dense layers are exactly the ones whose inversion underflows, and
+their difference is exactly the number of the particles that **do not**
+develop in the exact sampler (`n (1 - p)` = 6.8, 7.9 and 4.5 — the
+measured differences are 6.50, 7.88 and 4.30).
+
+**The port reproduces the fast path** — it must, that is the algorithm it
+implements — and it therefore reproduces the underflow with it: the
+inversion of `RandomGenerator.binomial` and of
+`FilmCounterRandom.binomial` computes the same `(1 - p) ** n` (in double
+precision for the CPU, in single precision for the counter based
+generator, which underflows even earlier).  The consequence is the
+documented discrepancy of the table above, and it is **not** a parity.
+
+#### The exact sampler mode: the resolution of the discrepancy
+
+The port now also implements the **exact** samplers — the inversion of the
+cumulative distribution, started at the mode of the distribution
+(`ExactSamplers`, `RandomGenerator.poissonExact` /
+`binomialExact` and `FilmCounterRandom.poissonExact` /
+`binomialExact`).  They draw from the very same distributions as the SciPy
+generators of the default path of the upstream (the PTRS and the BTPE
+algorithms), and the mode is **selectable** (`GrainSampler.exact`); the
+**default is unchanged** (`.fast`), so the existing fixtures and the
+existing validations stay valid.
+
+The validation of the exact mode is the strongest one of the slice 6: the
+comparison with the upstream **default** path, with the plain statistical
+gate and **no allowance at all**:
+
+| Comparison | the family | `k` | max \|z\| | The gate |
+|---|---|---|---|---|
+| the **CPU** grain with the exact samplers against the upstream **default** path | 1140 | 8.0996 | **4.8740** (`portra_400__flat_ev_minus2`, `acf_2`) | 3.20 σ, **no allowance** |
+| the **counter based** grain with the exact samplers against the upstream **default** path | 1444 | 8.3045 | **5.9241** (`portra_400__flat_ev_minus2`, `acf_2`) | 3.20 σ, **no allowance** |
+
+The two numbers are the same order as the ones of the algorithm gate against
+the fast path (3.80 and 3.59): the exact samplers of the port draw from
+the distribution of the upstream default path, and the discrepancy of the
+fast path is therefore **resolved** (by the exact mode) and **explained**
+(by the underflow).
+
+The Metal kernels have **no** exact mode yet: the shading language has no
+log gamma function, and the inversion from the mode needs it.  The GPU
+therefore reproduces the fast path (and its underflow), like the CPU
+reference does by default; the exact mode of the GPU is a deferred item
+(§7.9).
+
 ---
 
 ## 4. Values that are still not computed by the port (TODO list)
@@ -827,7 +970,20 @@ family-wise false alarm rate of 1 %).
 |---|---|---|---|
 | the grain against the upstream **fast** samplers (the algorithm the port reproduces) | 304 | **3.7952** (`vision3_500t__flat_ev_0`, `acf_2`) | 3.20 σ |
 | the glare against the upstream | 228 (27 below the resolution of the fixture) | **3.5123** (`portra_400__flat_ev_plus2`, `acf_8`) | 3.20 σ |
-| the grain against the upstream **default** samplers (the exact SciPy generators) | 304 | 12.95 (`ultramax_400__flat_ev_plus2`, `q25`) | 3.20 σ **+ the measured sampler difference in quadrature** |
+| the grain against the upstream **default** samplers (the exact SciPy generators), raw | 304 | 12.95 (`ultramax_400__flat_ev_plus2`, `q25`) | 3.20 σ, **no allowance** (the discrepancy is documented, §3.4) |
+| the grain against the upstream **default** samplers, adjusted | 304 | 12.95 (`ultramax_400__flat_ev_plus2`, `q25`) | 3.20 σ **+ the measured sampler difference in quadrature** |
+| the grain with the **exact** samplers against the upstream **default** samplers | 304 | **4.8740** (`portra_400__flat_ev_minus2`, `acf_2`) | 3.20 σ, **no allowance** |
+
+The counter based grain (the reference of the GPU path, `GrainCounterTests`,
+six realisations, the family of 1444 comparisons, `k` = 8.3045):
+
+| Comparison | Statistics | max \|z\| | The gate |
+|---|---|---|---|
+| the counter based grain against the grain of the CPU reference | 304 | **4.3735** (`portra_400__textured_ev_0`, `mean_0`) | 3.20 σ |
+| the counter based grain against the upstream **fast** samplers | 304 | **3.5943** (`ultramax_400__flat_ev_minus2`, `corr_0_1`) | 3.20 σ, **no allowance** |
+| the counter based grain against the upstream **default** samplers, raw | 304 | 11.36 (`ultramax_400__flat_ev_plus2`, `mean_0`) | 3.20 σ, **no allowance** (the discrepancy is documented, §3.4) |
+| the counter based grain against the upstream **default** samplers, adjusted | 304 | 11.36 (`ultramax_400__flat_ev_plus2`, `mean_0`) | 3.20 σ **+ the measured sampler difference in quadrature** |
+| the counter based grain with the **exact** samplers against the upstream **default** samplers | 304 | **5.9241** (`portra_400__flat_ev_minus2`, `acf_2`) | 3.20 σ, **no allowance** |
 
 The five worst z-scores of each comparison (the gate prints them at every
 run):
@@ -866,7 +1022,7 @@ Other measured quantities:
 | `Tests/FilmPhysicsTests/Slice1ParityTests.swift` | The tap by tap parity of the four parameter cases, the print balance reference, the exposure factor and the black / white correction path. |
 | `Tests/FilmPhysicsTests/Slice2ParityTests.swift` | The whole pipeline from `rgb_in` against the four slice 2 cases, the hanatos 2025 tc LUT, the CAM16-UCS model (forward and round trip), the output gamut compressor and the colour matrices. |
 | `Tests/FilmPhysicsTests/SpatialParityTests.swift` | The parity of the ten spatial effect cases of the slice 5 (the halation, the highlight boost, the DIR coupler diffusion, the diffusion filters, the lens blurs and the unsharp mask) and the parity of the image space helpers (the FIR and the IIR Gaussian, the exponential filter and the `reflect` boundary). |
-| `Tests/FilmPhysicsTests/GrainStatisticsTests.swift` | The statistical validation of the grain of the negative against the two upstream references (the fast kernels and the exact SciPy generators), the determinism of the seed, the timing of the grain of a 1024 × 1024 image and the invariance of the grain off path. |
+| `Tests/FilmPhysicsTests/GrainStatisticsTests.swift` | The statistical validation of the grain of the negative against the two upstream references (the fast kernels and the exact SciPy generators), the validation of the **exact** samplers of the port against the default upstream path (no allowance), the determinism of the seed, the timing of the grain of a 1024 × 1024 image and the invariance of the grain off path. |
 | `Tests/FilmPhysicsTests/GlareStatisticsTests.swift` | The statistical validation of the glare of the print against the upstream, the determinism of the seed and the absence of glare on a directly scanned film. |
 | `Tests/FilmPhysicsTests/StatisticsSupportTests.swift` | The numerics of the statistical gate (the Student t distribution, the critical value `k`, the resolution floor of the fixture and the size of the family of comparisons). |
 | `Tests/FilmPhysicsTests/ProfileLoaderTests.swift` | The profile loader against the digested fixture data, the `NaN` handling, the parameter digest, the DIR coupler matrix and the curves before the couplers. |
@@ -874,8 +1030,9 @@ Other measured quantities:
 | `Tests/FilmPhysicsTests/NumericsTests.swift` | The interpolation semantics, the geometric mean, the `NaN` aware statistics and the normal distribution function. |
 | `Tests/FilmPhysicsTests/FilmPhysicsTests.swift` | The package scaffold, the bundled profiles and the shape of the reference fixtures. |
 | `Tests/FilmPhysicsTests/FilmPlanEvaluatorTests.swift` | The validation of the render plan: the plan evaluator (in `Double`) and the `Float32` plan evaluator (the specification of the Metal kernels) against the CPU pipeline, on the slice 2, the catalogue of the slice 4 and the spatial cases of the slice 5. |
-| `Tests/FilmPhysicsTests/MetalSourceTests.swift` | The static analysis of the Metal port: the kernel names are unique, every dispatched kernel exists exactly once, the buffer indices are contiguous, the structures have the layout of their Swift counterparts and the shading language uses no `double`. |
-| `Tests/FilmPhysicsTests/GrainCounterTests.swift` | The statistical validation of the counter based grain (the reference of the GPU path) against the grain of the CPU reference and against the upstream. |
+| `Tests/FilmPhysicsTests/MetalSourceTests.swift` | The static analysis of the Metal port: the kernel names are unique, every dispatched kernel exists exactly once, the buffer indices are contiguous, the structures have the layout of their Swift counterparts, the shading language uses no `double`, no keyword as an identifier and only the valid Metal attributes. |
+| `Tests/FilmPhysicsTests/GrainCounterTests.swift` | The statistical validation of the counter based grain (the reference of the GPU path) against the grain of the CPU reference, against the upstream **fast** path (the algorithm gate, no allowance), against the upstream **default** path (raw and adjusted) and with the **exact** samplers against the upstream **default** path (no allowance). |
+| `Tests/FilmPhysicsTests/ExactSamplerTests.swift` | The unit tests of the exact samplers of the grain: the moments of the exact Poisson and of the exact binomial, the reproducibility of the counter based exact sampler and the underflow of the upstream fast inversion. |
 | `Tests/FilmPhysicsMetalTests/MetalParityTests.swift` | The parity of the GPU against the CPU reference (the slice 2, a subset of the catalogue of the slice 4, the spatial cases of the slice 5, the statistical gate of the grain) and the timing of a 1024 × 1024 image. macOS only. |
 | `Tests/FilmPhysicsMetalTests/MetalAvailabilityTests.swift` | The fallback of the Metal test target on the platforms that have no Metal (the test skips). |
 
@@ -884,7 +1041,7 @@ swift build
 swift test
 ```
 
-The whole suite (77 tests) runs in **4 to 6 min** in the debug build (one
+The whole suite (84 tests) runs in **12 to 15 min** in the debug build (one
 test skips on Linux: the Metal availability one; the two heaviest families
 are the statistical validation of the grain, §3.4, and the 148 looks of the
 catalogue); the timing of the grain is measured with
@@ -1085,17 +1242,42 @@ the grain of the CPU: it is validated **statistically**, with the gate of
 
 * the pure Swift reference of the GPU path (`FilmGrainPlan.apply`) is
   compared with the grain of the CPU reference over the 16 cases of the
-  slice 6: the worst z-score is **4.37** (the gate is `k` = 7.90 for the
-  1140 comparisons of the family),
-* the same reference is compared with the **upstream**: the only statistics
-  above the statistical gate are the four that the model difference of the
-  samplers explains (§3.4), and they are covered by the measured sampler
-  difference (added in quadrature, exactly like the existing grain
-  validation does).
+  slice 6: the worst z-score is **4.37** (the gate is `k` = 8.30 for the
+  1444 comparisons of the family),
+* the same reference is compared with the **fast** upstream path (the
+  algorithm the port reproduces): the worst z-score is **3.59**, with **no
+  allowance** at all,
+* the same reference is compared with the **default** upstream path (the
+  exact SciPy generators): the comparison is reported **raw** (the worst
+  z-score is **11.36**, the documented discrepancy between the fast and the
+  exact samplers, §3.4) and **adjusted** (the measured difference between
+  the two upstream paths added in quadrature),
+* the same reference, drawn with the **exact** samplers, is compared with
+  the **default** upstream path: the worst z-score is **5.92**, with **no
+  allowance** at all.
 
 The number of realisations of that comparison is six (the upstream averages
 twelve): the tolerance of the gate accounts for it
 (`k · σ · sqrt(1/m + 1/m)`), so the comparison stays honest.
+
+The **exact** samplers (§3.4) have **no** Metal counterpart yet: the
+inversion from the mode of the distribution needs the log gamma function,
+which the shading language does not have.  The GPU therefore reproduces the
+fast path (and its underflow), like the CPU reference does by default; the
+exact mode of the GPU is a deferred item (§7.9).
+
+One more difference between the two implementations of the fast path must be
+recorded: the CPU reference computes the inversion of the binomial in
+**double** precision (like the upstream), and the counter based reference
+(and the Metal kernel, which mirrors it) in **single** precision.  The
+inversion starts with `(1 - p) ** n`, so the single precision underflows
+**earlier**: the two implementations differ when
+`-308 < n · log10(1 - p) < -38` (e.g. 100 trials and a probability of 0.9).
+None of the cases of the slice 6 falls in that window (the dense layers, the
+only ones whose inversion is used at all, are at `n · log10(1 - p) < -700`),
+so the two implementations agree on the validated cases; the difference is
+nevertheless a real one, and it is a difference of the **precision** of the
+arithmetic, not of the algorithm.
 
 ### 7.7 What is validated on Linux and what only on macOS
 
@@ -1103,8 +1285,8 @@ twelve): the tolerance of the gate accounts for it
 |---|---|
 | the plan reproduces the CPU pipeline tap by tap (`FilmPlanEvaluatorTests`) | the Metal kernels against the CPU pipeline (a mean ΔE₀₀ below 0.5) |
 | the `Float32` specification of the kernels against the CPU pipeline | the Metal kernels against the `Float32` specification (a max abs error below 1e-3) |
-| the static analysis of the shading language: the kernel names are unique, every dispatched kernel exists, the buffer indices are contiguous, the structures have the layout of their Swift counterparts, there is no `double` (`MetalSourceTests`) | the spatial effects on the GPU (the halation, the diffusion filters, the lens blurs, the unsharp mask) |
-| the counter based grain against the grain of the CPU and against the upstream (`GrainCounterTests`) | the grain of the GPU against the grain of the CPU (the statistical gate) |
+| the static analysis of the shading language: the kernel names are unique, every dispatched kernel exists, the buffer indices are contiguous, the structures have the layout of their Swift counterparts, there is no `double`, no keyword is used as an identifier and the attributes belong to the whitelist of the valid Metal attributes (`MetalSourceTests`) | the spatial effects on the GPU (the halation, the diffusion filters, the lens blurs, the unsharp mask) |
+| the counter based grain against the grain of the CPU, against the upstream **fast** path (no allowance) and against the upstream **default** path (raw and adjusted), with the fast and with the exact samplers (`GrainCounterTests`, `GrainStatisticsTests`, `ExactSamplerTests`) | the grain of the GPU against the grain of the CPU (the statistical gate) |
 | the compilation of the package and of the test targets on Linux | the timing of the GPU against the CPU (a 1024 × 1024 image, the median of three runs after a warm up) — note that the CPU side of that measurement costs about **85 s per run** in a debug build (the release build is about twenty times faster) |
 
 **Nothing on Metal is validated until the CI runs it on a real Metal
@@ -1112,6 +1294,21 @@ device**: the MSL source, the Swift/Metal API calls and the buffer layouts
 are written to be correct, and the *logic* of the kernels is validated on
 Linux through the executable specification, but the code itself has never
 been compiled by a Metal compiler.
+
+**The static checks are not an execution.**  The `MetalSourceTests` read
+the Metal Shading Language source and check it *textually* (the kernel
+names, the buffer indices, the layout of the structures, the keywords, the
+attributes): they prove that the source has the expected **shape**, and
+nothing else.  The Linux build of the `FilmPhysicsMetal` target compiles
+**nothing** of the Metal code: every file of the target is wrapped in
+`#if canImport(Metal)`, so the target is empty on Linux and the Linux run
+is a **type check of the Swift side at best** — and on Linux the Swift side
+is not even compiled, since it is inside the same `#if`.  In other words:
+the Metal port is validated on Linux only *indirectly*, through the pure
+Swift specification of the kernels (`FilmPlanEvaluatorFloat32`,
+`FilmGrainPlan`); the **shaders themselves** are compiled and run only by
+the macOS CI, on a real Metal device.  The numbers of the GPU (the parity,
+the timing) exist **only** from those CI runs.
 
 ### 7.8 The CI
 
@@ -1144,17 +1341,24 @@ The tests print their measurements with the prefixes `METAL-PARITY` and
 * the **Metal performance** of the grain is not measured: the inversion of
   the cumulative distribution of the binomial is a loop of up to `n`
   iterations for the high exposure cases (the same loop as the CPU
-  reference).
+  reference),
+* the **exact samplers** (§3.4) have no Metal counterpart: the shading
+  language has no log gamma function, so the inversion from the mode of the
+  distribution cannot be written as it is in Swift.  The GPU reproduces the
+  fast path (and its underflow) until the exact mode is ported to the
+  shading language (a Stirling approximation of the log gamma would be
+  needed, and its accuracy would have to be validated on Linux).
 
 ---
 
 ## 8. Next steps
 
-* Implement the **exact** Poisson and binomial samplers (the PTRS and the
-  BTPE algorithms) in `Random.swift`, so that the grain of the port matches
-  the **default** upstream path (the exact SciPy generators) and not only its
-  fast kernels.  The model difference of the samplers is measured in §3.4
-  (up to 5.7 σ in the quantiles of the high exposure cases).
+* Port the **exact** samplers (the inversion from the mode, `ExactSamplers`)
+  to the **Metal** kernels, so that the GPU reproduces the **default**
+  upstream path (the exact SciPy generators) and not only its fast kernels.
+  The model difference of the samplers is measured in §3.4 (the underflow of
+  the upstream fast inversion), and the CPU reference already has the exact
+  mode (`GrainSampler.exact`) with its statistical validation.
 * Regenerate the slice 6 fixture with **more upstream seeds** (12 today): the
   spread of the upstream is known to ±21 %, which is why the critical value
   of the gate is the Student t quantile (7.84) and not the normal quantile

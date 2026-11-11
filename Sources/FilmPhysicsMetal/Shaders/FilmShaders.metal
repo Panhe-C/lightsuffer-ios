@@ -841,34 +841,37 @@ kernel void filmReduceMaxPartial(
     device const float *values [[buffer(0)]],
     device float *partials [[buffer(1)]],
     constant FilmPlanParams &params [[buffer(2)]],
-    uint gid [[thread_position_in_grid]],
-    uint groupSize [[threads_per_threadgroup]]
+    uint2 gid [[thread_position_in_grid]],
+    uint2 groupSize [[threads_per_threadgroup]]
 ) {
     const uint total = params.width * params.height * 3;
-    if (gid >= FILM_REDUCE_THREADS) {
+    // The grid is one dimensional: the position of the thread is its `x`.
+    const uint position = gid.x;
+    const uint threads = groupSize.x;
+    if (position >= FILM_REDUCE_THREADS) {
         return;
     }
-    const uint groupCount = max(FILM_REDUCE_THREADS / groupSize, 1u);
-    const uint groupIndex = gid / groupSize;
-    const uint threadInGroup = gid % groupSize;
+    const uint groupCount = max(FILM_REDUCE_THREADS / threads, 1u);
+    const uint groupIndex = position / threads;
+    const uint threadInGroup = position % threads;
     const uint block = (total + groupCount - 1) / groupCount;
     const uint start = groupIndex * block;
     const uint end = min(start + block, total);
 
     float maximum = -INFINITY;
-    for (uint index = start + threadInGroup; index < end; index += groupSize) {
+    for (uint index = start + threadInGroup; index < end; index += threads) {
         maximum = max(maximum, values[index]);
     }
-    partials[gid] = maximum;
+    partials[position] = maximum;
 }
 
 /// The second stage of the maximum reduction.
 kernel void filmReduceMaxFinal(
     device const float *partials [[buffer(0)]],
     device float *result [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
+    uint2 gid [[thread_position_in_grid]]
 ) {
-    if (gid != 0) {
+    if (gid.x != 0) {
         return;
     }
     float maximum = -INFINITY;

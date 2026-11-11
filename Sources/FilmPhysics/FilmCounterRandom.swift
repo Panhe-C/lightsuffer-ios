@@ -70,6 +70,14 @@ public enum FilmCounterRandom {
         public static let microStructureA: UInt32 = 0x5000
         /// The second uniform of the lognormal variate.
         public static let microStructureB: UInt32 = 0x5001
+        /// The first half of the uniform of the exact Poisson variate.
+        public static let poissonExactA: UInt32 = 0x6000
+        /// The second half of the uniform of the exact Poisson variate.
+        public static let poissonExactB: UInt32 = 0x6001
+        /// The first half of the uniform of the exact binomial variate.
+        public static let binomialExactA: UInt32 = 0x7000
+        /// The second half of the uniform of the exact binomial variate.
+        public static let binomialExactB: UInt32 = 0x7001
     }
 
     // MARK: - The hash
@@ -125,6 +133,24 @@ public enum FilmCounterRandom {
     @inline(__always)
     public static func uniform(_ hash: UInt32) -> Float {
         Float(hash >> 8) * (1.0 / 16_777_216.0)
+    }
+
+    /// A uniform variate in `[0, 1)` with the resolution of a double.
+    ///
+    /// The 53 high bits of two hashes are used: the exact samplers of the
+    /// grain (``ExactSamplers``) invert the cumulative distribution, and
+    /// the resolution of a single `float` would distort the tails of the
+    /// distribution.
+    ///
+    /// - Parameters:
+    ///   - first: the hash of the high bits.
+    ///   - second: the hash of the low bits.
+    /// - Returns: the variate.
+    @inline(__always)
+    public static func uniform53(_ first: UInt32, _ second: UInt32) -> Double {
+        let high = UInt64(first >> 5)
+        let low = UInt64(second >> 6)
+        return Double(high * (UInt64(1) << 26) + low) * (1.0 / 9_007_199_254_740_992.0)
     }
 
     /// A standard normal variate from two hashes.
@@ -277,6 +303,83 @@ public enum FilmCounterRandom {
             k += 1
         }
         return k - 1
+    }
+
+    /// An exact Poisson variate.
+    ///
+    /// The variate is drawn from the **exact** Poisson distribution, i.e.
+    /// the distribution of the default path of the upstream (the SciPy
+    /// `poisson` generator), and not from the normal approximation of the
+    /// fast kernel of the upstream.
+    ///
+    /// The uniform variate has the resolution of a double (the exact
+    /// samplers invert the cumulative distribution, and the resolution of a
+    /// single `float` would distort the tails of the distribution).
+    ///
+    /// - Parameters:
+    ///   - lambda: the mean of the distribution.
+    ///   - seed: the seed of the stream.
+    ///   - pixel: the index of the pixel.
+    ///   - layer: the index of the emulsion layer.
+    ///   - channel: the index of the colour channel.
+    /// - Returns: the variate.
+    public static func poissonExact(
+        lambda: Float,
+        seed: UInt32,
+        pixel: UInt32,
+        layer: UInt32,
+        channel: UInt32
+    ) -> Int {
+        guard lambda > 0 else { return 0 }
+        let u = uniform53(
+            counter(
+                seed: seed, pixel: pixel, layer: layer, channel: channel,
+                stream: Stream.poissonExactA
+            ),
+            counter(
+                seed: seed, pixel: pixel, layer: layer, channel: channel,
+                stream: Stream.poissonExactB
+            )
+        )
+        return ExactSamplers.poisson(lambda: Double(lambda), uniform: u)
+    }
+
+    /// An exact binomial variate.
+    ///
+    /// The variate is drawn from the **exact** binomial distribution, i.e.
+    /// the distribution of the default path of the upstream (the SciPy
+    /// `binom` generator), and not from the normal approximation of the
+    /// fast kernel of the upstream.
+    ///
+    /// - Parameters:
+    ///   - n: the number of trials.
+    ///   - p: the probability of a success.
+    ///   - seed: the seed of the stream.
+    ///   - pixel: the index of the pixel.
+    ///   - layer: the index of the emulsion layer.
+    ///   - channel: the index of the colour channel.
+    /// - Returns: the number of successes.
+    public static func binomialExact(
+        n: Int,
+        p: Float,
+        seed: UInt32,
+        pixel: UInt32,
+        layer: UInt32,
+        channel: UInt32
+    ) -> Int {
+        guard n > 0, p > 0 else { return 0 }
+        guard p < 1 else { return n }
+        let u = uniform53(
+            counter(
+                seed: seed, pixel: pixel, layer: layer, channel: channel,
+                stream: Stream.binomialExactA
+            ),
+            counter(
+                seed: seed, pixel: pixel, layer: layer, channel: channel,
+                stream: Stream.binomialExactB
+            )
+        )
+        return ExactSamplers.binomial(n: n, p: Double(p), uniform: u)
     }
 
     /// A lognormal variate with the given parameters of the underlying

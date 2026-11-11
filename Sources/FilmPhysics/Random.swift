@@ -142,6 +142,23 @@ public struct RandomGenerator {
         return Swift.max(0, Int(sample))
     }
 
+    /// An exact Poisson variate.
+    ///
+    /// The variate is drawn from the **exact** Poisson distribution, i.e.
+    /// the distribution of the default path of the upstream (the SciPy
+    /// `poisson` generator), and not from the normal approximation of the
+    /// fast kernel of the upstream.
+    ///
+    /// Upstream reference: `scipy.stats.poisson.rvs` (the PTRS algorithm of
+    /// NumPy); the *distribution* is the one of that generator, the
+    /// *realisation* is the one of the port.
+    ///
+    /// - Parameter lambda: the mean of the distribution.
+    /// - Returns: the variate.
+    public mutating func poissonExact(_ lambda: Double) -> Int {
+        ExactSamplers.poisson(lambda: lambda, uniform: uniform())
+    }
+
     // MARK: - The binomial distribution
 
     /// A binomial variate.
@@ -192,6 +209,25 @@ public struct RandomGenerator {
             k += 1
         }
         return k - 1
+    }
+
+    /// An exact binomial variate.
+    ///
+    /// The variate is drawn from the **exact** binomial distribution, i.e.
+    /// the distribution of the default path of the upstream (the SciPy
+    /// `binom` generator), and not from the normal approximation of the
+    /// fast kernel of the upstream.
+    ///
+    /// Upstream reference: `scipy.stats.binom.rvs` (the BTPE algorithm of
+    /// NumPy); the *distribution* is the one of that generator, the
+    /// *realisation* is the one of the port.
+    ///
+    /// - Parameters:
+    ///   - n: the number of trials.
+    ///   - p: the probability of a success.
+    /// - Returns: the number of successes.
+    public mutating func binomialExact(n: Int, p: Double) -> Int {
+        ExactSamplers.binomial(n: n, p: p, uniform: uniform())
     }
 
     // MARK: - The lognormal distribution

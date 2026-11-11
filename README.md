@@ -17,7 +17,7 @@ back — not a set of baked LUTs.
 |---|---|---|
 | P1 | `FilmPhysics`: pure-Swift port of the spektrafilm pipeline (CPU reference), validated tap by tap against the Python engine | **in progress** (slices 1, 2 and 4 ported: profile loading, the hanatos 2025 spectral upsampling and the whole camera → print → scan chain, negative development with DIR couplers, enlarger printing, print development, scanning, the cam16ucs gamut compression and the whole stock catalogue — parity with the Python engine, mean ΔE2000 ≈ 0.0021) |
 | P2 | Spatial effects (halation, grain, DIR-coupler diffusion, diffusion filters, glare, blur, unsharp) | **in progress** (slice 5 ported: the highlight boost, the in-emulsion scatter, the back-reflection halation, the DIR-coupler diffusion, the four diffusion-filter families, the lens blurs and the unsharp mask — parity with the Python engine, mean ΔE2000 ≈ 0.0011. The **grain** and the **glare** are ported in slice 6 and validated statistically against the upstream) |
-| P3 | Metal port of the engine, parity-tested against the CPU reference | **phase 1 implemented** (`FilmPhysicsMetal`): the render plan, the pure-Swift plan evaluator and its `Float32` specification, 28 Metal kernels (the whole per-pixel chain, the spatial effects, the grain and the glare) and the `MetalBackend`. The plan and the kernels are validated on Linux against the CPU reference; **the Metal code itself is only compiled and run by the macOS CI** (nothing on Metal is validated until then) |
+| P3 | Metal port of the engine, parity-tested against the CPU reference | **phase 1 implemented** (`FilmPhysicsMetal`): the render plan, the pure-Swift plan evaluator and its `Float32` specification, 28 Metal kernels (the whole per-pixel chain, the spatial effects, the grain and the glare) and the `MetalBackend`. The plan and the kernels are validated on Linux against the CPU reference; **the Metal code itself is only compiled and run by the macOS CI** (nothing on Metal is validated until then; the static checks of the source and the Linux type checks are **not** a Metal execution) |
 | P4 | SwiftUI app shell (photo/RAW input, all parameters, export, borders) | not started |
 | P5 | Release | not started |
 
@@ -204,12 +204,26 @@ validates the ported slices against the reference fixtures:
 * `MetalSourceTests` — the static analysis of the Metal port: the kernel
   names are unique, every dispatched kernel exists exactly once in the
   shading language, the buffer indices are contiguous, the structures read
-  by the shaders have exactly the layout of their Swift counterparts and
-  the shading language uses no `double`.
+  by the shaders have exactly the layout of their Swift counterparts, the
+  shading language uses no `double`, no **keyword** as an identifier and
+  only the valid Metal attributes.  These are **static checks of the
+  source**: they are *not* a compilation and *not* an execution of the
+  shaders — only the macOS CI (a real Metal device) compiles and runs them.
 * `GrainCounterTests` — the **counter based** grain (the reference of the
   GPU path, which cannot draw from a sequential stream) is statistically
   indistinguishable from the grain of the CPU reference and from the
-  upstream: the worst z-score is 4.37 against the gate of 7.90.
+  upstream: the worst z-score is 4.37 against the gate of 8.30 (against the
+  CPU reference) and 3.59 against the upstream **fast** samplers (the
+  algorithm the port reproduces, **no allowance**).  The comparison with
+  the upstream **default** samplers (the exact SciPy generators) is
+  reported **raw** (11.36: the fast samplers and the exact samplers do not
+  draw from the same distribution — the cause is an underflow of the
+  upstream fast inversion, `docs/PORTING.md` §3.4) and **adjusted**; the
+  **exact** samplers of the port pass the same comparison with **no
+  allowance** (5.92).
+* `ExactSamplerTests` — the unit tests of the exact samplers of the grain
+  (the moments of the exact Poisson and of the exact binomial, and the
+  underflow of the upstream fast inversion).
 * `ColourTests` — the sRGB transfer function, the CIELAB conversion and the
   CIEDE2000 formula against the published Sharma et al. test pairs.
 * `NumericsTests` — the interpolation semantics, the geometric mean and the

@@ -311,12 +311,17 @@ public struct FilmGrainPlan: Sendable {
     ///   - width: the width of the image, in pixels.
     ///   - height: the height of the image, in pixels.
     ///   - seed: the seed of the pipeline.
+    ///   - sampler: the sampler of the variates of the particles: the fast
+    ///     kernels of the upstream (the default, the algorithm the Metal
+    ///     kernels reproduce) or the exact generators of the default path of
+    ///     the upstream.
     /// - Returns: the densities with the grain.
     public func apply(
         densityCMY: [Double],
         width: Int,
         height: Int,
-        seed: UInt64
+        seed: UInt64,
+        sampler: GrainSampler = .fast
     ) -> [Double] {
         guard params.active else { return densityCMY }
         guard !densityCMY.isEmpty, width > 0, height > 0 else { return densityCMY }
@@ -343,7 +348,8 @@ public struct FilmGrainPlan: Sendable {
                     channel: channel,
                     width: width,
                     height: height,
-                    seed: seed
+                    seed: seed,
+                    sampler: sampler
                 )
                 for index in 0..<plane.count {
                     output[index * Self.channelCount + channel] += grain[index]
@@ -403,6 +409,7 @@ public struct FilmGrainPlan: Sendable {
     ///   - width: the width of the image, in pixels.
     ///   - height: the height of the image, in pixels.
     ///   - seed: the seed of the pipeline.
+    ///   - sampler: the sampler of the variates of the particles.
     /// - Returns: the density of the developed grains, one value per pixel.
     private func particleModel(
         plane: [Double],
@@ -410,7 +417,8 @@ public struct FilmGrainPlan: Sendable {
         channel: Int,
         width: Int,
         height: Int,
-        seed: UInt64
+        seed: UInt64,
+        sampler: GrainSampler
     ) -> [Double] {
         let pixelCount = width * height
         let index = layer * Self.channelCount + channel
@@ -426,21 +434,38 @@ public struct FilmGrainPlan: Sendable {
         for pixel in 0..<pixelCount {
             let value = Swift.min(Swift.max(plane[pixel] / densityMax, 1e-6), 1.0 - 1e-6)
             let saturation = 1.0 - value * uniformity * (1.0 - 1e-6)
-            let particles = FilmCounterRandom.poisson(
-                lambda: Float(nParticles / saturation),
-                seed: seed32,
-                pixel: UInt32(pixel),
-                layer: UInt32(layer),
-                channel: UInt32(channel)
-            )
-            let developed = FilmCounterRandom.binomial(
-                n: particles,
-                p: Float(value),
-                seed: seed32,
-                pixel: UInt32(pixel),
-                layer: UInt32(layer),
-                channel: UInt32(channel)
-            )
+            let particles = sampler == .exact
+                ? FilmCounterRandom.poissonExact(
+                    lambda: Float(nParticles / saturation),
+                    seed: seed32,
+                    pixel: UInt32(pixel),
+                    layer: UInt32(layer),
+                    channel: UInt32(channel)
+                )
+                : FilmCounterRandom.poisson(
+                    lambda: Float(nParticles / saturation),
+                    seed: seed32,
+                    pixel: UInt32(pixel),
+                    layer: UInt32(layer),
+                    channel: UInt32(channel)
+                )
+            let developed = sampler == .exact
+                ? FilmCounterRandom.binomialExact(
+                    n: particles,
+                    p: Float(value),
+                    seed: seed32,
+                    pixel: UInt32(pixel),
+                    layer: UInt32(layer),
+                    channel: UInt32(channel)
+                )
+                : FilmCounterRandom.binomial(
+                    n: particles,
+                    p: Float(value),
+                    seed: seed32,
+                    pixel: UInt32(pixel),
+                    layer: UInt32(layer),
+                    channel: UInt32(channel)
+                )
             grain[pixel] = Double(developed) * od * saturation
         }
 
