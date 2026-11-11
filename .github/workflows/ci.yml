@@ -1,7 +1,13 @@
 name: CI
 
-# The CI of the package: the CPU reference (Linux and macOS) and the Metal
-# port (macOS only, the GPU needs a Metal device).
+# The CI of the package: the CPU reference (the tests of the `FilmPhysics`
+# target) and the Metal port (the tests of the `FilmPhysicsMetal` target,
+# which need a Metal device).
+#
+# The two jobs run **in parallel**: the CPU tests take about twenty
+# minutes and the Metal tests about ten, and the two of them together
+# exceeded the cap of the single job of the previous layout (the job was
+# cancelled in the middle of the Metal tests, which looked like a hang).
 on:
   push:
     branches:
@@ -11,10 +17,20 @@ on:
   workflow_dispatch:
 
 jobs:
-  macos:
-    name: macOS (the CPU reference and the Metal port)
+  metal:
+    name: macOS (the Metal port)
     runs-on: macos-15
-    timeout-minutes: 40
+    # The cap of the job: the build of the tests (a few minutes) plus the
+    # two steps below (15 + 10 minutes).  It must be **larger** than the
+    # sum of the caps of the steps, or the cap of the job kills a step
+    # that is still running (which is what happened before).
+    timeout-minutes: 30
+    env:
+      # The output of the tests must not be buffered: the log of the CI is
+      # a pipe, and a buffered output hides the test that hangs (the
+      # tests also write their progress on the standard error, which is
+      # unbuffered).
+      NSUnbufferedIO: YES
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,30 +46,94 @@ jobs:
           # The name of the default Metal device, when there is one.
           xcrun -sdk macosx metal --info 2>/dev/null || true
 
-      - name: Build
-        run: swift build
+      - name: Build (with the tests)
+        run: swift build --build-tests
 
-      - name: Test
-        shell: bash
+      - name: The Metal tests
+        timeout-minutes: 15
+        env:
+          # The diagnostic mode of the backend: every pass of a render is
+          # committed on its own command buffer and the time it took is
+          # printed (`METAL-STAGE <kernel> <ms>`), so that the log shows
+          # exactly which kernel hangs.  The wait of a command buffer is
+          # bounded (60 seconds by default), so a kernel that never
+          # finishes fails the test instead of hanging the job.
+          FILM_METAL_DIAGNOSTIC: 1
         run: |
-          swift test 2>&1 | tee test.log
-          exit ${PIPESTATUS[0]}
+          set -o pipefail
+          swift test --skip-build --filter FilmPhysicsMetalTests 2>&1 \
+            | while IFS= read -r l; do printf '%s %s\n' "$(date -u +%H:%M:%S)" "$l"; done \
+            | tee metal.log
 
-      - name: The log of the tests
+      - name: The timing of the GPU and of the CPU (release)
+        # The timing test is **skipped** in the debug step (the CPU side
+        # of the measurement costs about a hundred seconds per run in a
+        # debug build); it runs here, in release, with its own cap.
+        if: always()
+        timeout-minutes: 10
+        env:
+          RUN_TIMING: 1
+        run: |
+          set -o pipefail
+          swift test -c release --filter testTheTimingOfTheGPUAndOfTheCPU 2>&1 \
+            | while IFS= read -r l; do printf '%s %s\n' "$(date -u +%H:%M:%S)" "$l"; done \
+            | tee timing.log
+
+      - name: The logs of the Metal tests
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-log
-          path: test.log
+          name: metal-log
+          path: |
+            metal.log
+            timing.log
+          if-no-files-found: ignore
+
+  cpu-and-ios:
+    name: macOS (the CPU reference and the iOS build)
+    runs-on: macos-15
+    # The cap of the job: the build of the tests (a few minutes) plus the
+    # two steps below (35 + 15 minutes).
+    timeout-minutes: 55
+    env:
+      NSUnbufferedIO: YES
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: The toolchain
+        run: |
+          swift --version
+          xcrun --show-sdk-path
+
+      - name: Build (with the tests)
+        run: swift build --build-tests
+
+      - name: The CPU tests
+        timeout-minutes: 35
+        run: |
+          set -o pipefail
+          swift test --skip-build --skip FilmPhysicsMetalTests 2>&1 \
+            | while IFS= read -r l; do printf '%s %s\n' "$(date -u +%H:%M:%S)" "$l"; done \
+            | tee cpu.log
+
+      - name: The log of the CPU tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-log
+          path: cpu.log
           if-no-files-found: ignore
 
       - name: The schemes of the package
+        if: always()
         run: xcodebuild -list
 
       - name: The iOS build
-        shell: bash
+        if: always()
+        timeout-minutes: 15
         run: |
-          set -euo pipefail
+          set -o pipefail
           # The scheme of the package: `xcodebuild -list` prints it under
           # the "Schemes:" heading.
           SCHEME="$(xcodebuild -list 2>/dev/null \
@@ -63,4 +143,14 @@ jobs:
           fi
           echo "the scheme of the package: ${SCHEME}"
           xcodebuild -scheme "${SCHEME}" \
-            -destination 'generic/platform=iOS Simulator' build
+            -destination 'generic/platform=iOS Simulator' build 2>&1 \
+            | while IFS= read -r l; do printf '%s %s\n' "$(date -u +%H:%M:%S)" "$l"; done \
+            | tee ios.log
+
+      - name: The log of the iOS build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-log
+          path: ios.log
+          if-no-files-found: ignore

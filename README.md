@@ -142,12 +142,19 @@ swift test         # run the FilmPhysics test target
 ```
 
 On macOS the `FilmPhysicsMetalTests` target runs as well: it renders the
-slice 2, a subset of the slice 4 catalogue and the slice 5 spatial cases
-on the GPU, compares them with the CPU reference (a mean ΔE200₀₀ below
+slice 2, a **subset** of the slice 4 catalogue (four looks that cover
+every family: a negative film on two papers, a negative film scanned
+directly and a slide scanned directly) and the slice 5 spatial cases on
+the GPU, compares them with the CPU reference (a mean ΔE200₀₀ below
 0.5), checks the grain with the statistical gate of the slice 6 and prints
-the timing of a 1024 × 1024 image. The lines it prints start with
-`METAL-PARITY` and `METAL-TIMING`. Without a Metal device the tests skip;
-a shader that does not compile is a **failure**, not a skip.
+the timing of a 1024 × 1024 image (in release, when `RUN_TIMING=1` is
+set). The lines it prints start with `METAL-PARITY`, `METAL-TIMING` and
+`METAL-PROGRESS`. Without a Metal device the tests skip; a shader that
+does not compile is a **failure**, not a skip. The wait of a command
+buffer is **bounded** (a GPU that never finishes fails the test instead
+of hanging the job), and the diagnostic mode
+(`FILM_METAL_DIAGNOSTIC=1`) commits every pass on its own command buffer
+and prints `METAL-STAGE <kernel> <ms>`.
 
 The test target checks the package scaffold and the bundled profiles, and
 validates the ported slices against the reference fixtures:
@@ -205,10 +212,12 @@ validates the ported slices against the reference fixtures:
   names are unique, every dispatched kernel exists exactly once in the
   shading language, the buffer indices are contiguous, the structures read
   by the shaders have exactly the layout of their Swift counterparts, the
-  shading language uses no `double`, no **keyword** as an identifier and
-  only the valid Metal attributes.  These are **static checks of the
-  source**: they are *not* a compilation and *not* an execution of the
-  shaders — only the macOS CI (a real Metal device) compiles and runs them.
+  shading language uses no `double`, no **keyword** as an identifier, only
+  the valid Metal attributes, every loop is bounded and the bound of the
+  radius of the convolutions is the same on the two sides.  These are
+  **static checks of the source**: they are *not* a compilation and *not*
+  an execution of the shaders — only the macOS CI (a real Metal device)
+  compiles and runs them.
 * `GrainCounterTests` — the **counter based** grain (the reference of the
   GPU path, which cannot draw from a sequential stream) is statistically
   indistinguishable from the grain of the CPU reference and from the

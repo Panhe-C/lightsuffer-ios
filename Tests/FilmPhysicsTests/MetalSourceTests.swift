@@ -488,4 +488,95 @@ final class MetalSourceTests: XCTestCase {
             )
         }
     }
+
+    /// The loops of the shading language are bounded.
+    ///
+    /// A loop whose bound comes from a parameter (a radius, a number of
+    /// samples, a number of threads) can run for billions of iterations —
+    /// or for ever, when the bound is zero (a stride of zero in the
+    /// reduction) — and hang the GPU.  The test checks that every `while`
+    /// of the shading language compares its condition with a bound, and
+    /// that every `for` loop has a limit.
+    func testTheLoopsOfTheShadingLanguageAreBounded() throws {
+        let code = Self.code(of: Self.shaderSource)
+        let range = NSRange(code.startIndex..., in: code)
+
+        // The `while` loops (the `do { … } while (…)` loops included).
+        let whilePattern = try? NSRegularExpression(pattern: #"while\s*\(([^)]*)\)"#)
+        guard let whilePattern else {
+            XCTFail("the pattern of the while loops could not be built")
+            return
+        }
+        let whiles = whilePattern.matches(in: code, range: range)
+        XCTAssertFalse(whiles.isEmpty, "the shading language holds while loops")
+        for match in whiles {
+            guard let swiftRange = Range(match.range(at: 1), in: code) else { continue }
+            let condition = String(code[swiftRange])
+            XCTAssertTrue(
+                condition.contains("<") || condition.contains(">"),
+                "the while loop '\(condition)' of the shading language has no bound"
+            )
+        }
+
+        // The `for` loops.
+        let forPattern = try? NSRegularExpression(pattern: #"for\s*\(([^)]*)\)"#)
+        guard let forPattern else {
+            XCTFail("the pattern of the for loops could not be built")
+            return
+        }
+        let fors = forPattern.matches(in: code, range: range)
+        XCTAssertFalse(fors.isEmpty, "the shading language holds for loops")
+        for match in fors {
+            guard let swiftRange = Range(match.range(at: 1), in: code) else { continue }
+            let header = String(code[swiftRange])
+            let parts = header.split(separator: ";")
+            XCTAssertEqual(
+                parts.count, 3,
+                "the for loop '\(header)' of the shading language has no limit"
+            )
+            if parts.count == 3 {
+                XCTAssertTrue(
+                    parts[1].contains("<") || parts[1].contains("!="),
+                    "the for loop '\(header)' of the shading language has no limit"
+                )
+            }
+        }
+    }
+
+    /// The bound of the radius of the convolutions is the same on the two
+    /// sides.
+    ///
+    /// The shading language clamps the radius of the convolutions
+    /// (`FILM_MAX_BLUR_RADIUS`) and the Swift side builds the kernels
+    /// with the same bound (`MetalKernels.maxBlurRadius`): the two must
+    /// agree, or the kernels would read outside of the buffer of the
+    /// weights.
+    func testTheBoundOfTheRadiusOfTheConvolutionsIsTheSameOnTheTwoSides() throws {
+        let shader = Self.shaderSource
+        let plan = Self.source(of: "Sources/FilmPhysicsMetal/MetalPlan.swift")
+        let metalPattern = try? NSRegularExpression(
+            pattern: #"#define\s+FILM_MAX_BLUR_RADIUS\s+(\d+)"#
+        )
+        let swiftPattern = try? NSRegularExpression(
+            pattern: #"maxBlurRadius\s*=\s*(\d+)"#
+        )
+        let range = NSRange(shader.startIndex..., in: shader)
+        guard let metalPattern, let swiftPattern,
+              let metalMatch = metalPattern.firstMatch(in: shader, range: range),
+              let metalRange = Range(metalMatch.range(at: 1), in: shader) else {
+            XCTFail("the bound of the radius is not in the shading language")
+            return
+        }
+        let planRange = NSRange(plan.startIndex..., in: plan)
+        guard let swiftMatch = swiftPattern.firstMatch(in: plan, range: planRange),
+              let swiftRange = Range(swiftMatch.range(at: 1), in: plan) else {
+            XCTFail("the bound of the radius is not in the Swift source")
+            return
+        }
+        XCTAssertEqual(
+            Int(shader[metalRange]), Int(plan[swiftRange]),
+            "the bound of the radius of the convolutions is not the same on "
+                + "the two sides"
+        )
+    }
 }

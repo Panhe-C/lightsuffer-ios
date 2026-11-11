@@ -26,6 +26,17 @@ final class MetalParityTests: XCTestCase {
 
     // MARK: - The helpers
 
+    /// Prints a line of the progress of the tests.
+    ///
+    /// The line is written on the **standard error**, unbuffered: the
+    /// standard output of a test is block buffered when it is piped (the
+    /// log of the CI is a pipe), so a `print` would only reach the log
+    /// when the buffer is full — which is exactly what happens when a
+    /// test hangs.
+    private func progress(_ line: String) {
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+    }
+
     /// The Metal backend of the tests.
     ///
     /// - Throws: `XCTSkip` when the machine has no Metal device, and a
@@ -107,6 +118,14 @@ final class MetalParityTests: XCTestCase {
     /// image; every spatial and stochastic effect is off, so the CPU
     /// pipeline *is* the per pixel chain the GPU computes.
     func testTheGPUReproducesTheCPUChainOfSlice2() throws {
+        let start = Date()
+        progress("METAL-PROGRESS testTheGPUReproducesTheCPUChainOfSlice2 start")
+        defer {
+            progress(
+                "METAL-PROGRESS testTheGPUReproducesTheCPUChainOfSlice2 end "
+                    + "\(Date().timeIntervalSince(start)) s"
+            )
+        }
         let backend = try makeBackend()
         let common = try JSONValue.load(named: "slice2_common")
         let film = try ProfileLoader.load(stock: "kodak_portra_400")
@@ -126,7 +145,7 @@ final class MetalParityTests: XCTestCase {
             let plan = try FilmRenderPlan.build(params: params)
             let gpu = try backend.render(input, plan: plan)
             let error = deltaE(cpu.rgbOut.data, gpu.rgbOut.data)
-            print("METAL-PARITY slice2 \(name): mean dE2000 \(error.mean), "
+            progress("METAL-PARITY slice2 \(name): mean dE2000 \(error.mean), "
                 + "max dE2000 \(error.max), max abs error "
                 + "\(maxDifference(cpu.rgbOut.data, gpu.rgbOut.data))")
             XCTAssertLessThan(error.mean, 0.5, "\(name): the mean dE2000 of the GPU")
@@ -136,7 +155,7 @@ final class MetalParityTests: XCTestCase {
             let cmyFilm = maxDifference(cpu.cmyFilm.data, gpu.cmyFilm.data)
             let logEPrint = maxDifference(cpu.logEPrint.data, gpu.logEPrint.data)
             let cmyPrint = maxDifference(cpu.cmyPrint.data, gpu.cmyPrint.data)
-            print("METAL-PARITY slice2 \(name): the taps, max abs error: "
+            progress("METAL-PARITY slice2 \(name): the taps, max abs error: "
                 + "log_e_film \(logEFilm), cmy_film \(cmyFilm), "
                 + "log_e_print \(logEPrint), cmy_print \(cmyPrint)")
             XCTAssertLessThan(logEFilm, 1e-3, "\(name): log_e_film")
@@ -149,7 +168,7 @@ final class MetalParityTests: XCTestCase {
             // rounding of the arithmetic.
             let specification = try FilmPlanEvaluatorFloat32.evaluate(plan: plan, rgbIn: input)
             let difference = maxDifference(specification.rgbOut.data, gpu.rgbOut.data)
-            print("METAL-PARITY slice2 \(name): the GPU against the float32 "
+            progress("METAL-PARITY slice2 \(name): the GPU against the float32 "
                 + "specification, max abs error \(difference)")
             XCTAssertLessThan(difference, 1e-3, "\(name): the GPU against the specification")
         }
@@ -158,10 +177,32 @@ final class MetalParityTests: XCTestCase {
     /// The GPU reproduces the CPU pipeline of a subset of the catalogue.
     ///
     /// The catalogue of the slice 4 holds the 148 looks of the engine; the
-    /// test runs a **subset** of them (the prints and the direct scans of
-    /// two stocks), because the Metal tests run on a CI machine and the
-    /// whole catalogue would double the duration of the job.
+    /// test runs a **subset** of them, because the Metal tests run on a CI
+    /// machine and the whole catalogue would double the duration of the
+    /// job.
+    ///
+    /// The subset covers **every family** of the catalogue:
+    ///
+    /// | The look | The family |
+    /// |---|---|
+    /// | `kodak_portra_400__kodak_portra_endura` | a negative film, the print path |
+    /// | `kodak_portra_400__kodak_2383` | a negative film, another paper |
+    /// | `kodak_portra_400__kodak_portra_endura__scan` | a negative film, the direct scan |
+    /// | `fujifilm_velvia_100__kodak_portra_endura__scan` | a slide (a positive film), the direct scan |
+    ///
+    /// The 144 looks that are not in the subset are **not** validated on
+    /// the GPU: they are validated on the CPU reference (the 148 looks of
+    /// `CatalogParityTests` and of `FilmPlanEvaluatorTests`), which
+    /// exercises the same plan (and therefore the same kernels).
     func testTheGPUReproducesTheCPUChainOfTheCatalogue() throws {
+        let start = Date()
+        progress("METAL-PROGRESS testTheGPUReproducesTheCPUChainOfTheCatalogue start")
+        defer {
+            progress(
+                "METAL-PROGRESS testTheGPUReproducesTheCPUChainOfTheCatalogue end "
+                    + "\(Date().timeIntervalSince(start)) s"
+            )
+        }
         let backend = try makeBackend()
         let fixture = try JSONValue.load(named: "slice4_catalog")
         let cases = try XCTUnwrap(fixture["cases"]?.arrayElements)
@@ -170,7 +211,16 @@ final class MetalParityTests: XCTestCase {
         let data = try XCTUnwrap(image["data"]?.flatDoubles)
         let input = RGBImage(width: Int(size[0]), height: Int(size[1]), data: data)
 
-        let subset = ["kodak_portra_400__kodak_portra_endura", "kodak_portra_400__kodak_2383"]
+        let subset = [
+            // A negative film, the print path.
+            "kodak_portra_400__kodak_portra_endura",
+            // A negative film, another paper.
+            "kodak_portra_400__kodak_2383",
+            // A negative film, the direct scan.
+            "kodak_portra_400__kodak_portra_endura__scan",
+            // A slide (a positive film), the direct scan.
+            "fujifilm_velvia_100__kodak_portra_endura__scan",
+        ]
         for entry in cases {
             let id = try XCTUnwrap(entry["id"]?.string)
             guard subset.contains(id) else { continue }
@@ -179,7 +229,7 @@ final class MetalParityTests: XCTestCase {
             let plan = try FilmRenderPlan.build(params: params)
             let gpu = try backend.render(input, plan: plan)
             let error = deltaE(cpu.rgbOut.data, gpu.rgbOut.data)
-            print("METAL-PARITY slice4 \(id): mean dE2000 \(error.mean), "
+            progress("METAL-PARITY slice4 \(id): mean dE2000 \(error.mean), "
                 + "max dE2000 \(error.max)")
             XCTAssertLessThan(error.mean, 0.5, "\(id): the mean dE2000 of the GPU")
         }
@@ -218,6 +268,14 @@ final class MetalParityTests: XCTestCase {
     /// the GPU pipeline, and the test checks that they do not change the
     /// image more than they change it on the CPU.
     func testTheGPUReproducesTheSpatialEffects() throws {
+        let start = Date()
+        progress("METAL-PROGRESS testTheGPUReproducesTheSpatialEffects start")
+        defer {
+            progress(
+                "METAL-PROGRESS testTheGPUReproducesTheSpatialEffects end "
+                    + "\(Date().timeIntervalSince(start)) s"
+            )
+        }
         let backend = try makeBackend()
         let fixture = try JSONValue.load(named: "slice5_spatial")
         let cases = try XCTUnwrap(fixture["cases"]?.arrayElements)
@@ -237,7 +295,7 @@ final class MetalParityTests: XCTestCase {
             let plan = try FilmRenderPlan.build(params: params)
             let gpu = try backend.render(input, plan: plan)
             let error = deltaE(cpu.rgbOut.data, gpu.rgbOut.data)
-            print("METAL-PARITY slice5 \(id): mean dE2000 \(error.mean), "
+            progress("METAL-PARITY slice5 \(id): mean dE2000 \(error.mean), "
                 + "max dE2000 \(error.max)")
             XCTAssertLessThan(error.mean, 0.5, "\(id): the mean dE2000 of the GPU")
         }
@@ -253,6 +311,14 @@ final class MetalParityTests: XCTestCase {
     /// value is the Bonferroni corrected Student t quantile of the family of
     /// the slice 6 (`k = 7.8362`, see `docs/PORTING.md` §3.4).
     func testTheGrainOfTheGPUHasTheStatisticsOfTheCPUGrain() throws {
+        let start = Date()
+        progress("METAL-PROGRESS testTheGrainOfTheGPUHasTheStatisticsOfTheCPUGrain start")
+        defer {
+            progress(
+                "METAL-PROGRESS testTheGrainOfTheGPUHasTheStatisticsOfTheCPUGrain end "
+                    + "\(Date().timeIntervalSince(start)) s"
+            )
+        }
         let backend = try makeBackend()
         let fixture = try JSONValue.load(named: "slice6_stochastic")
         let cases = try XCTUnwrap(fixture["cases"]?.arrayElements)
@@ -282,6 +348,17 @@ final class MetalParityTests: XCTestCase {
         var gpuMeans = [[Double]](repeating: [], count: 3)
         var gpuStds = [[Double]](repeating: [], count: 3)
 
+        // The plan of the reference (the grain off) does not depend on the
+        // seed: it is built once (the plan of a render is the expensive
+        // part of the test in a debug build).
+        var plainParams = try makePipelineParams(
+            fixture: entry, film: film, print: printProfile
+        )
+        plainParams.stochastic.seed = seeds[0]
+        plainParams.filmRender.grain.active = false
+        plainParams.printRender.glare.active = false
+        let plainPlan = try FilmRenderPlan.build(params: plainParams)
+
         for seed in seeds {
             var params = try makePipelineParams(
                 fixture: entry, film: film, print: printProfile
@@ -302,7 +379,6 @@ final class MetalParityTests: XCTestCase {
             }
 
             let gpuPlan = try FilmRenderPlan.build(params: params)
-            let plainPlan = try FilmRenderPlan.build(params: plain)
             let gpu = try backend.render(image, plan: gpuPlan)
             let gpuReference = try backend.render(image, plan: plainPlan)
             let gpuField = zip(gpu.cmyFilm.data, gpuReference.cmyFilm.data).map { $0 - $1 }
@@ -327,7 +403,7 @@ final class MetalParityTests: XCTestCase {
                 let deviation = abs(gpuValue - cpuValue)
                 let tolerance = k * scale
                 worst = Swift.max(worst, deviation / Swift.max(scale, 1e-300))
-                print("METAL-PARITY slice6 \(id): the grain \(name)_\(channel): "
+                progress("METAL-PARITY slice6 \(id): the grain \(name)_\(channel): "
                     + "the GPU \(gpuValue), the CPU \(cpuValue), the upstream "
                     + "\(upstreamMean) +- \(upstreamStd), the deviation "
                     + "\(deviation), the tolerance \(tolerance)")
@@ -338,7 +414,7 @@ final class MetalParityTests: XCTestCase {
                 )
             }
         }
-        print("METAL-PARITY slice6 \(id): the worst z-score of the grain: \(worst)")
+        progress("METAL-PARITY slice6 \(id): the worst z-score of the grain: \(worst)")
     }
 
     // MARK: - The timing
@@ -347,7 +423,26 @@ final class MetalParityTests: XCTestCase {
     ///
     /// The test only **prints** the times: the assertion would be a
     /// measurement of the CI machine, not a property of the port.
+    ///
+    /// The test is **skipped** unless the environment variable
+    /// `RUN_TIMING=1` is set: the CPU side of the measurement costs about
+    /// a hundred seconds per run in a debug build (the release build is
+    /// about twenty times faster), so the measurement runs in its own step
+    /// of the CI, in release.
     func testTheTimingOfTheGPUAndOfTheCPU() throws {
+        guard ProcessInfo.processInfo.environment["RUN_TIMING"] == "1" else {
+            throw XCTSkip(
+                "the timing test only runs when RUN_TIMING=1 (the release step of the CI)"
+            )
+        }
+        let start = Date()
+        progress("METAL-PROGRESS testTheTimingOfTheGPUAndOfTheCPU start")
+        defer {
+            progress(
+                "METAL-PROGRESS testTheTimingOfTheGPUAndOfTheCPU end "
+                    + "\(Date().timeIntervalSince(start)) s"
+            )
+        }
         let backend = try makeBackend()
         let width = 1024
         let height = 1024
@@ -389,7 +484,7 @@ final class MetalParityTests: XCTestCase {
         }
         gpuTimes.sort()
         cpuTimes.sort()
-        print("METAL-TIMING 1024x1024: the GPU \(gpuTimes[1]) s, "
+        progress("METAL-TIMING 1024x1024: the GPU \(gpuTimes[1]) s, "
             + "the CPU \(cpuTimes[1]) s, the speed up "
             + "\(cpuTimes[1] / Swift.max(gpuTimes[1], 1e-9))x")
     }

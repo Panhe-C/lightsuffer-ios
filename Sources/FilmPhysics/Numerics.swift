@@ -220,6 +220,17 @@ public enum Numerics {
 
     /// The series expansion of `P(a, x)`, used for `x < a + 1`.
     private static func gammaSeries(_ a: Double, _ x: Double) -> Double {
+        gammaSeries(a, x, front: exp(-x + a * log(x) - logGamma(a)))
+    }
+
+    /// The series expansion of `P(a, x)` with an explicit front factor.
+    ///
+    /// The front factor is the part of the expansion that does not depend
+    /// on the series itself: it is evaluated separately, so that the
+    /// cancellation free evaluation of the exact samplers can be used
+    /// without touching the numbers of the CPU reference (which use the
+    /// plain front factor through `erfc`).
+    private static func gammaSeries(_ a: Double, _ x: Double, front: Double) -> Double {
         let epsilon = 3e-16
         var ap = a
         var sum = 1.0 / a
@@ -232,11 +243,19 @@ public enum Numerics {
             if abs(delta) < abs(sum) * epsilon { break }
             iterations += 1
         }
-        return sum * exp(-x + a * log(x) - logGamma(a))
+        return sum * front
     }
 
     /// The continued fraction expansion of `Q(a, x)`, used for `x >= a + 1`.
     private static func gammaContinuedFraction(_ a: Double, _ x: Double) -> Double {
+        gammaContinuedFraction(a, x, front: exp(-x + a * log(x) - logGamma(a)))
+    }
+
+    /// The continued fraction expansion of `Q(a, x)` with an explicit front
+    /// factor.
+    private static func gammaContinuedFraction(
+        _ a: Double, _ x: Double, front: Double
+    ) -> Double {
         let epsilon = 3e-16
         let tiny = 1e-300
         var b = x + 1 - a
@@ -258,7 +277,251 @@ public enum Numerics {
             if abs(delta - 1) < epsilon { break }
             iterations += 1
         }
-        return exp(-x + a * log(x) - logGamma(a)) * h
+        return front * h
+    }
+
+    /// A compensated (Kahan) addition.
+    ///
+    /// The compensation holds the part of the rounding that the previous
+    /// additions lost, so that the sum of many terms keeps an absolute
+    /// error of the order of the rounding of the result (and not of the
+    /// order of the number of the terms).
+    ///
+    /// - Parameters:
+    ///   - sum: the sum so far.
+    ///   - value: the value to add.
+    ///   - compensation: the compensation of the sum (updated).
+    /// - Returns: the new sum.
+    public static func compensatedAdd(
+        _ sum: Double, _ value: Double, compensation: inout Double
+    ) -> Double {
+        let adjusted = value - compensation
+        let updated = sum + adjusted
+        compensation = (updated - sum) - adjusted
+        return updated
+    }
+
+    // MARK: - The special functions of the exact samplers
+
+    /// The regularised upper incomplete gamma function `Q(a, x)`, with the
+    /// **cancellation free** evaluation of its front factor.
+    ///
+    /// `Q(a, x) = Γ(a, x) / Γ(a)` is the tail of the gamma distribution;
+    /// the cumulative distribution of a Poisson distribution is
+    /// `P(X ≤ k) = Q(k + 1, λ)`.
+    ///
+    /// The front factor of the continued fraction is
+    /// `exp(-x + a·log(x) - Γ(a))`: it is the difference of terms of the
+    /// order of `a·log(x)`, so its evaluation loses about thirteen digits
+    /// when `a` is of the order of a thousand.  The implementation below
+    /// evaluates it through the logarithm of the probability of a Poisson
+    /// distribution (``logPoissonProbability``), which is free of that
+    /// cancellation: the relative error of the front is of the order of the
+    /// rounding of the result itself, and not of the order of the rounding
+    /// of its terms.
+    ///
+    /// - Parameters:
+    ///   - a: the shape of the gamma distribution (an integer ≥ 1).
+    ///   - x: the argument.
+    /// - Returns: the value of `Q(a, x)`.
+    public static func regularizedGammaQ(a: Int, x: Double) -> Double {
+        guard a > 0 else { return 1 }
+        guard x > 0 else { return 1 }
+        guard x.isFinite else { return 0 }
+        let shape = Double(a)
+        let front = exp(logPoissonProbability(lambda: x, k: a - 1) + log(x))
+        if x < shape + 1 {
+            return 1 - gammaSeries(shape, x, front: front)
+        }
+        return gammaContinuedFraction(shape, x, front: front)
+    }
+
+    /// The regularised incomplete beta function `I_x(a, b)`, with the
+    /// **cancellation free** evaluation of its front factor.
+    ///
+    /// `I_x(a, b)` is the cumulative distribution function of the beta
+    /// distribution; the cumulative distribution of a binomial
+    /// distribution is `P(X ≤ k) = I_p(k + 1, n - k)`.
+    ///
+    /// The front factor is evaluated through the logarithm of the
+    /// probability of a binomial distribution
+    /// (``logBinomialProbability``), for the same reason as in
+    /// ``regularizedGammaQ(a:x:)``.
+    ///
+    /// - Parameters:
+    ///   - a: the first shape (an integer ≥ 1).
+    ///   - b: the second shape (an integer ≥ 1).
+    ///   - x: the argument, in `[0, 1]`.
+    /// - Returns: the value of `I_x(a, b)`.
+    public static func regularizedIncompleteBeta(a: Int, b: Int, x: Double) -> Double {
+        guard a > 0, b > 0 else { return .nan }
+        if x <= 0 { return 0 }
+        if x >= 1 { return 1 }
+        let n = a + b - 1
+        // The front factor is `x·b·P(a - 1; n, x)`: the probability of the
+        // binomial distribution of `n` trials at `a - 1` successes, times
+        // the factor of the tail of the beta distribution.
+        let front = exp(
+            logBinomialProbability(n: n, k: a - 1, p: x) + log(x) + log(Double(b))
+        )
+        if x < (Double(a) + 1) / (Double(a + b) + 2) {
+            return front * betaContinuedFraction(Double(a), Double(b), x) / Double(a)
+        }
+        return 1 - front * betaContinuedFraction(Double(b), Double(a), 1 - x) / Double(b)
+    }
+
+    /// The continued fraction of the incomplete beta function (the modified
+    /// Lentz method).
+    private static func betaContinuedFraction(
+        _ a: Double, _ b: Double, _ x: Double
+    ) -> Double {
+        let epsilon = 3e-16
+        let tiny = 1e-300
+        let qab = a + b
+        let qap = a + 1
+        let qam = a - 1
+        var c = 1.0
+        var d = 1 - qab * x / qap
+        if abs(d) < tiny { d = tiny }
+        d = 1 / d
+        var h = d
+        var m = 1
+        while m <= 300 {
+            let m2 = 2 * Double(m)
+            // The even step.
+            var numerator = Double(m) * (b - Double(m)) * x / ((qam + m2) * (a + m2))
+            d = 1 + numerator * d
+            if abs(d) < tiny { d = tiny }
+            c = 1 + numerator / c
+            if abs(c) < tiny { c = tiny }
+            d = 1 / d
+            h *= d * c
+            // The odd step.
+            numerator = -(a + Double(m)) * (qab + Double(m)) * x
+                / ((a + m2) * (qap + m2))
+            d = 1 + numerator * d
+            if abs(d) < tiny { d = tiny }
+            c = 1 + numerator / c
+            if abs(c) < tiny { c = tiny }
+            d = 1 / d
+            let delta = d * c
+            h *= delta
+            if abs(delta - 1) < epsilon { break }
+            m += 1
+        }
+        return h
+    }
+
+    /// The logarithm of the probability of a Poisson distribution.
+    ///
+    /// The evaluation is **cancellation free**: the terms of the Stirling
+    /// expansion are combined into the relative entropy of the
+    /// distribution, so that the absolute error of the result is of the
+    /// order of the rounding of the result itself (and not of the order of
+    /// the rounding of the terms, which are of the order of `k·log(λ)`).
+    ///
+    /// - Parameters:
+    ///   - lambda: the mean of the distribution.
+    ///   - k: the value.
+    /// - Returns: the logarithm of the probability of `k`.
+    public static func logPoissonProbability(lambda: Double, k: Int) -> Double {
+        guard lambda > 0, k >= 0 else { return -.infinity }
+        if k == 0 { return -lambda }
+        let count = Double(k)
+        // The Stirling expansion of the logarithm of the gamma function is
+        // used at the argument `k + 1`:
+        //
+        //     log P(k) = -λ + k·log(λ) - [(k + 0.5)·log(k + 1) - (k + 1)
+        //                + 0.5·log(2π) + S(k + 1)]
+        //
+        // The two terms of the order of `k` are combined into
+        // `-k·log((k + 1)/λ) + (k + 1 - λ)`, which is free of any
+        // cancellation: the difference `k + 1 - λ` is exact and the
+        // logarithm is evaluated by `log1p`, which keeps the accuracy of
+        // the small argument.
+        let excess = count + 1 - lambda
+        var value = -count * log1p(excess / lambda) + excess
+        value -= 0.5 * log(2 * .pi * (count + 1))
+        value -= stirlingCorrection(count + 1)
+        return value
+    }
+
+    /// The logarithm of the probability of a binomial distribution.
+    ///
+    /// The evaluation is **cancellation free**, like
+    /// ``logPoissonProbability(lambda:k:)``.
+    ///
+    /// - Parameters:
+    ///   - n: the number of trials.
+    ///   - k: the number of successes.
+    ///   - p: the probability of a success.
+    /// - Returns: the logarithm of the probability of `k`.
+    public static func logBinomialProbability(n: Int, k: Int, p: Double) -> Double {
+        guard n > 0, k >= 0, k <= n else { return -.infinity }
+        guard p > 0, p < 1 else { return -.infinity }
+        let q = 1 - p
+        if k == 0 { return Double(n) * log(q) }
+        if k == n { return Double(n) * log(p) }
+        let trials = Double(n)
+        let successes = Double(k)
+        let failures = Double(n - k)
+        // The Stirling expansion of the logarithm of the gamma function is
+        // used at the arguments `n + 1`, `k + 1` and `n - k + 1`:
+        //
+        //     log P(k) = k·log(p(n + 1)/(k + 1))
+        //              + (n - k)·log(q(n + 1)/(n - k + 1))
+        //              + 0.5·log((n + 1)/(2π(k + 1)(n - k + 1))) + 1
+        //              + S(n + 1) - S(k + 1) - S(n - k + 1)
+        //
+        // The two logarithms of the first line are the logarithms of the
+        // ratios, which are one when `k` is the mode of the distribution:
+        // they are evaluated by `log1p`, which keeps the accuracy of the
+        // small argument, so that the cancellation of the terms of the
+        // order of `n` does not cost any digit.
+        var value = successes * log1p(
+            (p * (trials + 1) - (successes + 1)) / (successes + 1)
+        )
+        value += failures * log1p(
+            (q * (trials + 1) - (failures + 1)) / (failures + 1)
+        )
+        value += 0.5 * log(
+            (trials + 1) / (2 * .pi * (successes + 1) * (failures + 1))
+        )
+        value += 1
+        value += stirlingCorrection(trials + 1)
+        value -= stirlingCorrection(successes + 1)
+        value -= stirlingCorrection(failures + 1)
+        return value
+    }
+
+    /// The correction of the Stirling expansion of the logarithm of the
+    /// gamma function.
+    ///
+    /// It is the difference between the exact logarithm of the gamma
+    /// function and its main term:
+    /// `S(z) = logGamma(z) - ((z - 0.5)·log(z) - z + 0.5·log(2π))`.
+    ///
+    /// For a large argument the Bernoulli series is used (its terms are
+    /// computed directly, so the evaluation is free of any cancellation);
+    /// for a small argument the exact difference is computed (both terms
+    /// are small, so the difference is accurate).
+    private static func stirlingCorrection(_ z: Double) -> Double {
+        guard z > 0 else { return 0 }
+        guard z >= 8 else {
+            return logGamma(z) - ((z - 0.5) * log(z) - z + 0.5 * log(2 * .pi))
+        }
+        // The Bernoulli numbers `B(2j)` divided by `2j(2j-1)`.
+        let coefficients: [Double] = [
+            1.0 / 12.0, -1.0 / 360.0, 1.0 / 1260.0, -1.0 / 1680.0, 1.0 / 1188.0,
+            -691.0 / 360360.0, 1.0 / 156.0, -3617.0 / 122400.0,
+            43867.0 / 244188.0, -174611.0 / 125400.0,
+        ]
+        var sum = 0.0
+        for (index, coefficient) in coefficients.enumerated() {
+            let power = 2 * Double(index) + 1
+            sum += coefficient / pow(z, power)
+        }
+        return sum
     }
 
     /// The natural logarithm of the gamma function.

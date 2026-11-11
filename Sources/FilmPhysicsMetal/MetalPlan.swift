@@ -268,6 +268,19 @@ struct FilmGlareParams {
 /// identity the CPU reference uses for a radius of zero.
 enum MetalKernels {
 
+    /// The maximum radius of a convolution kernel, in pixels.
+    ///
+    /// The radius of a Gaussian kernel is the truncation of the kernel at
+    /// three sigmas: a radius above this bound would mean a blur of more
+    /// than three hundred pixels, which is never the case (the diffusion
+    /// filters are bounded by the size of the image).  The bound makes the
+    /// loops of the kernels **bounded**, whatever the parameters of the
+    /// render are: a parameter that is not a number (a `NaN` of a
+    /// degenerate profile, an infinite sigma) would otherwise make the
+    /// conversion to an integer trap, or the loop of the kernel run for
+    /// billions of iterations.
+    static let maxBlurRadius = 1024
+
     /// The separable Gaussian kernels of the given sigmas.
     ///
     /// - Parameter sigmas: the standard deviations, in pixels, one per
@@ -277,15 +290,22 @@ enum MetalKernels {
         let sigmas = sigmas.count == 1 ? [sigmas[0], sigmas[0], sigmas[0]] : sigmas
         let channels = sigmas.count == 3 ? sigmas : [sigmas[0], sigmas[0], sigmas[0]]
         var radii = [Int](repeating: 0, count: 3)
+        var effective = [Double](repeating: 0, count: 3)
         for channel in 0..<3 {
-            radii[channel] = Int(3.0 * channels[channel] + 0.5)
+            let sigma = channels[channel]
+            // A sigma that is not a positive number is the identity.
+            guard sigma.isFinite, sigma > 0 else { continue }
+            // The truncation at three sigmas, bounded.
+            let bounded = Swift.min(sigma, Double(maxBlurRadius) / 3.0)
+            effective[channel] = bounded
+            radii[channel] = Int(3.0 * bounded + 0.5)
         }
-        let radius = max(max(radii[0], radii[1]), radii[2])
+        let radius = Swift.min(max(max(radii[0], radii[1]), radii[2]), maxBlurRadius)
         let length = 2 * radius + 1
         var kernels = [Float](repeating: 0, count: 3 * length)
         for channel in 0..<3 {
             let (kernel, kernelRadius) = SpatialEffects.gaussianKernel(
-                sigma: channels[channel], truncate: 3.0
+                sigma: effective[channel], truncate: 3.0
             )
             if kernelRadius == 0 {
                 kernels[channel * length + radius] = 1
@@ -326,8 +346,16 @@ enum MetalKernels {
         let bloomMaxLambdaPX = DiffusionFilter.bloomMaxLambdaUM(
             params.filterFamily, params: params
         ) * params.spatialScale / pixelSizeUM
-        var radius = Int(ceil(max(8.0 * bloomMaxLambdaPX, 5.0)))
+        // The radius is bounded (a parameter that is not a number would
+        // otherwise trap the conversion, and the loop of the kernel would
+        // run for billions of iterations).
+        let bounded = Swift.min(
+            Swift.max(bloomMaxLambdaPX.isFinite ? 8.0 * bloomMaxLambdaPX : 5.0, 5.0),
+            Double(maxBlurRadius)
+        )
+        var radius = Int(ceil(bounded))
         radius = min(radius, max(min(height, width) / 2 - 1, 1))
+        radius = min(radius, maxBlurRadius)
         let shape = 2 * radius + 1
         guard let kernel = DiffusionFilter.psf(
             shape: shape,

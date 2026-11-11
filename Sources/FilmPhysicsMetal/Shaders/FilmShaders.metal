@@ -30,6 +30,14 @@ using namespace metal;
 #define FILM_PI 3.141592653589793
 // The number of threads of the two stage maximum reduction.
 #define FILM_REDUCE_THREADS 1024
+// The maximum radius of a convolution kernel, in pixels.
+//
+// The radius is the truncation of the Gaussian at three sigmas: the bound
+// makes the loops of the convolutions **bounded**, whatever the parameters
+// of the render are (a radius of billions of pixels would make a kernel
+// run for hours).  The Swift side uses the same bound
+// (`MetalKernels.maxBlurRadius`).
+#define FILM_MAX_BLUR_RADIUS 1024
 
 // MARK: - The parameters of the plan
 
@@ -847,7 +855,9 @@ kernel void filmReduceMaxPartial(
     const uint total = params.width * params.height * 3;
     // The grid is one dimensional: the position of the thread is its `x`.
     const uint position = gid.x;
-    const uint threads = groupSize.x;
+    // The number of the threads of the group: it is the stride of the
+    // loop, and it must never be zero (the loop would never end).
+    const uint threads = max(groupSize.x, 1u);
     if (position >= FILM_REDUCE_THREADS) {
         return;
     }
@@ -1355,7 +1365,7 @@ kernel void filmBlurHorizontal(
     if (gid.x >= params.width || gid.y >= params.height) {
         return;
     }
-    const int radius = int(params.radius);
+    const int radius = min(int(params.radius), FILM_MAX_BLUR_RADIUS);
     const int length = 2 * radius + 1;
     const uint pixel = gid.y * params.width + gid.x;
     const int column = int(gid.x);
@@ -1389,7 +1399,7 @@ kernel void filmBlurVertical(
     if (gid.x >= params.width || gid.y >= params.height) {
         return;
     }
-    const int radius = int(params.radius);
+    const int radius = min(int(params.radius), FILM_MAX_BLUR_RADIUS);
     const int length = 2 * radius + 1;
     const uint pixel = gid.y * params.width + gid.x;
     const int row = int(gid.y);
@@ -1423,7 +1433,7 @@ kernel void filmDiffusionFilter(
     if (gid.x >= params.width || gid.y >= params.height) {
         return;
     }
-    const int radius = int(params.radius);
+    const int radius = min(int(params.radius), FILM_MAX_BLUR_RADIUS);
     const int shape = 2 * radius + 1;
     const uint pixel = gid.y * params.width + gid.x;
 

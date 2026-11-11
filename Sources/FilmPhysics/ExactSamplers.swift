@@ -22,8 +22,7 @@
 //  This file provides the **exact** samplers, so that the port can also
 //  reproduce the default path of the upstream: they draw from the very same
 //  distributions as the SciPy generators (the inversion of the cumulative
-//  distribution, started at the mode of the distribution, which is exact and
-//  of constant time).
+//  distribution, which is exact).
 //
 //  The investigation of the difference between the two paths is in
 //  `docs/PORTING.md` §3.4: it is **not** a difference of approximation, it
@@ -76,17 +75,71 @@ public enum GrainSampler: Sendable {
 /// upstream (`scipy.stats.poisson.rvs` and `scipy.stats.binom.rvs`, i.e.
 /// the PTRS and the BTPE algorithms of NumPy); the *distribution* is the
 /// one of those generators, the *realisation* is the one of the port.
+///
+/// ## The algorithm
+///
+/// Both samplers **invert the cumulative distribution** of their
+/// distribution: the variate is the smallest `k` whose cumulative
+/// distribution exceeds the uniform variate.  The inversion is done around
+/// the **mode** of the distribution, where the probability mass is
+/// concentrated:
+///
+/// 1. the probability of the mode is computed in log space, with the
+///    **cancellation free** evaluation of ``Numerics/logPoissonProbability(lambda:k:)``
+///    and ``Numerics/logBinomialProbability(n:k:p:)``,
+/// 2. the cumulative distribution **below** the mode is computed with the
+///    regularised incomplete gamma function (the Poisson) and with the
+///    regularised incomplete beta function (the binomial),
+/// 3. the variate is found by walking from the mode towards the side the
+///    uniform variate falls on, with the recurrence of the probabilities:
+///    `P(k - 1) = P(k)·k/λ` (the Poisson) and
+///    `P(k ∓ 1) = P(k)·k·q/((n - k + 1)·p)` (the binomial).
+///
+/// The walk is **exact**: every `k` owns an interval of the uniform of the
+/// length `P(k)`, and the interval of the variate is the one the uniform
+/// falls in.  **No probability mass is dropped**: the walk is bounded by
+/// the support of the distribution (the binomial) or by the underflow of
+/// the probabilities (the Poisson), never by an arbitrary tolerance.
+///
+/// ### The cost
+///
+/// The number of steps of the walk is the distance between the mode and
+/// the variate, which is of the order of **√(variance)** of the
+/// distribution (the terms around the mode of a Poisson or of a binomial
+/// distribution decay like a Gaussian).  The two special functions of the
+/// first step cost a fixed number of iterations (a few tens).
+///
+/// The previous implementation walked from the mode **down to zero** before
+/// trying the mode and the terms above it, i.e. it took `Θ(λ)` steps (about
+/// 2 500 for the dense layers of the emulsion, and more than 11 000 for the
+/// densest one) — the claim that the walk was of a "constant expected
+/// length" was wrong, and it is corrected here.
+///
+/// ### The bias of the inversion
+///
+/// The only inexactness of the samplers is the rounding of the arithmetic:
+///
+/// * the cumulative distribution below the mode is the value of a special
+///   function, whose relative error is of the order of `1e-15`,
+/// * the walk accumulates the probabilities with a compensated
+///   (Kahan) summation, so that the rounding of the accumulation is of the
+///   order of `1e-16`,
+/// * the probabilities of the walk are computed with the recurrence of the
+///   distribution: their relative error grows with the number of steps
+///   (of the order of `k·eps`, i.e. `4e-13` for the densest layer of the
+///   emulsion).
+///
+/// The **total variation distance** between the law of the sampler and the
+/// exact law is therefore of the order of `1e-12` for the densest layer of
+/// the emulsion (and of the order of `1e-15` for the sparse ones).  It is
+/// measured by the tests of `Tests/FilmPhysicsTests/ExactSamplerTests.swift`.
 public enum ExactSamplers {
 
     /// An exact Poisson variate.
     ///
-    /// The method is the inversion of the cumulative distribution, started
-    /// at the mode of the distribution (the mode of a Poisson distribution
-    /// is `floor(λ)`): the probability of the mode is computed in log space
-    /// (with the log gamma function), and the cumulative distribution is
-    /// built from the mode, downwards and upwards.  The walk is of a
-    /// constant expected length (a few steps), and the variate is the
-    /// smallest `k` whose cumulative distribution exceeds the uniform.
+    /// The method is the inversion of the cumulative distribution, around
+    /// the mode of the distribution (the mode of a Poisson distribution is
+    /// `floor(λ)`).
     ///
     /// - Parameters:
     ///   - lambda: the mean of the distribution.
@@ -99,68 +152,78 @@ public enum ExactSamplers {
 
         // The mode of the distribution and its probability.
         let mode = Int(floor(lambda))
-        let modeProbability = exp(
-            -lambda + Double(mode) * log(lambda)
-                - Numerics.logGamma(Double(mode) + 1)
-        )
-        guard modeProbability > 0 else { return mode }
+        let modeProbability = exp(Numerics.logPoissonProbability(lambda: lambda, k: mode))
+        guard modeProbability > 0, modeProbability.isFinite else { return mode }
 
-        // The cumulative distribution below the mode: F(mode - 1).
-        //
-        // The terms are summed from the mode downwards (the sum does not
-        // depend on the order of the terms), and the cumulative
-        // distribution is walked **down** from the mode when the variate is
-        // below it.
-        var below = 0.0
-        var probability = modeProbability
-        var k = mode
-        while k > 0 {
-            probability *= Double(k) / lambda
-            below += probability
-            k -= 1
-        }
+        // The cumulative distribution below the mode: `P(X ≤ mode - 1)`.
+        let below = mode > 0
+            ? Numerics.regularizedGammaQ(a: mode, x: lambda)
+            : 0.0
+
         if u < below {
             // The variate is below the mode: the cumulative distribution is
-            // walked **down** from the mode (F(j) decreases), and the
-            // variate is the smallest k whose cumulative distribution
-            // exceeds the uniform.
-            var cdf = below
-            probability = modeProbability
-            var j = mode
-            while j > 0 {
-                probability *= Double(j) / lambda
-                j -= 1
-                cdf -= probability
-                if cdf <= u { return j }
+            // walked **down** from the mode.
+            //
+            // The mass that is subtracted from the cumulative distribution
+            // is accumulated with a compensated summation, so that the
+            // rounding of the accumulation stays of the order of the
+            // rounding of the result.
+            var k = mode
+            var probability = modeProbability        // P(k)
+            var mass = 0.0                          // the mass of (k, mode]
+            var compensation = 0.0
+            let top = below + modeProbability        // P(X ≤ mode)
+            while k > 0 {
+                // The cumulative distribution of `k - 1`.
+                let previous = top - mass - probability
+                if previous <= u { break }
+                mass = Numerics.compensatedAdd(mass, probability, compensation: &compensation)
+                probability *= Double(k) / lambda  // P(k - 1)
+                k -= 1
             }
-            return 0
+            return k
         }
 
-        // The mode itself.
-        var cdf = below + modeProbability
-        if u < cdf { return mode }
-
-        // Above the mode: P(k + 1) = P(k) · λ/(k + 1).
-        probability = modeProbability
-        k = mode
-        let limit = mode + 1000 + Int(20 * lambda.squareRoot())
-        while k < limit {
-            probability *= lambda / Double(k + 1)
+        // The variate is at the mode or above it: the cumulative
+        // distribution is walked **up** from the mode.
+        var k = mode
+        var probability = modeProbability            // P(k)
+        var mass = 0.0                              // the mass of (mode, k)
+        var compensation = 0.0
+        let top = below + modeProbability            // P(X ≤ mode)
+        if u < top {
+            // The variate is the mode itself.
+            return mode
+        }
+        while true {
+            let next = probability * lambda / Double(k + 1)  // P(k + 1)
+            if next == 0 {
+                // The probability underflowed: the mass of the tail beyond
+                // this point is below 1e-300 (the terms decay geometrically
+                // beyond the mode), so the uniform cannot fall in it.
+                break
+            }
+            let updated = mass + next
+            if updated == mass && top + mass > u {
+                // The accumulation of the cumulative distribution stalled:
+                // the remaining mass is below the rounding of the sum.  The
+                // variate is the last `k` whose probability is not
+                // negligible (and **not** a far outlier).
+                break
+            }
+            mass = Numerics.compensatedAdd(mass, next, compensation: &compensation)
+            probability = next
             k += 1
-            cdf += probability
-            if u < cdf { return k }
+            if top + mass > u { break }
         }
         return k
     }
 
     /// An exact binomial variate.
     ///
-    /// The method is the inversion of the cumulative distribution, started
-    /// at the mode of the distribution (the mode of a binomial
-    /// distribution is `floor((n + 1) p)`): the probability of the mode is
-    /// computed in log space (with the log gamma function), and the
-    /// cumulative distribution is built from the mode, downwards and
-    /// upwards.
+    /// The method is the inversion of the cumulative distribution, around
+    /// the mode of the distribution (the mode of a binomial distribution is
+    /// `floor((n + 1) p)`).
     ///
     /// - Parameters:
     ///   - n: the number of trials.
@@ -177,59 +240,70 @@ public enum ExactSamplers {
         let q = 1.0 - p
         // The mode of the distribution and its probability.
         let mode = min(max(Int(floor((Double(n) + 1) * p)), 0), n)
-        let modeProbability = exp(
-            Numerics.logGamma(Double(n) + 1)
-                - Numerics.logGamma(Double(mode) + 1)
-                - Numerics.logGamma(Double(n - mode) + 1)
-                + Double(mode) * log(p)
-                + Double(n - mode) * log(q)
-        )
-        guard modeProbability > 0 else { return mode }
+        let modeProbability = exp(Numerics.logBinomialProbability(n: n, k: mode, p: p))
+        guard modeProbability > 0, modeProbability.isFinite else { return mode }
 
-        // The cumulative distribution below the mode: F(mode - 1).
+        // The cumulative distribution below the mode: `P(X ≤ mode - 1)`.
         //
-        // The terms are summed from the mode downwards (the sum does not
-        // depend on the order of the terms), and the cumulative
-        // distribution is walked **down** from the mode when the variate is
-        // below it.
-        var below = 0.0
-        var probability = modeProbability
-        var k = mode
-        while k > 0 {
-            probability *= Double(k) * q / (Double(n - k + 1) * p)
-            below += probability
-            k -= 1
-        }
+        // The identity of the binomial distribution is
+        // `P(X ≤ k) = I_(1-p)(n - k, k + 1)`.
+        let below = mode > 0
+            ? Numerics.regularizedIncompleteBeta(a: n - mode + 1, b: mode, x: q)
+            : 0.0
+
         if u < below {
             // The variate is below the mode: the cumulative distribution is
-            // walked **down** from the mode (F(j) decreases), and the
-            // variate is the smallest k whose cumulative distribution
-            // exceeds the uniform.
-            var cdf = below
-            probability = modeProbability
-            var j = mode
-            while j > 0 {
-                probability *= Double(j) * q / (Double(n - j + 1) * p)
-                j -= 1
-                cdf -= probability
-                if cdf <= u { return j }
+            // walked **down** from the mode.
+            var k = mode
+            var probability = modeProbability        // P(k)
+            var mass = 0.0                          // the mass of (k, mode]
+            var compensation = 0.0
+            let top = below + modeProbability        // P(X ≤ mode)
+            while k > 0 {
+                let previous = top - mass - probability
+                if previous <= u { break }
+                mass = Numerics.compensatedAdd(mass, probability, compensation: &compensation)
+                probability *= Double(k) * q / (Double(n - k + 1) * p)   // P(k - 1)
+                k -= 1
             }
-            return 0
+            return k
         }
 
-        // The mode itself.
-        var cdf = below + modeProbability
-        if u < cdf { return mode }
-
-        // Above the mode: P(k + 1) = P(k) · (n - k) · p / ((k + 1) · q).
-        probability = modeProbability
-        k = mode
+        // The variate is at the mode or above it: the cumulative
+        // distribution is walked **up** from the mode, until the end of the
+        // support (the binomial distribution is bounded, so the walk always
+        // terminates).
+        var k = mode
+        var probability = modeProbability            // P(k)
+        var mass = 0.0                              // the mass of (mode, k]
+        var compensation = 0.0
+        let top = below + modeProbability            // P(X ≤ mode)
+        if u < top {
+            // The variate is the mode itself.
+            return mode
+        }
         while k < n {
-            probability *= Double(n - k) * p / (Double(k + 1) * q)
+            let next = probability * Double(n - k) * p / (Double(k + 1) * q)  // P(k + 1)
+            if next == 0 {
+                // The probability underflowed: the mass of the tail beyond
+                // this point is negligible.
+                break
+            }
+            let updated = mass + next
+            if updated == mass && top + mass > u {
+                // The accumulation stalled: the variate is the last `k`
+                // whose probability is not negligible.
+                break
+            }
+            mass = Numerics.compensatedAdd(mass, next, compensation: &compensation)
+            probability = next
             k += 1
-            cdf += probability
-            if u < cdf { return k }
+            if top + mass > u { break }
         }
-        return n
+        // The support ends at `n`: when the accumulated cumulative
+        // distribution never exceeds the uniform (the sum of the terms of
+        // the distribution is one, up to the rounding of the arithmetic),
+        // the variate is the last `k` of the support.
+        return k
     }
 }

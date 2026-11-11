@@ -763,7 +763,7 @@ documented discrepancy of the table above, and it is **not** a parity.
 #### The exact sampler mode: the resolution of the discrepancy
 
 The port now also implements the **exact** samplers — the inversion of the
-cumulative distribution, started at the mode of the distribution
+cumulative distribution, around the mode of the distribution
 (`ExactSamplers`, `RandomGenerator.poissonExact` /
 `binomialExact` and `FilmCounterRandom.poissonExact` /
 `binomialExact`).  They draw from the very same distributions as the SciPy
@@ -771,6 +771,85 @@ generators of the default path of the upstream (the PTRS and the BTPE
 algorithms), and the mode is **selectable** (`GrainSampler.exact`); the
 **default is unchanged** (`.fast`), so the existing fixtures and the
 existing validations stay valid.
+
+##### The algorithm of the exact samplers
+
+The inversion is **exact**: the variate is the smallest `k` whose
+cumulative distribution exceeds the uniform variate, i.e. every `k` owns
+an interval of the uniform of the length `P(k)`.  **No probability mass
+is dropped**: the walk of the inversion is bounded by the support of the
+distribution (the binomial) or by the underflow of the probabilities (the
+Poisson), never by an arbitrary tolerance.
+
+The walk is done around the **mode** of the distribution, where the mass
+is concentrated:
+
+1. the probability of the mode is computed in log space, with the
+   **cancellation free** evaluation of `Numerics.logPoissonProbability`
+   and `Numerics.logBinomialProbability` (the terms of the Stirling
+   expansion are combined into the relative entropy of the distribution,
+   so that the error of the result is of the order of the rounding of the
+   result itself, and not of the order of the rounding of the terms,
+   which are of the order of `n·log(p)`),
+2. the cumulative distribution **below** the mode is computed with the
+   regularised incomplete gamma function (the Poisson) and with the
+   regularised incomplete beta function (the binomial) — the two
+   functions are new (`Numerics.regularizedGammaQ`,
+   `Numerics.regularizedIncompleteBeta`) and their front factors are
+   evaluated with the cancellation free forms above,
+3. the variate is found by walking from the mode towards the side the
+   uniform falls on, with the recurrence of the probabilities
+   (`P(k ∓ 1) = P(k)·k/λ` for the Poisson,
+   `P(k ∓ 1) = P(k)·k·q/((n - k + 1)·p)` for the binomial); the mass
+   that is accumulated is accumulated with a **compensated (Kahan)
+   summation**.
+
+The number of steps of the walk is the distance between the mode and the
+variate, which is of the order of **√(variance)** of the distribution;
+the two special functions of the first step cost a fixed number of
+iterations (a few tens).  The previous implementation walked from the
+mode **down to zero** before trying the mode and the terms above it, i.e.
+it took `Θ(λ)` steps (about 2 500 for the dense layers of the emulsion):
+the claim that the walk was of a "constant expected length" was wrong,
+and it is corrected here.  The measured runtime of a hundred thousand
+variates of a Poisson of a mean of 2 500 is **1.4 s** in a debug build
+(the test `testTheExactSamplersAreFast`).
+
+##### The numerical limits of the exact samplers
+
+The only inexactness of the samplers is the rounding of the arithmetic:
+
+| The source of the error | Its order | The consequence |
+|---|---|---|
+| the special functions (the cumulative distribution below the mode) | `1e-15` (relative) | the variate is wrong for a uniform within `1e-15` of the boundary |
+| the accumulated mass (a compensated summation) | `1e-16` | — |
+| the probabilities of the walk (the recurrence) | `k·eps`, i.e. `4e-13` for the densest layer | the cumulative distribution is off by `1e-12` |
+| the representation of `n·p` and of `λ` | `n·eps` | the same order |
+
+The **total variation distance** between the law of the sampler and the
+exact law is therefore of the order of **`1e-12`** for the densest layer
+of the emulsion, and of the order of `1e-15` for the sparse ones.  It is
+measured by the tests: the law of the samplers is checked against the
+exact law by a **chi-square test** (the probability of the statistic
+must be above 1e-3), for a Poisson of a mean of 3.5 and of 2 500 and
+for a binomial of 40 trials and of 3 768 trials with a probability of
+0.998; the moments are checked against the theoretical ones; the
+consistency of the inversion (`F(k - 1) ≤ u < F(k)`) is checked on a
+range of uniforms.
+
+The **tail** of the range (the uniforms of the last `1e-16`) is the case
+the inversion cannot resolve: the cumulative distribution of a
+distribution is one, up to the rounding of the arithmetic, so the walk
+can end without a `k` whose cumulative distribution exceeds the uniform.
+The sampler then returns the **last** `k` whose probability is not
+negligible (and **not** a far outlier: the test checks that the variate
+of the largest uniform stays within a few standard deviations of the
+mode).  The same happens when the cumulative distribution underflows (a
+uniform below the smallest representable cumulative distribution): the
+sampler returns the first `k` whose cumulative distribution is
+representable.
+
+##### The validation of the exact mode
 
 The validation of the exact mode is the strongest one of the slice 6: the
 comparison with the upstream **default** path, with the plain statistical
@@ -1285,9 +1364,9 @@ arithmetic, not of the algorithm.
 |---|---|
 | the plan reproduces the CPU pipeline tap by tap (`FilmPlanEvaluatorTests`) | the Metal kernels against the CPU pipeline (a mean ΔE₀₀ below 0.5) |
 | the `Float32` specification of the kernels against the CPU pipeline | the Metal kernels against the `Float32` specification (a max abs error below 1e-3) |
-| the static analysis of the shading language: the kernel names are unique, every dispatched kernel exists, the buffer indices are contiguous, the structures have the layout of their Swift counterparts, there is no `double`, no keyword is used as an identifier and the attributes belong to the whitelist of the valid Metal attributes (`MetalSourceTests`) | the spatial effects on the GPU (the halation, the diffusion filters, the lens blurs, the unsharp mask) |
+| the static analysis of the shading language: the kernel names are unique, every dispatched kernel exists, the buffer indices are contiguous, the structures have the layout of their Swift counterparts, there is no `double`, no keyword is used as an identifier, the attributes belong to the whitelist of the valid Metal attributes, the loops are bounded and the bound of the radius is the same on the two sides (`MetalSourceTests`) | the spatial effects on the GPU (the halation, the diffusion filters, the lens blurs, the unsharp mask) |
 | the counter based grain against the grain of the CPU, against the upstream **fast** path (no allowance) and against the upstream **default** path (raw and adjusted), with the fast and with the exact samplers (`GrainCounterTests`, `GrainStatisticsTests`, `ExactSamplerTests`) | the grain of the GPU against the grain of the CPU (the statistical gate) |
-| the compilation of the package and of the test targets on Linux | the timing of the GPU against the CPU (a 1024 × 1024 image, the median of three runs after a warm up) — note that the CPU side of that measurement costs about **85 s per run** in a debug build (the release build is about twenty times faster) |
+| the compilation of the package and of the test targets on Linux | the timing of the GPU against the CPU (a 1024 × 1024 image, the median of three runs after a warm up, in **release**) — note that the CPU side of that measurement costs about **100 s per run** in a debug build (the release build is about twenty times faster) |
 
 **Nothing on Metal is validated until the CI runs it on a real Metal
 device**: the MSL source, the Swift/Metal API calls and the buffer layouts
@@ -1312,20 +1391,108 @@ the timing) exist **only** from those CI runs.
 
 ### 7.8 The CI
 
-`.github/workflows/ci.yml` runs, on `macos-15` (a timeout of 40 minutes):
+`.github/workflows/ci.yml` runs **two jobs in parallel** on `macos-15`:
 
-1. the checkout, `swift --version` and `xcrun --show-sdk-path`,
-2. the Metal devices of the machine (`system_profiler SPDisplaysDataType`),
-3. `swift build`,
-4. `swift test 2>&1 | tee test.log` (the log is uploaded as an artifact),
-5. `xcodebuild -list` and the build of the package scheme for the iOS
-   Simulator (`-destination 'generic/platform=iOS Simulator'`), the scheme
-   being detected in the script.
+| The job | The cap | The steps |
+|---|---|---|
+| `metal` | 30 minutes | the checkout, the toolchain, the Metal devices, `swift build --build-tests`, the **Metal tests only** (`swift test --skip-build --filter FilmPhysicsMetalTests`, cap 15 minutes), the **timing** in release (`swift test -c release --filter testTheTimingOfTheGPUAndOfTheCPU`, cap 10 minutes, `if: always()`), the upload of `metal.log` and `timing.log` (`if: always()`) |
+| `cpu-and-ios` | 55 minutes | the checkout, the toolchain, `swift build --build-tests`, the **CPU tests** (`swift test --skip-build --skip FilmPhysicsMetalTests`, cap 35 minutes), the upload of `cpu.log` (`if: always()`), `xcodebuild -list`, the **iOS build** (`xcodebuild -scheme <detected> -destination 'generic/platform=iOS Simulator' build`, cap 15 minutes, `if: always()`), the upload of `ios.log` (`if: always()`) |
 
-The tests print their measurements with the prefixes `METAL-PARITY` and
-`METAL-TIMING`, so that the log of the job can be grepped.
+The cap of a job is **larger** than the sum of the caps of its steps (the
+build of the tests is not capped): the cap of the job must never kill a
+step that is still running.
 
-### 7.9 The deferred items
+Every test step writes its output **unbuffered and timestamped**:
+
+```bash
+swift test --skip-build --filter FilmPhysicsMetalTests 2>&1 \
+  | while IFS= read -r l; do printf '%s %s\n' "$(date -u +%H:%M:%S)" "$l"; done \
+  | tee metal.log
+```
+
+and the environment variable `NSUnbufferedIO=YES` disables the buffering
+of the output of the test runner.  The Metal tests also write their own
+progress on the **standard error** (which is unbuffered):
+`METAL-PROGRESS <test> start` and `METAL-PROGRESS <test> end <s>`.
+
+The tests print their measurements with the prefixes `METAL-PARITY`,
+`METAL-TIMING` and `METAL-STAGE`, so that the log of the job can be
+grepped.
+
+### 7.9 The hang of the Metal tests: the diagnosis
+
+The run
+<https://github.com/Panhe-C/lightsuffer-ios/actions/runs/43008312020>
+(commit `2df16c1`, `macos-15`, a Metal device present) was **cancelled at
+the 40-minute cap** of the single job of the previous layout.  The log
+showed the last Metal test that had *started*
+(`MetalParityTests.testTheGPUReproducesTheCPUChainOfSlice2`) and no
+`METAL-` line at all.
+
+**What the log could and could not say.**  The output of the test runner
+is block buffered when it is piped (`tee`), so the Metal part of the log
+was **stale**: it showed the tests that had started, not the ones that
+were running.  The Metal tests could therefore have been anywhere in
+their sequence — the failure was *not* localised.
+
+**What the measurements say.**  The CPU part of the suite takes about
+**twenty minutes** in a debug build on the runner (the CPU pipeline of a
+1024 × 1024 image costs about a hundred seconds per run in a debug
+build, and the timing test runs it four times).  The Metal part needs
+about **twelve minutes** in a debug build (the plan of a render — the
+spectral table, the CAM16 table — costs about twelve seconds per render
+in a debug build, and the Metal tests build twenty five of them).  The
+two together do not fit in the 40-minute cap of the job, with the build
+of the tests and the iOS build on top of them: **the job was killed by
+its cap in the middle of the Metal tests**, which is what the log looked
+like.
+
+**What has been done about it.**
+
+* the CI is split into two jobs that run **in parallel** (§7.8), each
+  with its own cap and its own logs, so that the CPU tests and the Metal
+  tests no longer compete for the same budget,
+* the timing test (the most expensive one, on the CPU side) is **skipped**
+  in the debug step (`RUN_TIMING=1` enables it) and runs in **release**,
+  in its own step,
+* the Metal tests print their progress **unbuffered**, so that the log
+  of a run that is killed shows exactly where the tests were,
+* the wait of a command buffer is now **bounded** (60 seconds by
+  default, `FILM_METAL_TIMEOUT` overrides it): a GPU that never
+  finishes fails the test with `MetalBackendError.gpuTimeout(stage:)`
+  (the name of the stage is in the message) instead of hanging the job,
+* the **diagnostic mode** (`FILM_METAL_DIAGNOSTIC=1`, enabled in the CI)
+  commits every pass of a render in its own command buffer and prints
+  `METAL-STAGE <kernel> <ms>`: the log then shows the time of every
+  kernel, and the kernel that hangs is the last line before the timeout.
+
+**What is still unknown.**  The hang has **not** been reproduced: this
+box has no GPU, and the Metal code is only executed by the CI.  The
+diagnosis above is the most likely explanation of the cancelled run (it
+is consistent with the measured runtimes and with the stale log), but it
+is **not** a proof: the next CI run, with the bounded waits and the
+diagnostic mode, will either show a `METAL-STAGE` line that repeats (a
+kernel that hangs) or complete the suite.
+
+### 7.10 The audit of the kernels and of the dispatch
+
+Every kernel of the shading language and every dispatch of the Swift
+side has been audited for the failure modes that would hang the GPU or
+corrupt its memory.  The findings and the fixes:
+
+| The place | The finding | The fix |
+|---|---|---|
+| `filmReduceMaxPartial` | the stride of the loop is the number of the threads of the group: a group of zero threads would make the loop **never end** | the stride is `max(groupSize.x, 1)` |
+| `filmBlurHorizontal`, `filmBlurVertical`, `filmDiffusionFilter` | the radius of the convolution comes from the parameters: a radius of billions of pixels would make the kernel run for hours, and a radius that is not a number would **trap** the conversion of the Swift side (`Int(Double.nan)`) | the radius is bounded (`FILM_MAX_BLUR_RADIUS = 1024`, the same bound on the two sides, checked by `MetalSourceTests`), and the sigmas that are not positive numbers are the identity |
+| `MetalKernels.gaussian` | the same: `Int(3.0 * sigma + 0.5)` traps on a `NaN` or an infinite sigma | the sigmas are sanitised and the radius is bounded |
+| `MetalKernels.diffusionFilter` | the same: `Int(ceil(8·λ))` traps on a `NaN` | the radius is bounded before the conversion |
+| `MetalBufferPool.acquire` | the allocation of a buffer that fails **terminated the process** (`fatalError`) | the allocation throws `MetalBackendError.commandFailed` |
+| the wait of the command buffer | `waitUntilCompleted()` waits **for ever** | the wait is bounded and the status and the error of the command buffer are checked (§7.9) |
+| the buffers and the indices of the kernels | the sizes of the buffers and the indices of the kernels were compared one by one (the tc lookup table, the spectral tables, the curves, the layers of the grain, the weights of the convolutions, the point spread function of the diffusion filters): they agree | — |
+| the loops of the shading language | the `while` loops of the binomial inversion (bounded by `n`), of the layers of the grain (bounded by the number of the samples) and the product method of Knuth (bounded by a thousand steps) are bounded | the bound is checked statically by `MetalSourceTests.testTheLoopsOfTheShadingLanguageAreBounded` |
+| the dispatch sizes | the thread groups are 16 × 16 (256 threads), which every Metal device accepts; the reduction is dispatched with exactly 1 024 threads in groups of 256, as the kernel requires | — |
+
+### 7.11 The deferred items
 
 * the **single layer model** of the grain (`grain.sublayers_active = false`)
   is not ported to the GPU: the backend raises

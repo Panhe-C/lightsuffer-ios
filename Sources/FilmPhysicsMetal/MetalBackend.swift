@@ -41,6 +41,11 @@ public enum MetalBackendError: Error, CustomStringConvertible {
     case invalidPlan(String)
     /// A command of the render failed.
     case commandFailed(String)
+    /// A command of the render did not finish in time.
+    ///
+    /// The GPU never completed the command buffer: the render is abandoned
+    /// instead of blocking the process forever.
+    case gpuTimeout(stage: String)
 
     public var description: String {
         switch self {
@@ -52,7 +57,137 @@ public enum MetalBackendError: Error, CustomStringConvertible {
             return "invalid render plan: \(reason)"
         case let .commandFailed(reason):
             return "the render command failed: \(reason)"
+        case let .gpuTimeout(stage):
+            return "the GPU did not finish the stage '\(stage)' in time"
         }
+    }
+}
+
+// MARK: - The command context
+
+/// The command buffer of a render of the Metal backend.
+///
+/// The context owns the command buffer and the compute encoder of the
+/// render, and it waits for the completion of the command buffer with a
+/// **bounded** wait: a GPU that never finishes (a kernel that never
+/// terminates, a device that is lost) must not hang the process — the
+/// render fails with ``MetalBackendError/gpuTimeout(stage:)`` instead.
+///
+/// In the **diagnostic** mode (the environment variable
+/// `FILM_METAL_DIAGNOSTIC=1`), every pass is committed in its own command
+/// buffer and the time it took is printed (`METAL-STAGE <kernel> <ms>`):
+/// the log of the CI then shows exactly which kernel hangs.
+final class MetalCommandContext {
+
+    /// The queue of the commands.
+    private let queue: MTLCommandQueue
+    /// Whether every pass is committed on its own command buffer.
+    let diagnostic: Bool
+    /// The maximum time a command buffer may take, in seconds.
+    let timeout: TimeInterval
+    /// The command buffer of the render.
+    private var commandBuffer: MTLCommandBuffer?
+    /// The encoder of the render.
+    private var encoder: MTLComputeCommandEncoder?
+    /// The number of the committed stages.
+    private(set) var stageCount = 0
+
+    /// Creates the context of a render.
+    ///
+    /// - Parameters:
+    ///   - queue: the queue of the commands.
+    ///   - diagnostic: whether every pass is committed on its own.
+    ///   - timeout: the maximum time a command buffer may take.
+    init(queue: MTLCommandQueue, diagnostic: Bool, timeout: TimeInterval) {
+        self.queue = queue
+        self.diagnostic = diagnostic
+        self.timeout = timeout
+    }
+
+    /// The encoder of the render.
+    ///
+    /// - Returns: the encoder, created on the first call.
+    func encoder() throws -> MTLComputeCommandEncoder {
+        if let encoder { return encoder }
+        guard let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw MetalBackendError.commandFailed("the command buffer could not be created")
+        }
+        self.commandBuffer = commandBuffer
+        self.encoder = encoder
+        return encoder
+    }
+
+    /// Commits the current command buffer and waits for its completion.
+    ///
+    /// - Parameter stage: the name of the stage (the name of the kernel),
+    ///   which is reported when the GPU does not finish.
+    func commit(stage: String) throws {
+        guard let commandBuffer, let encoder else { return }
+        encoder.endEncoding()
+        self.encoder = nil
+        self.commandBuffer = nil
+        let start = Date()
+        try Self.wait(
+            for: commandBuffer, timeout: timeout, stage: stage
+        )
+        stageCount += 1
+        if diagnostic {
+            let elapsed = Date().timeIntervalSince(start) * 1000
+            MetalCommandContext.log(
+                "METAL-STAGE \(stage) \(String(format: "%.3f", elapsed)) ms"
+            )
+        }
+    }
+
+    /// The completion of the render.
+    func finish() throws {
+        try commit(stage: "the render")
+    }
+
+    /// Waits for the completion of a command buffer, with a bounded wait.
+    ///
+    /// The wait is bounded: a command buffer that does not complete in
+    /// `timeout` seconds is a failure, not a hang.  The status and the
+    /// error of the command buffer are checked afterwards: an error of the
+    /// GPU (a fault of a kernel, a lost device) is reported with the
+    /// message of the driver, which is the difference between a *runtime*
+    /// failure and a *compilation* failure of the shaders.
+    ///
+    /// - Parameters:
+    ///   - commandBuffer: the command buffer to wait for.
+    ///   - timeout: the maximum time, in seconds.
+    ///   - stage: the name of the stage (reported in the errors).
+    private static func wait(
+        for commandBuffer: MTLCommandBuffer, timeout: TimeInterval, stage: String
+    ) throws {
+        let semaphore = DispatchSemaphore(value: 0)
+        commandBuffer.addCompletedHandler { _ in semaphore.signal() }
+        commandBuffer.commit()
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+            throw MetalBackendError.gpuTimeout(stage: stage)
+        }
+        if commandBuffer.status == .error {
+            throw MetalBackendError.commandFailed(
+                "the stage '\(stage)' failed: "
+                    + (commandBuffer.error.map { String(describing: $0) } ?? "unknown error")
+            )
+        }
+        guard commandBuffer.status == .completed else {
+            throw MetalBackendError.gpuTimeout(stage: stage)
+        }
+        if let error = commandBuffer.error {
+            throw MetalBackendError.commandFailed("the stage '\(stage)' failed: \(error)")
+        }
+    }
+
+    /// Prints a line on the standard error, unbuffered.
+    ///
+    /// The lines of the diagnostic mode must reach the log of the CI
+    /// immediately: the standard output of a test is block buffered when
+    /// it is piped.
+    static func log(_ line: String) {
+        FileHandle.standardError.write(Data((line + "\n").utf8))
     }
 }
 
@@ -74,14 +209,21 @@ final class MetalBufferPool {
     }
 
     /// Acquires a buffer of the pool.
-    func acquire() -> MTLBuffer {
+    ///
+    /// - Returns: the buffer.
+    /// - Throws: ``MetalBackendError/commandFailed(_:)`` when the device
+    ///   cannot allocate the buffer (the render fails instead of
+    ///   terminating the process).
+    func acquire() throws -> MTLBuffer {
         if let index = free.popLast() {
             return storage[index]
         }
         guard let buffer = device.makeBuffer(
             length: length, options: .storageModeShared
         ) else {
-            fatalError("the Metal device could not allocate a buffer of \(length) bytes")
+            throw MetalBackendError.commandFailed(
+                "the Metal device could not allocate a buffer of \(length) bytes"
+            )
         }
         storage.append(buffer)
         return buffer
@@ -155,6 +297,21 @@ public final class MetalBackend: FilmRenderBackend {
     /// not skip).
     public let initializationError: Error?
 
+    /// Whether the backend runs in the **diagnostic** mode.
+    ///
+    /// In that mode every pass of a render is committed in its own command
+    /// buffer and the time it took is printed (`METAL-STAGE <kernel> <ms>`),
+    /// so that the log shows exactly which kernel hangs.  The mode is
+    /// enabled by the environment variable `FILM_METAL_DIAGNOSTIC=1`.
+    public let diagnostic: Bool
+
+    /// The maximum time a command buffer of a render may take, in seconds.
+    ///
+    /// The default is 60 seconds; the environment variable
+    /// `FILM_METAL_TIMEOUT` overrides it.  The wait is **bounded**: a GPU
+    /// that never finishes must fail the render, not hang the process.
+    public let timeout: TimeInterval
+
     /// The compiled shader library.
     private let library: MTLLibrary?
     /// The compute pipeline states, by name.
@@ -170,6 +327,8 @@ public final class MetalBackend: FilmRenderBackend {
         guard let device, let queue = device.makeCommandQueue() else { return nil }
         self.device = device
         self.commandQueue = queue
+        self.diagnostic = MetalBackend.environmentFlag("FILM_METAL_DIAGNOSTIC")
+        self.timeout = MetalBackend.environmentTimeout("FILM_METAL_TIMEOUT")
         do {
             self.library = try MetalBackend.compileLibrary(device: device)
             self.initializationError = nil
@@ -177,6 +336,26 @@ public final class MetalBackend: FilmRenderBackend {
             self.library = nil
             self.initializationError = error
         }
+    }
+
+    /// Reads a flag of the environment.
+    ///
+    /// - Parameter name: the name of the variable.
+    /// - Returns: `true` when the variable is set to `1` or to `true`.
+    private static func environmentFlag(_ name: String) -> Bool {
+        guard let value = ProcessInfo.processInfo.environment[name] else { return false }
+        let value = value.trimmingCharacters(in: .whitespaces).lowercased()
+        return value == "1" || value == "true" || value == "yes"
+    }
+
+    /// Reads a timeout of the environment, in seconds.
+    ///
+    /// - Parameter name: the name of the variable.
+    /// - Returns: the timeout, or the default of 60 seconds.
+    private static func environmentTimeout(_ name: String) -> TimeInterval {
+        guard let value = ProcessInfo.processInfo.environment[name],
+              let timeout = TimeInterval(value), timeout > 0 else { return 60 }
+        return timeout
     }
 
     /// Compiles the shader library of the package.
@@ -286,10 +465,12 @@ public final class MetalBackend: FilmRenderBackend {
         }
         let count = width * height * 3
 
-        guard let commandBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeComputeCommandEncoder() else {
-            throw MetalBackendError.commandFailed("the command buffer could not be created")
-        }
+        // The command buffer of the render.  In the diagnostic mode every
+        // pass is committed on its own command buffer (the log then shows
+        // the time of every kernel).
+        let context = MetalCommandContext(
+            queue: commandQueue, diagnostic: diagnostic, timeout: timeout
+        )
 
         let planBuffers = try MetalPlanBuffers(
             plan: plan, width: width, height: height, device: device
@@ -316,18 +497,18 @@ public final class MetalBackend: FilmRenderBackend {
         )
 
         // --- the filming stage ------------------------------------------
-        let raw = pool.acquire()
+        let raw = try pool.acquire()
         try dispatch(
-            encoder, "filmSpectralUpsample",
+            context, "filmSpectralUpsample",
             [input, raw, planBuffers.inputMatrix, planBuffers.tcLUT, planBuffers.params],
             library: library, width: width, height: height
         )
 
         var current = raw
         if plan.boostActive {
-            let boosted = pool.acquire()
+            let boosted = try pool.acquire()
             try applyHighlightBoost(
-                encoder, source: current, destination: boosted, plan: plan,
+                context, source: current, destination: boosted, plan: plan,
                 planBuffers: planBuffers, library: library, width: width, height: height
             )
             current = boosted
@@ -341,9 +522,9 @@ public final class MetalBackend: FilmRenderBackend {
             height: height
         )
         if let cameraFilter {
-            let filtered = pool.acquire()
+            let filtered = try pool.acquire()
             try applyDiffusionFilter(
-                encoder, source: current, destination: filtered, filter: cameraFilter,
+                context, source: current, destination: filtered, filter: cameraFilter,
                 scatter: DiffusionFilter.scatterFraction(
                     strength: plan.params.camera.diffusionFilter.strength,
                     family: plan.params.camera.diffusionFilter.filterFamily
@@ -357,9 +538,9 @@ public final class MetalBackend: FilmRenderBackend {
         if plan.params.camera.lensBlurUM > 0, pixelSizeUM > 0 {
             let sigma = plan.params.camera.lensBlurUM / pixelSizeUM
             if sigma > 0 {
-                let blurred = pool.acquire()
+                let blurred = try pool.acquire()
                 try applyBlur(
-                    encoder, source: current, destination: blurred, sigmas: [sigma],
+                    context, source: current, destination: blurred, sigmas: [sigma],
                     width: width, height: height, library: library, pool: pool
                 )
                 current = blurred
@@ -368,9 +549,9 @@ public final class MetalBackend: FilmRenderBackend {
 
         // The scatter and the back reflection halation.
         if plan.params.filmRender.halation.active, pixelSizeUM > 0 {
-            let bloomed = pool.acquire()
+            let bloomed = try pool.acquire()
             try applyHalation(
-                encoder, source: current, destination: bloomed,
+                context, source: current, destination: bloomed,
                 params: plan.params.filmRender.halation, pixelSizeUM: pixelSizeUM,
                 width: width, height: height, library: library, pool: pool
             )
@@ -378,9 +559,9 @@ public final class MetalBackend: FilmRenderBackend {
         }
 
         // The log exposure of the negative.
-        let logEFilm = pool.acquire()
+        let logEFilm = try pool.acquire()
         try dispatch(
-            encoder, "filmLinearToLog",
+            context, "filmLinearToLog",
             [
                 current,
                 logEFilm,
@@ -394,18 +575,18 @@ public final class MetalBackend: FilmRenderBackend {
         )
 
         // --- the development of the negative ------------------------------
-        let density = pool.acquire()
+        let density = try pool.acquire()
         try dispatch(
-            encoder, "filmFilmDensity",
+            context, "filmFilmDensity",
             [logEFilm, density, planBuffers.filmCurve, planBuffers.params],
             library: library, width: width, height: height
         )
 
         var cmyFilm = density
         if plan.couplersActive {
-            let correction = pool.acquire()
+            let correction = try pool.acquire()
             try dispatch(
-                encoder, "filmCouplerCorrection",
+                context, "filmCouplerCorrection",
                 [density, correction, planBuffers.coupler, planBuffers.params],
                 library: library, width: width, height: height
             )
@@ -416,20 +597,20 @@ public final class MetalBackend: FilmRenderBackend {
             if couplers.diffusionSizeUM > 0, pixelSizeUM > 0 {
                 let diffusionSize = couplers.diffusionSizeUM / pixelSizeUM
                 let tailSize = couplers.diffusionTailUM / pixelSizeUM
-                let gaussian = pool.acquire()
+                let gaussian = try pool.acquire()
                 try applyBlur(
-                    encoder, source: correction, destination: gaussian,
+                    context, source: correction, destination: gaussian,
                     sigmas: [diffusionSize], width: width, height: height,
                     library: library, pool: pool
                 )
-                let tail = pool.acquire()
+                let tail = try pool.acquire()
                 try applyExponentialFilter(
-                    encoder, source: correction, destination: tail, decay: [tailSize],
+                    context, source: correction, destination: tail, decay: [tailSize],
                     width: width, height: height, library: library, pool: pool
                 )
-                let combined = pool.acquire()
+                let combined = try pool.acquire()
                 try dispatch(
-                    encoder, "filmCombine2",
+                    context, "filmCombine2",
                     [
                         gaussian,
                         tail,
@@ -448,9 +629,9 @@ public final class MetalBackend: FilmRenderBackend {
                 diffused = combined
             }
 
-            let coupled = pool.acquire()
+            let coupled = try pool.acquire()
             try dispatch(
-                encoder, "filmFilmDensityCoupled",
+                context, "filmFilmDensityCoupled",
                 [
                     logEFilm,
                     diffused,
@@ -485,11 +666,11 @@ public final class MetalBackend: FilmRenderBackend {
                 seed: plan.params.stochastic.seed,
                 device: device
             )
-            let cyan = pool.acquire()
-            let magenta = pool.acquire()
-            let yellow = pool.acquire()
+            let cyan = try pool.acquire()
+            let magenta = try pool.acquire()
+            let yellow = try pool.acquire()
             try dispatch(
-                encoder, "filmGrainLayers",
+                context, "filmGrainLayers",
                 [
                     cmyFilm,
                     cyan,
@@ -513,9 +694,9 @@ public final class MetalBackend: FilmRenderBackend {
                 let sigmas = (0..<FilmGrainPlan.layerCount).map { layer in
                     Double(grainPlan.blurSigma[layer * FilmGrainPlan.channelCount + colour])
                 }
-                let blurred = pool.acquire()
+                let blurred = try pool.acquire()
                 try applyBlur(
-                    encoder, source: layers[colour], destination: blurred,
+                    context, source: layers[colour], destination: blurred,
                     sigmas: sigmas, width: width, height: height,
                     library: library, pool: pool
                 )
@@ -523,38 +704,38 @@ public final class MetalBackend: FilmRenderBackend {
             }
 
             // The sum of the layers.
-            var sum = pool.acquire()
+            var sum = try pool.acquire()
             try dispatch(
-                encoder, "filmGrainSumLayers",
+                context, "filmGrainSumLayers",
                 [layers[0], layers[1], layers[2], sum, planBuffers.params],
                 library: library, width: width, height: height
             )
 
             // The micro structure of the emulsion.
-            let clumping = pool.acquire()
+            let clumping = try pool.acquire()
             try dispatch(
-                encoder, "filmGrainClumping",
+                context, "filmGrainClumping",
                 [clumping, grainBuffers.clumpingParams],
                 library: library, width: width, height: height
             )
             if Double(grainPlan.microStructureBlur) > 0.4 {
-                let blurred = pool.acquire()
+                let blurred = try pool.acquire()
                 try applyBlur(
-                    encoder, source: clumping, destination: blurred,
+                    context, source: clumping, destination: blurred,
                     sigmas: [Double(grainPlan.microStructureBlur)],
                     width: width, height: height, library: library, pool: pool
                 )
-                let multiplied = pool.acquire()
+                let multiplied = try pool.acquire()
                 try dispatch(
-                    encoder, "filmCombineMultiply",
+                    context, "filmCombineMultiply",
                     [sum, blurred, multiplied, planBuffers.params],
                     library: library, width: width, height: height
                 )
                 sum = multiplied
             } else {
-                let multiplied = pool.acquire()
+                let multiplied = try pool.acquire()
                 try dispatch(
-                    encoder, "filmCombineMultiply",
+                    context, "filmCombineMultiply",
                     [sum, clumping, multiplied, planBuffers.params],
                     library: library, width: width, height: height
                 )
@@ -562,18 +743,18 @@ public final class MetalBackend: FilmRenderBackend {
             }
 
             // The removal of the minimum density.
-            var grained = pool.acquire()
+            var grained = try pool.acquire()
             try dispatch(
-                encoder, "filmGrainFinalize",
+                context, "filmGrainFinalize",
                 [sum, grainBuffers.densityMin, grained, planBuffers.params],
                 library: library, width: width, height: height
             )
 
             // The final blur of the grain.
             if grainParams.blur > 0 {
-                let blurred = pool.acquire()
+                let blurred = try pool.acquire()
                 try applyBlur(
-                    encoder, source: grained, destination: blurred,
+                    context, source: grained, destination: blurred,
                     sigmas: [grainParams.blur], width: width, height: height,
                     library: library, pool: pool
                 )
@@ -589,9 +770,9 @@ public final class MetalBackend: FilmRenderBackend {
         var cmyPrintBuffer: MTLBuffer?
         var cmyPrint = cmyFilm
         if !plan.scanFilm {
-            let rawPrint = pool.acquire()
+            let rawPrint = try pool.acquire()
             try dispatch(
-                encoder, "filmPrintingExposure",
+                context, "filmPrintingExposure",
                 [
                     cmyFilm,
                     rawPrint,
@@ -614,9 +795,9 @@ public final class MetalBackend: FilmRenderBackend {
             )
             var printed = rawPrint
             if let enlargerFilter {
-                let filtered = pool.acquire()
+                let filtered = try pool.acquire()
                 try applyDiffusionFilter(
-                    encoder, source: rawPrint, destination: filtered, filter: enlargerFilter,
+                    context, source: rawPrint, destination: filtered, filter: enlargerFilter,
                     scatter: DiffusionFilter.scatterFraction(
                         strength: plan.params.enlarger.diffusionFilter.strength,
                         family: plan.params.enlarger.diffusionFilter.filterFamily
@@ -627,10 +808,10 @@ public final class MetalBackend: FilmRenderBackend {
             }
 
             // The log exposure of the paper.
-            let logEPrint = pool.acquire()
+            let logEPrint = try pool.acquire()
             logEPrintBuffer = logEPrint
             try dispatch(
-                encoder, "filmLinearToLog",
+                context, "filmLinearToLog",
                 [
                     printed,
                     logEPrint,
@@ -646,10 +827,10 @@ public final class MetalBackend: FilmRenderBackend {
             )
 
             // --- the development of the paper ----------------------------------
-            let developed = pool.acquire()
+            let developed = try pool.acquire()
             cmyPrintBuffer = developed
             try dispatch(
-                encoder, "filmPrintDensity",
+                context, "filmPrintDensity",
                 [logEPrint, developed, planBuffers.printCurve, planBuffers.params],
                 library: library, width: width, height: height
             )
@@ -657,9 +838,9 @@ public final class MetalBackend: FilmRenderBackend {
         }
 
         // --- the scanning stage --------------------------------------------
-        var xyz = pool.acquire()
+        var xyz = try pool.acquire()
         try dispatch(
-            encoder, "filmScanXYZ",
+            context, "filmScanXYZ",
             [
                 cmyPrint,
                 xyz,
@@ -675,9 +856,9 @@ public final class MetalBackend: FilmRenderBackend {
         // The glare of the print, added to the tristimulus values.
         let glare = plan.params.printRender.glare
         if glare.active, glare.percent > 0 {
-            let field = pool.acquire()
+            let field = try pool.acquire()
             try dispatch(
-                encoder, "filmGlareField",
+                context, "filmGlareField",
                 [
                     field,
                     try smallBuffer(
@@ -696,9 +877,9 @@ public final class MetalBackend: FilmRenderBackend {
             )
             var blurred = field
             if glare.blur > 0 {
-                let destination = pool.acquire()
+                let destination = try pool.acquire()
                 try applyBlur(
-                    encoder, source: field, destination: destination,
+                    context, source: field, destination: destination,
                     sigmas: [glare.blur], width: width, height: height,
                     library: library, pool: pool
                 )
@@ -723,9 +904,9 @@ public final class MetalBackend: FilmRenderBackend {
                     "the buffer of the illuminant could not be allocated"
                 )
             }
-            let glared = pool.acquire()
+            let glared = try pool.acquire()
             try dispatch(
-                encoder, "filmGlareApply",
+                context, "filmGlareApply",
                 [
                     xyz,
                     blurred,
@@ -738,18 +919,18 @@ public final class MetalBackend: FilmRenderBackend {
             xyz = glared
         }
 
-        var rgb = pool.acquire()
+        var rgb = try pool.acquire()
         try dispatch(
-            encoder, "filmXYZToRGB",
+            context, "filmXYZToRGB",
             [xyz, rgb, planBuffers.xyzToRGB, planBuffers.params],
             library: library, width: width, height: height
         )
 
         // The output gamut compression.
         if let cMax = planBuffers.cMax {
-            let compressed = pool.acquire()
+            let compressed = try pool.acquire()
             try dispatch(
-                encoder, "filmGamutCompress",
+                context, "filmGamutCompress",
                 [
                     rgb,
                     compressed,
@@ -765,9 +946,9 @@ public final class MetalBackend: FilmRenderBackend {
 
         // The lens blur of the scanner.
         if plan.params.scanner.lensBlur > 0 {
-            let blurred = pool.acquire()
+            let blurred = try pool.acquire()
             try applyBlur(
-                encoder, source: rgb, destination: blurred,
+                context, source: rgb, destination: blurred,
                 sigmas: [plan.params.scanner.lensBlur],
                 width: width, height: height, library: library, pool: pool
             )
@@ -778,14 +959,14 @@ public final class MetalBackend: FilmRenderBackend {
         let unsharpAmount = plan.params.scanner.unsharpMaskAmount
         let unsharpSigma = plan.params.scanner.unsharpMaskSigma
         if unsharpSigma > 0, unsharpAmount > 0 {
-            let blurred = pool.acquire()
+            let blurred = try pool.acquire()
             try applyBlur(
-                encoder, source: rgb, destination: blurred, sigmas: [unsharpSigma],
+                context, source: rgb, destination: blurred, sigmas: [unsharpSigma],
                 width: width, height: height, library: library, pool: pool
             )
-            let sharpened = pool.acquire()
+            let sharpened = try pool.acquire()
             try dispatch(
-                encoder, "filmCombine2",
+                context, "filmCombine2",
                 [
                     rgb,
                     blurred,
@@ -805,19 +986,16 @@ public final class MetalBackend: FilmRenderBackend {
         }
 
         // The output transfer function.
-        let output = pool.acquire()
+        let output = try pool.acquire()
         try dispatch(
-            encoder, "filmEncodeOutput",
+            context, "filmEncodeOutput",
             [rgb, output, planBuffers.srgbToSRGB, planBuffers.params],
             library: library, width: width, height: height
         )
 
-        encoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        if let error = commandBuffer.error {
-            throw MetalBackendError.commandFailed(String(describing: error))
-        }
+        // The completion of the render: the wait is bounded, and the
+        // status and the error of the command buffer are checked.
+        try context.finish()
 
         // The read back.
         let contents = output.contents().bindMemory(to: Float.self, capacity: count)
@@ -860,8 +1038,13 @@ public final class MetalBackend: FilmRenderBackend {
     // MARK: - The passes
 
     /// Encodes a compute dispatch of the chain.
+    ///
+    /// In the diagnostic mode the pass is committed on its own command
+    /// buffer: the log then shows the time of every kernel, and a kernel
+    /// that hangs is reported (with its name) instead of hanging the
+    /// whole render.
     private func dispatch(
-        _ encoder: MTLComputeCommandEncoder,
+        _ context: MetalCommandContext,
         _ name: String,
         _ buffers: [MTLBuffer],
         library: MTLLibrary,
@@ -869,6 +1052,7 @@ public final class MetalBackend: FilmRenderBackend {
         height: Int
     ) throws {
         let state = try pipeline(named: name, library: library)
+        let encoder = try context.encoder()
         encoder.setComputePipelineState(state)
         for (index, buffer) in buffers.enumerated() {
             encoder.setBuffer(buffer, offset: 0, index: index)
@@ -880,6 +1064,9 @@ public final class MetalBackend: FilmRenderBackend {
             MTLSize(width: totalWidth, height: totalHeight, depth: 1),
             threadsPerThreadgroup: MTLSize(width: group, height: group, depth: 1)
         )
+        if context.diagnostic {
+            try context.commit(stage: name)
+        }
     }
 
     /// The width of the thread groups of a pipeline.
@@ -935,7 +1122,7 @@ public final class MetalBackend: FilmRenderBackend {
 
     /// The highlight boost of the negative.
     private func applyHighlightBoost(
-        _ encoder: MTLComputeCommandEncoder,
+        _ context: MetalCommandContext,
         source: MTLBuffer,
         destination: MTLBuffer,
         plan: FilmRenderPlan,
@@ -965,6 +1152,7 @@ public final class MetalBackend: FilmRenderBackend {
             "the threads of the reduction must be a whole number of thread groups"
         )
         let partialState = try pipeline(named: "filmReduceMaxPartial", library: library)
+        let encoder = try context.encoder()
         encoder.setComputePipelineState(partialState)
         encoder.setBuffer(source, offset: 0, index: 0)
         encoder.setBuffer(partials, offset: 0, index: 1)
@@ -973,20 +1161,29 @@ public final class MetalBackend: FilmRenderBackend {
             MTLSize(width: Self.reduceThreads, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: Self.reduceGroupThreads, height: 1, depth: 1)
         )
+        if context.diagnostic {
+            try context.commit(stage: "filmReduceMaxPartial")
+        }
 
         // The second stage of the reduction.
         let finalState = try pipeline(named: "filmReduceMaxFinal", library: library)
-        encoder.setComputePipelineState(finalState)
-        encoder.setBuffer(partials, offset: 0, index: 0)
-        encoder.setBuffer(maximum, offset: 0, index: 1)
-        encoder.dispatchThreads(
+        // The encoder is fetched again: in the diagnostic mode the first
+        // stage has been committed (and its encoder ended).
+        let finalEncoder = try context.encoder()
+        finalEncoder.setComputePipelineState(finalState)
+        finalEncoder.setBuffer(partials, offset: 0, index: 0)
+        finalEncoder.setBuffer(maximum, offset: 0, index: 1)
+        finalEncoder.dispatchThreads(
             MTLSize(width: 1, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
         )
+        if context.diagnostic {
+            try context.commit(stage: "filmReduceMaxFinal")
+        }
 
         // The boost itself.
         try dispatch(
-            encoder, "filmBoostHighlights",
+            context, "filmBoostHighlights",
             [source, destination, maximum, planBuffers.params],
             library: library, width: width, height: height
         )
@@ -994,7 +1191,7 @@ public final class MetalBackend: FilmRenderBackend {
 
     /// The separable Gaussian filter.
     private func applyBlur(
-        _ encoder: MTLComputeCommandEncoder,
+        _ context: MetalCommandContext,
         source: MTLBuffer,
         destination: MTLBuffer,
         sigmas: [Double],
@@ -1017,14 +1214,14 @@ public final class MetalBackend: FilmRenderBackend {
         ) else {
             throw MetalBackendError.commandFailed("a parameter buffer could not be allocated")
         }
-        let temporary = pool.acquire()
+        let temporary = try pool.acquire()
         try dispatch(
-            encoder, "filmBlurHorizontal",
+            context, "filmBlurHorizontal",
             [source, temporary, kernelBuffer, paramsBuffer],
             library: library, width: width, height: height
         )
         try dispatch(
-            encoder, "filmBlurVertical",
+            context, "filmBlurVertical",
             [temporary, destination, kernelBuffer, paramsBuffer],
             library: library, width: width, height: height
         )
@@ -1033,7 +1230,7 @@ public final class MetalBackend: FilmRenderBackend {
 
     /// The exponential surrogate of the isotropic 2D exponential PSF.
     private func applyExponentialFilter(
-        _ encoder: MTLComputeCommandEncoder,
+        _ context: MetalCommandContext,
         source: MTLBuffer,
         destination: MTLBuffer,
         decay: [Double],
@@ -1048,9 +1245,9 @@ public final class MetalBackend: FilmRenderBackend {
             let sigmas = decay.count == 1
                 ? [fit.sigmaRatio * decay[0], fit.sigmaRatio * decay[0], fit.sigmaRatio * decay[0]]
                 : decay.map { fit.sigmaRatio * $0 }
-            let component = pool.acquire()
+            let component = try pool.acquire()
             try applyBlur(
-                encoder, source: source, destination: component, sigmas: sigmas,
+                context, source: source, destination: component, sigmas: sigmas,
                 width: width, height: height, library: library, pool: pool
             )
             components.append(component)
@@ -1069,7 +1266,7 @@ public final class MetalBackend: FilmRenderBackend {
             throw MetalBackendError.commandFailed("a parameter buffer could not be allocated")
         }
         try dispatch(
-            encoder, "filmCombine3",
+            context, "filmCombine3",
             [components[0], components[1], components[2], destination, paramsBuffer],
             library: library, width: width, height: height
         )
@@ -1080,7 +1277,7 @@ public final class MetalBackend: FilmRenderBackend {
 
     /// The two dimensional convolution of a diffusion filter.
     private func applyDiffusionFilter(
-        _ encoder: MTLComputeCommandEncoder,
+        _ context: MetalCommandContext,
         source: MTLBuffer,
         destination: MTLBuffer,
         filter: (radius: Int, psf: [Float]),
@@ -1105,7 +1302,7 @@ public final class MetalBackend: FilmRenderBackend {
             throw MetalBackendError.commandFailed("a parameter buffer could not be allocated")
         }
         try dispatch(
-            encoder, "filmDiffusionFilter",
+            context, "filmDiffusionFilter",
             [source, destination, psfBuffer, paramsBuffer],
             library: library, width: width, height: height
         )
@@ -1113,7 +1310,7 @@ public final class MetalBackend: FilmRenderBackend {
 
     /// The in emulsion scatter and the back reflection halation.
     private func applyHalation(
-        _ encoder: MTLComputeCommandEncoder,
+        _ context: MetalCommandContext,
         source: MTLBuffer,
         destination: MTLBuffer,
         params: HalationParams,
@@ -1137,9 +1334,9 @@ public final class MetalBackend: FilmRenderBackend {
         if params.scatterAmount > 0, hasCore || hasTail {
             var core = current
             if hasCore {
-                let blurred = pool.acquire()
+                let blurred = try pool.acquire()
                 try applyBlur(
-                    encoder, source: current, destination: blurred,
+                    context, source: current, destination: blurred,
                     sigmas: corePixels.map { max($0, 1e-6) },
                     width: width, height: height, library: library, pool: pool
                 )
@@ -1147,15 +1344,15 @@ public final class MetalBackend: FilmRenderBackend {
             }
             var tail = current
             if hasTail {
-                let filtered = pool.acquire()
+                let filtered = try pool.acquire()
                 try applyExponentialFilter(
-                    encoder, source: current, destination: filtered,
+                    context, source: current, destination: filtered,
                     decay: tailPixels.map { max($0, 1e-6) },
                     width: width, height: height, library: library, pool: pool
                 )
                 tail = filtered
             }
-            let scattered = pool.acquire()
+            let scattered = try pool.acquire()
             let tailWeight = params.scatterTailWeight
             var combineParams = FilmCombineParams(
                 width: width,
@@ -1172,7 +1369,7 @@ public final class MetalBackend: FilmRenderBackend {
                 throw MetalBackendError.commandFailed("a parameter buffer could not be allocated")
             }
             try dispatch(
-                encoder, "filmScatterCombine",
+                context, "filmScatterCombine",
                 [current, core, tail, scattered, paramsBuffer],
                 library: library, width: width, height: height
             )
@@ -1201,9 +1398,9 @@ public final class MetalBackend: FilmRenderBackend {
             var componentWeights: [Float] = []
             for index in 0..<bounces {
                 let sigma = sigmaPixels.map { max($0 * sqrt(Double(index + 1)), 1e-6) }
-                let component = pool.acquire()
+                let component = try pool.acquire()
                 try applyBlur(
-                    encoder, source: current, destination: component, sigmas: sigma,
+                    context, source: current, destination: component, sigmas: sigma,
                     width: width, height: height, library: library, pool: pool
                 )
                 components.append(component)
@@ -1227,9 +1424,9 @@ public final class MetalBackend: FilmRenderBackend {
             ) else {
                 throw MetalBackendError.commandFailed("a parameter buffer could not be allocated")
             }
-            let bloom = pool.acquire()
+            let bloom = try pool.acquire()
             try dispatch(
-                encoder, "filmCombine3",
+                context, "filmCombine3",
                 [components[0], components[1], components[2], bloom, paramsBuffer],
                 library: library, width: width, height: height
             )
@@ -1251,7 +1448,7 @@ public final class MetalBackend: FilmRenderBackend {
                 throw MetalBackendError.commandFailed("a parameter buffer could not be allocated")
             }
             try dispatch(
-                encoder, "filmHalationCombine",
+                context, "filmHalationCombine",
                 [current, bloom, destination, halationBuffer],
                 library: library, width: width, height: height
             )
@@ -1259,7 +1456,7 @@ public final class MetalBackend: FilmRenderBackend {
             // Without the halation the image is unchanged: the destination is
             // filled with the source by a copy pass.
             try dispatch(
-                encoder, "filmCombine2",
+                context, "filmCombine2",
                 [
                     current,
                     current,
