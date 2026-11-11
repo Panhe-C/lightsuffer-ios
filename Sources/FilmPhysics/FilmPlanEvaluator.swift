@@ -132,50 +132,58 @@ public enum FilmPlanEvaluator {
         }
 
         // --- the printing stage -------------------------------------------
+        // The direct scan path (`io.scan_film`) skips the printing stage
+        // entirely: the negative is scanned as it is.
         let wavelengths = plan.filmBaseDensity.count
-        var logEPrint = [Double](repeating: 0, count: pixels * 3)
+        var logEPrint = [Double](repeating: 0, count: plan.scanFilm ? 0 : pixels * 3)
+        var cmyPrint = [Double](repeating: 0, count: plan.scanFilm ? 0 : pixels * 3)
         var light = [Double](repeating: 0, count: wavelengths)
-        for pixel in 0..<pixels {
-            for wavelength in 0..<wavelengths {
-                var density = Double(plan.filmBaseDensity[wavelength])
-                for channel in 0..<3 {
-                    density += cmyFilm[pixel * 3 + channel]
-                        * Double(plan.filmChannelDensity[wavelength * 3 + channel])
-                }
-                let value = pow(10.0, -density) * Double(plan.printIlluminant[wavelength])
-                light[wavelength] = value.isNaN ? 0 : value
-            }
-            for channel in 0..<3 {
-                var total = 0.0
+        if !plan.scanFilm {
+            for pixel in 0..<pixels {
                 for wavelength in 0..<wavelengths {
-                    total += light[wavelength] * Double(plan.printSensitivity[wavelength * 3 + channel])
+                    var density = Double(plan.filmBaseDensity[wavelength])
+                    for channel in 0..<3 {
+                        density += cmyFilm[pixel * 3 + channel]
+                            * Double(plan.filmChannelDensity[wavelength * 3 + channel])
+                    }
+                    let value = pow(10.0, -density) * Double(plan.printIlluminant[wavelength])
+                    light[wavelength] = value.isNaN ? 0 : value
                 }
-                let rawPrint = total * Double(plan.exposureFactor) + Double(plan.preflash[channel])
-                let linear = (Swift.max(rawPrint, 0.0) + 1e-10)
-                    * Double(plan.printExposure)
-                    * Double(plan.printingExposureCorrection)
-                logEPrint[pixel * 3 + channel] = log10(Swift.max(linear, 0.0) + 1e-10)
+                for channel in 0..<3 {
+                    var total = 0.0
+                    for wavelength in 0..<wavelengths {
+                        total += light[wavelength] * Double(plan.printSensitivity[wavelength * 3 + channel])
+                    }
+                    let rawPrint = total * Double(plan.exposureFactor) + Double(plan.preflash[channel])
+                    let linear = (Swift.max(rawPrint, 0.0) + 1e-10)
+                        * Double(plan.printExposure)
+                        * Double(plan.printingExposureCorrection)
+                    logEPrint[pixel * 3 + channel] = log10(Swift.max(linear, 0.0) + 1e-10)
+                }
             }
-        }
 
-        // --- the development of the paper ----------------------------------
-        var cmyPrint = [Double](repeating: 0, count: pixels * 3)
-        for pixel in 0..<pixels {
-            for channel in 0..<3 {
-                cmyPrint[pixel * 3 + channel] = plan.printCurve.sample(
-                    logEPrint[pixel * 3 + channel], channel: channel
-                )
+            // --- the development of the paper ----------------------------------
+            for pixel in 0..<pixels {
+                for channel in 0..<3 {
+                    cmyPrint[pixel * 3 + channel] = plan.printCurve.sample(
+                        logEPrint[pixel * 3 + channel], channel: channel
+                    )
+                }
             }
         }
 
         // --- the scanning stage --------------------------------------------
+        // The densities that are scanned: the densities of the paper of the
+        // print and scan path, the densities of the negative itself of the
+        // direct scan path.
+        let scanned = plan.scanFilm ? cmyFilm : cmyPrint
         var xyz = [Double](repeating: 0, count: pixels * 3)
         for pixel in 0..<pixels {
             for wavelength in 0..<wavelengths {
-                var density = Double(plan.printBaseDensity[wavelength])
+                var density = Double(plan.scanBaseDensity[wavelength])
                 for channel in 0..<3 {
-                    density += cmyPrint[pixel * 3 + channel]
-                        * Double(plan.printChannelDensity[wavelength * 3 + channel])
+                    density += scanned[pixel * 3 + channel]
+                        * Double(plan.scanChannelDensity[wavelength * 3 + channel])
                 }
                 let value = pow(10.0, -density) * Double(plan.scanIlluminant[wavelength])
                 light[wavelength] = value.isNaN ? 0 : value
@@ -243,8 +251,16 @@ public enum FilmPlanEvaluator {
         return FilmPlanTaps(
             logEFilm: RGBImage(width: rgbIn.width, height: rgbIn.height, data: logEFilm),
             cmyFilm: RGBImage(width: rgbIn.width, height: rgbIn.height, data: cmyFilm),
-            logEPrint: RGBImage(width: rgbIn.width, height: rgbIn.height, data: logEPrint),
-            cmyPrint: RGBImage(width: rgbIn.width, height: rgbIn.height, data: cmyPrint),
+            logEPrint: RGBImage(
+                width: plan.scanFilm ? 0 : rgbIn.width,
+                height: plan.scanFilm ? 0 : rgbIn.height,
+                data: logEPrint
+            ),
+            cmyPrint: RGBImage(
+                width: plan.scanFilm ? 0 : rgbIn.width,
+                height: plan.scanFilm ? 0 : rgbIn.height,
+                data: cmyPrint
+            ),
             rgbOut: RGBImage(width: rgbIn.width, height: rgbIn.height, data: rgb)
         )
     }

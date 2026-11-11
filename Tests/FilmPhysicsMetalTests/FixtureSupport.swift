@@ -13,6 +13,7 @@
 //  This file is part of a GPLv3 licensed project; see LICENSE at the repo root.
 //
 
+#if canImport(Metal)
 import Foundation
 import XCTest
 
@@ -225,3 +226,5 @@ func meanAbsoluteDifference(_ lhs: [Double], _ rhs: [Double]) -> Double {
     }
     return sum / Double(lhs.count)
 }
+
+#endif

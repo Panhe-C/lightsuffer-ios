@@ -8,6 +8,7 @@
 //  This file is part of a GPLv3 licensed project; see LICENSE at the repo root.
 //
 
+#if canImport(Metal)
 import Foundation
 import XCTest
 import FilmPhysics
@@ -294,3 +295,5 @@ func makePipelineParams(
         )
     )
 }
+
+#endif

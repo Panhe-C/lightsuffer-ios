@@ -94,6 +94,40 @@ final class MetalBufferPool {
     }
 }
 
+// MARK: - The taps
+
+/// The taps of a render of the Metal backend.
+///
+/// The taps are the same as the ones of the CPU reference (``FilmTaps``):
+/// they are the intermediate results of the chain, which the tests compare
+/// with the ones of the CPU.
+public struct MetalRenderTaps: Sendable {
+    /// The log10 exposure of the negative.
+    public var logEFilm: RGBImage
+    /// The developed densities of the negative (with the grain).
+    public var cmyFilm: RGBImage
+    /// The log10 exposure of the paper (empty on the direct scan path).
+    public var logEPrint: RGBImage
+    /// The developed densities of the print (empty on the direct scan path).
+    public var cmyPrint: RGBImage
+    /// The scanned and encoded print.
+    public var rgbOut: RGBImage
+
+    public init(
+        logEFilm: RGBImage,
+        cmyFilm: RGBImage,
+        logEPrint: RGBImage,
+        cmyPrint: RGBImage,
+        rgbOut: RGBImage
+    ) {
+        self.logEFilm = logEFilm
+        self.cmyFilm = cmyFilm
+        self.logEPrint = logEPrint
+        self.cmyPrint = cmyPrint
+        self.rgbOut = rgbOut
+    }
+}
+
 // MARK: - The backend
 
 /// The Metal implementation of ``FilmRenderBackend``.
@@ -207,7 +241,7 @@ public final class MetalBackend: FilmRenderBackend {
     /// - Returns: the scanned print.
     public func render(_ image: RGBImage, params: PipelineParams) throws -> RGBImage {
         let plan = try FilmRenderPlan.build(params: params)
-        return try render(image, plan: plan)
+        return try render(image, plan: plan).rgbOut
     }
 
     /// Renders an image with a precomputed plan.
@@ -215,15 +249,19 @@ public final class MetalBackend: FilmRenderBackend {
     /// - Parameters:
     ///   - image: the camera image, in the input colourspace of the plan.
     ///   - plan: the precomputed data of the render.
-    /// - Returns: the scanned print.
-    public func render(_ image: RGBImage, plan: FilmRenderPlan) throws -> RGBImage {
+    /// - Returns: the taps of the render.
+    public func render(_ image: RGBImage, plan: FilmRenderPlan) throws -> MetalRenderTaps {
         guard let library else {
             throw initializationError ?? MetalBackendError.noDevice
         }
         let width = image.width
         let height = image.height
         guard width > 0, height > 0 else {
-            return RGBImage(width: 0, height: 0, data: [])
+            let empty = RGBImage(width: 0, height: 0, data: [])
+            return MetalRenderTaps(
+                logEFilm: empty, cmyFilm: empty, logEPrint: empty, cmyPrint: empty,
+                rgbOut: empty
+            )
         }
         guard image.data.count == width * height * 3 else {
             throw PipelineError.invalidImageData(
@@ -410,85 +448,280 @@ public final class MetalBackend: FilmRenderBackend {
             cmyFilm = coupled
         }
 
-        // --- the printing stage -------------------------------------------
-        let rawPrint = pool.acquire()
-        try dispatch(
-            encoder, "filmPrintingExposure",
-            [
-                cmyFilm,
-                rawPrint,
-                planBuffers.filmChannelDensity,
-                planBuffers.filmBaseDensity,
-                planBuffers.printSensitivity,
-                planBuffers.printIlluminant,
-                planBuffers.preflash,
-                planBuffers.params,
-            ],
-            library: library, width: width, height: height
-        )
-
-        // The diffusion filter of the enlarger.
-        let enlargerFilter = MetalKernels.diffusionFilter(
-            params: plan.params.enlarger.diffusionFilter,
-            pixelSizeUM: pixelSizeUM,
-            width: width,
-            height: height
-        )
-        var printed = rawPrint
-        if let enlargerFilter {
-            let filtered = pool.acquire()
-            try applyDiffusionFilter(
-                encoder, source: rawPrint, destination: filtered, filter: enlargerFilter,
-                scatter: DiffusionFilter.scatterFraction(
-                    strength: plan.params.enlarger.diffusionFilter.strength,
-                    family: plan.params.enlarger.diffusionFilter.filterFamily
-                ),
-                width: width, height: height, library: library, pool: pool
+        // --- the grain of the negative -------------------------------------
+        // The grain replaces the developed densities (the upstream does not
+        // add the grain to them).
+        let grainParams = plan.params.filmRender.grain
+        if grainParams.active {
+            guard grainParams.sublayersActive else {
+                throw MetalBackendError.invalidPlan(
+                    "the single layer model of the grain is not ported to the GPU"
+                )
+            }
+            let grainPlan = FilmGrainPlan.build(
+                grain: grainParams,
+                film: plan.params.film,
+                pixelSizeUM: pixelSizeUM
             )
-            printed = filtered
+            let grainBuffers = try MetalGrainBuffers(
+                plan: grainPlan,
+                width: width,
+                height: height,
+                seed: plan.params.stochastic.seed,
+                device: device
+            )
+            let cyan = pool.acquire()
+            let magenta = pool.acquire()
+            let yellow = pool.acquire()
+            try dispatch(
+                encoder, "filmGrainLayers",
+                [
+                    cmyFilm,
+                    cyan,
+                    magenta,
+                    yellow,
+                    grainBuffers.layerCurves,
+                    grainBuffers.normalisedCurves,
+                    grainBuffers.layerParameters,
+                    grainBuffers.uniformity,
+                    grainBuffers.seeds,
+                    grainBuffers.params,
+                ],
+                library: library, width: width, height: height
+            )
+
+            // The blur of the dye clouds: every layer is blurred with its
+            // own sigma, so the three layers of a channel are the three
+            // channels of an image.
+            var layers = [cyan, magenta, yellow]
+            for colour in 0..<3 {
+                let sigmas = (0..<FilmGrainPlan.layerCount).map { layer in
+                    Double(grainPlan.blurSigma[layer * FilmGrainPlan.channelCount + colour])
+                }
+                let blurred = pool.acquire()
+                try applyBlur(
+                    encoder, source: layers[colour], destination: blurred,
+                    sigmas: sigmas, width: width, height: height,
+                    library: library, pool: pool
+                )
+                layers[colour] = blurred
+            }
+
+            // The sum of the layers.
+            var sum = pool.acquire()
+            try dispatch(
+                encoder, "filmGrainSumLayers",
+                [layers[0], layers[1], layers[2], sum, planBuffers.params],
+                library: library, width: width, height: height
+            )
+
+            // The micro structure of the emulsion.
+            let clumping = pool.acquire()
+            try dispatch(
+                encoder, "filmGrainClumping",
+                [clumping, grainBuffers.clumpingParams],
+                library: library, width: width, height: height
+            )
+            if Double(grainPlan.microStructureBlur) > 0.4 {
+                let blurred = pool.acquire()
+                try applyBlur(
+                    encoder, source: clumping, destination: blurred,
+                    sigmas: [Double(grainPlan.microStructureBlur)],
+                    width: width, height: height, library: library, pool: pool
+                )
+                let multiplied = pool.acquire()
+                try dispatch(
+                    encoder, "filmCombineMultiply",
+                    [sum, blurred, multiplied, planBuffers.params],
+                    library: library, width: width, height: height
+                )
+                sum = multiplied
+            } else {
+                let multiplied = pool.acquire()
+                try dispatch(
+                    encoder, "filmCombineMultiply",
+                    [sum, clumping, multiplied, planBuffers.params],
+                    library: library, width: width, height: height
+                )
+                sum = multiplied
+            }
+
+            // The removal of the minimum density.
+            var grained = pool.acquire()
+            try dispatch(
+                encoder, "filmGrainFinalize",
+                [sum, grainBuffers.densityMin, grained, planBuffers.params],
+                library: library, width: width, height: height
+            )
+
+            // The final blur of the grain.
+            if grainParams.blur > 0 {
+                let blurred = pool.acquire()
+                try applyBlur(
+                    encoder, source: grained, destination: blurred,
+                    sigmas: [grainParams.blur], width: width, height: height,
+                    library: library, pool: pool
+                )
+                grained = blurred
+            }
+            cmyFilm = grained
         }
 
-        // The log exposure of the paper.
-        let logEPrint = pool.acquire()
-        try dispatch(
-            encoder, "filmLinearToLog",
-            [
-                printed,
-                logEPrint,
-                try smallBuffer(
-                    FilmExposureParams(
-                        width: width,
-                        height: height,
-                        scale: plan.printExposure * plan.printingExposureCorrection
-                    )
-                ),
-            ],
-            library: library, width: width, height: height
-        )
+        // --- the printing stage -------------------------------------------
+        // The direct scan path (`io.scan_film`) skips the printing stage:
+        // the negative is scanned as it is.
+        var logEPrintBuffer: MTLBuffer?
+        var cmyPrintBuffer: MTLBuffer?
+        var cmyPrint = cmyFilm
+        if !plan.scanFilm {
+            let rawPrint = pool.acquire()
+            try dispatch(
+                encoder, "filmPrintingExposure",
+                [
+                    cmyFilm,
+                    rawPrint,
+                    planBuffers.filmChannelDensity,
+                    planBuffers.filmBaseDensity,
+                    planBuffers.printSensitivity,
+                    planBuffers.printIlluminant,
+                    planBuffers.preflash,
+                    planBuffers.params,
+                ],
+                library: library, width: width, height: height
+            )
 
-        // --- the development of the paper ----------------------------------
-        let cmyPrint = pool.acquire()
-        try dispatch(
-            encoder, "filmPrintDensity",
-            [logEPrint, cmyPrint, planBuffers.printCurve, planBuffers.params],
-            library: library, width: width, height: height
-        )
+            // The diffusion filter of the enlarger.
+            let enlargerFilter = MetalKernels.diffusionFilter(
+                params: plan.params.enlarger.diffusionFilter,
+                pixelSizeUM: pixelSizeUM,
+                width: width,
+                height: height
+            )
+            var printed = rawPrint
+            if let enlargerFilter {
+                let filtered = pool.acquire()
+                try applyDiffusionFilter(
+                    encoder, source: rawPrint, destination: filtered, filter: enlargerFilter,
+                    scatter: DiffusionFilter.scatterFraction(
+                        strength: plan.params.enlarger.diffusionFilter.strength,
+                        family: plan.params.enlarger.diffusionFilter.filterFamily
+                    ),
+                    width: width, height: height, library: library, pool: pool
+                )
+                printed = filtered
+            }
+
+            // The log exposure of the paper.
+            let logEPrint = pool.acquire()
+            logEPrintBuffer = logEPrint
+            try dispatch(
+                encoder, "filmLinearToLog",
+                [
+                    printed,
+                    logEPrint,
+                    try smallBuffer(
+                        FilmExposureParams(
+                            width: width,
+                            height: height,
+                            scale: plan.printExposure * plan.printingExposureCorrection
+                        )
+                    ),
+                ],
+                library: library, width: width, height: height
+            )
+
+            // --- the development of the paper ----------------------------------
+            let developed = pool.acquire()
+            cmyPrintBuffer = developed
+            try dispatch(
+                encoder, "filmPrintDensity",
+                [logEPrint, developed, planBuffers.printCurve, planBuffers.params],
+                library: library, width: width, height: height
+            )
+            cmyPrint = developed
+        }
 
         // --- the scanning stage --------------------------------------------
-        let xyz = pool.acquire()
+        var xyz = pool.acquire()
         try dispatch(
             encoder, "filmScanXYZ",
             [
                 cmyPrint,
                 xyz,
-                planBuffers.printChannelDensity,
-                planBuffers.printBaseDensity,
+                planBuffers.scanChannelDensity,
+                planBuffers.scanBaseDensity,
                 planBuffers.scanIlluminant,
                 planBuffers.colourMatchingFunctions,
                 planBuffers.params,
             ],
             library: library, width: width, height: height
         )
+
+        // The glare of the print, added to the tristimulus values.
+        let glare = plan.params.printRender.glare
+        if glare.active, glare.percent > 0 {
+            let field = pool.acquire()
+            try dispatch(
+                encoder, "filmGlareField",
+                [
+                    field,
+                    try smallBuffer(
+                        FilmGlareParams(
+                            width: width,
+                            height: height,
+                            seed: UInt32(truncatingIfNeeded: StochasticSeed.glare(
+                                seed: plan.params.stochastic.seed
+                            )),
+                            mean: Float(glare.percent),
+                            std: Float(glare.roughness * glare.percent)
+                        )
+                    ),
+                ],
+                library: library, width: width, height: height
+            )
+            var blurred = field
+            if glare.blur > 0 {
+                let destination = pool.acquire()
+                try applyBlur(
+                    encoder, source: field, destination: destination,
+                    sigmas: [glare.blur], width: width, height: height,
+                    library: library, pool: pool
+                )
+                blurred = destination
+            }
+            let illuminant = Glare.illuminantXYZ(
+                scanIlluminant: plan.scanIlluminant.map { Double($0) },
+                colourMatchingFunctions: stride(
+                    from: 0, to: plan.colourMatchingFunctions.count, by: 3
+                ).map { offset in
+                    (0..<3).map { Double(plan.colourMatchingFunctions[offset + $0]) }
+                },
+                normalization: Double(plan.scanNormalization)
+            )
+            let illuminantValues = illuminant.map { Float($0) }
+            guard let illuminantBuffer = device.makeBuffer(
+                bytes: illuminantValues,
+                length: illuminantValues.count * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            ) else {
+                throw MetalBackendError.commandFailed(
+                    "the buffer of the illuminant could not be allocated"
+                )
+            }
+            let glared = pool.acquire()
+            try dispatch(
+                encoder, "filmGlareApply",
+                [
+                    xyz,
+                    blurred,
+                    illuminantBuffer,
+                    glared,
+                    planBuffers.params,
+                ],
+                library: library, width: width, height: height
+            )
+            xyz = glared
+        }
 
         var rgb = pool.acquire()
         try dispatch(
@@ -573,6 +806,28 @@ public final class MetalBackend: FilmRenderBackend {
 
         // The read back.
         let contents = output.contents().bindMemory(to: Float.self, capacity: count)
+        var values = [Double](repeating: 0, count: count)
+        for index in 0..<count {
+            values[index] = Double(contents[index])
+        }
+        let rgbOut = RGBImage(width: width, height: height, data: values)
+        return MetalRenderTaps(
+            logEFilm: readBack(logEFilm, width: width, height: height),
+            cmyFilm: readBack(cmyFilm, width: width, height: height),
+            logEPrint: logEPrintBuffer.map {
+                readBack($0, width: width, height: height)
+            } ?? RGBImage(width: 0, height: 0, data: []),
+            cmyPrint: cmyPrintBuffer.map {
+                readBack($0, width: width, height: height)
+            } ?? RGBImage(width: 0, height: 0, data: []),
+            rgbOut: rgbOut
+        )
+    }
+
+    /// Reads a buffer of the render back into an image.
+    private func readBack(_ buffer: MTLBuffer, width: Int, height: Int) -> RGBImage {
+        let count = width * height * 3
+        let contents = buffer.contents().bindMemory(to: Float.self, capacity: count)
         var values = [Double](repeating: 0, count: count)
         for index in 0..<count {
             values[index] = Double(contents[index])

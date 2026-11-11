@@ -269,11 +269,18 @@ public struct FilmRenderPlan: Sendable {
 
     // MARK: The scanning
 
-    /// The spectral density of the image forming layer of the paper,
-    /// `wavelength * 3 + channel`.
-    public var printChannelDensity: [Float]
-    /// The base density of the paper, one value per wavelength.
-    public var printBaseDensity: [Float]
+    /// The spectral density of the image forming layer of the **scanned**
+    /// emulsion, `wavelength * 3 + channel`.
+    ///
+    /// It is the paper of the print and scan path and the negative itself
+    /// of the direct scan path (`io.scan_film`).
+    public var scanChannelDensity: [Float]
+    /// The base density of the **scanned** emulsion, one value per
+    /// wavelength.
+    ///
+    /// It is the paper of the print and scan path and the negative itself
+    /// of the direct scan path (`io.scan_film`).
+    public var scanBaseDensity: [Float]
     /// The illuminant of the scanner, one value per wavelength.
     public var scanIlluminant: [Float]
     /// The CIE 1931 2° colour matching functions, `wavelength * 3 + component`.
@@ -313,6 +320,12 @@ public struct FilmRenderPlan: Sendable {
     public var gamutCompression: PlanGamutCompression?
 
     // MARK: The metadata
+
+    /// Whether the negative is scanned directly (the `io.scan_film` path).
+    ///
+    /// The printing stage is skipped on that path: the negative is scanned
+    /// as it is.
+    public var scanFilm: Bool
 
     /// The digested parameters of the render.
     public var params: PipelineParams
@@ -550,10 +563,20 @@ public struct FilmRenderPlan: Sendable {
         )
 
         // --- the scanning -----------------------------------------------
-        self.printChannelDensity = printProfile.data.channelDensity.flatMap {
-            $0.map { Float($0) }
+        // The emulsion that is scanned: the paper of the print and scan
+        // path, the negative itself of the direct scan path.
+        self.scanFilm = params.io.scanFilm
+        if params.io.scanFilm {
+            self.scanChannelDensity = film.data.channelDensity.flatMap {
+                $0.map { Float($0) }
+            }
+            self.scanBaseDensity = film.data.baseDensity.map { Float($0) }
+        } else {
+            self.scanChannelDensity = printProfile.data.channelDensity.flatMap {
+                $0.map { Float($0) }
+            }
+            self.scanBaseDensity = printProfile.data.baseDensity.map { Float($0) }
         }
-        self.printBaseDensity = printProfile.data.baseDensity.map { Float($0) }
         self.scanIlluminant = inputs.spectral.scanIlluminant.map { Float($0) }
         self.colourMatchingFunctions = inputs.spectral.colourMatchingFunctions.flatMap {
             $0.map { Float($0) }

@@ -1,0 +1,66 @@
+name: CI
+
+# The CI of the package: the CPU reference (Linux and macOS) and the Metal
+# port (macOS only, the GPU needs a Metal device).
+on:
+  push:
+    branches:
+      - main
+      - 'wip/**'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    name: macOS (the CPU reference and the Metal port)
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: The toolchain
+        run: |
+          swift --version
+          xcrun --show-sdk-path
+
+      - name: The Metal devices of the machine
+        run: |
+          system_profiler SPDisplaysDataType || true
+          # The name of the default Metal device, when there is one.
+          xcrun -sdk macosx metal --info 2>/dev/null || true
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        shell: bash
+        run: |
+          swift test 2>&1 | tee test.log
+          exit ${PIPESTATUS[0]}
+
+      - name: The log of the tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log
+          path: test.log
+          if-no-files-found: ignore
+
+      - name: The schemes of the package
+        run: xcodebuild -list
+
+      - name: The iOS build
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The scheme of the package: `xcodebuild -list` prints it under
+          # the "Schemes:" heading.
+          SCHEME="$(xcodebuild -list 2>/dev/null \
+            | awk '/Schemes:/ {found=1; next} found && NF {print $1; exit}')"
+          if [ -z "${SCHEME}" ]; then
+            SCHEME="lightsuffer-ios-Package"
+          fi
+          echo "the scheme of the package: ${SCHEME}"
+          xcodebuild -scheme "${SCHEME}" \
+            -destination 'generic/platform=iOS Simulator' build

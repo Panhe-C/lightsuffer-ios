@@ -17,7 +17,7 @@ back — not a set of baked LUTs.
 |---|---|---|
 | P1 | `FilmPhysics`: pure-Swift port of the spektrafilm pipeline (CPU reference), validated tap by tap against the Python engine | **in progress** (slices 1, 2 and 4 ported: profile loading, the hanatos 2025 spectral upsampling and the whole camera → print → scan chain, negative development with DIR couplers, enlarger printing, print development, scanning, the cam16ucs gamut compression and the whole stock catalogue — parity with the Python engine, mean ΔE2000 ≈ 0.0021) |
 | P2 | Spatial effects (halation, grain, DIR-coupler diffusion, diffusion filters, glare, blur, unsharp) | **in progress** (slice 5 ported: the highlight boost, the in-emulsion scatter, the back-reflection halation, the DIR-coupler diffusion, the four diffusion-filter families, the lens blurs and the unsharp mask — parity with the Python engine, mean ΔE2000 ≈ 0.0011. The **grain** and the **glare** are ported in slice 6 and validated statistically against the upstream) |
-| P3 | Metal port of the engine, parity-tested against the CPU reference | not started |
+| P3 | Metal port of the engine, parity-tested against the CPU reference | **phase 1 implemented** (`FilmPhysicsMetal`): the render plan, the pure-Swift plan evaluator and its `Float32` specification, 28 Metal kernels (the whole per-pixel chain, the spatial effects, the grain and the glare) and the `MetalBackend`. The plan and the kernels are validated on Linux against the CPU reference; **the Metal code itself is only compiled and run by the macOS CI** (nothing on Metal is validated until then) |
 | P4 | SwiftUI app shell (photo/RAW input, all parameters, export, borders) | not started |
 | P5 | Release | not started |
 
@@ -70,6 +70,17 @@ Sources/FilmPhysics/              pure-Swift physical engine (CPU reference)
   Pipeline.swift                  the slice 1 entry point (Slice1Pipeline)
   FilmPipeline.swift              the slice 2 entry point (FilmPipeline, rgb_in → rgb_out)
   Resources.swift                 the bundled upstream resources (spectra, CMFs, filters)
+  FilmRenderBackend.swift         the renderer protocol and the CPU reference backend
+  FilmRenderPlan.swift            the precomputed data of a render (the payload of the
+                                  GPU buffers, in Float32)
+  FilmPlanEvaluator.swift         the pure-Swift evaluation of the plan (the reference
+                                  the Metal kernels are validated against)
+  FilmPlanEvaluatorFloat32.swift  the Float32 evaluation of the plan: the executable
+                                  specification of the Metal kernels
+  FilmGrainPlan.swift             the plan of the grain and its pure-Swift reference
+                                  (the counter based generator of the GPU path)
+  FilmCounterRandom.swift         the counter based random number generator (the GPU
+                                  cannot draw from a sequential stream)
   Resources/profiles/             spektrafilm profile JSON (unmodified copies)
     kodak_portra_400.json         film    — CC BY-SA 4.0
     kodak_portra_endura.json       print   — CC BY-SA 4.0
@@ -101,6 +112,16 @@ Tests/FilmPhysicsTests/           Swift test target
   ProfileLoaderTests.swift        the loaded profile vs. the digested fixture data
   ColourTests.swift               sRGB / CIELAB / CIEDE2000 (Sharma test data)
   NumericsTests.swift             the numeric helpers
+Sources/FilmPhysicsMetal/         the Metal port of the engine (GPU)
+  MetalBackend.swift              the GPU implementation of the renderer protocol
+  MetalPlan.swift                 the structures the shaders read, the buffers of the
+                                  plan and the builders of the convolution kernels
+  Shaders/FilmShaders.metal       the 28 compute kernels (the chain, the spatial
+                                  effects, the grain and the glare)
+Tests/FilmPhysicsMetalTests/      the Metal test target (macOS only)
+  MetalParityTests.swift          the parity of the GPU against the CPU reference and
+                                  the timing of a 1024 x 1024 image
+  MetalAvailabilityTests.swift    the fallback on the platforms that have no Metal
 tools/
   gen_fixtures.py                 regenerates the reference fixtures
   README.md                       how to regenerate them
@@ -119,6 +140,14 @@ NOTICE                            attribution
 swift build        # build the FilmPhysics library
 swift test         # run the FilmPhysics test target
 ```
+
+On macOS the `FilmPhysicsMetalTests` target runs as well: it renders the
+slice 2, a subset of the slice 4 catalogue and the slice 5 spatial cases
+on the GPU, compares them with the CPU reference (a mean ΔE200₀₀ below
+0.5), checks the grain with the statistical gate of the slice 6 and prints
+the timing of a 1024 × 1024 image. The lines it prints start with
+`METAL-PARITY` and `METAL-TIMING`. Without a Metal device the tests skip;
+a shader that does not compile is a **failure**, not a skip.
 
 The test target checks the package scaffold and the bundled profiles, and
 validates the ported slices against the reference fixtures:
@@ -164,6 +193,23 @@ validates the ported slices against the reference fixtures:
   tolerance** of its own. Measured: max |z| = 3.80 (the grain against the
   upstream fast samplers) and 3.51 (the glare); the grain of a 1024 × 1024
   image takes 0.92 s in the release build.
+* `FilmPlanEvaluatorTests` — the **render plan** (the precomputed data the
+  GPU receives) reproduces the CPU pipeline tap by tap: the plan evaluator
+  (in `Double`) is within 2.8e-7 on the density taps and 6.4e-6 of ΔE2000 on
+  the output, and its `Float32` form (the executable specification of the
+  Metal kernels) is within 5.3e-6 and 0.0046 of ΔE2000. The family covers
+  the four cases of the slice 2, the **148** looks of the catalogue of the
+  slice 4 and the ten cases of the slice 5. The tolerances are the measured
+  maxima times a headroom of at most two (see `docs/PORTING.md` §7.4).
+* `MetalSourceTests` — the static analysis of the Metal port: the kernel
+  names are unique, every dispatched kernel exists exactly once in the
+  shading language, the buffer indices are contiguous, the structures read
+  by the shaders have exactly the layout of their Swift counterparts and
+  the shading language uses no `double`.
+* `GrainCounterTests` — the **counter based** grain (the reference of the
+  GPU path, which cannot draw from a sequential stream) is statistically
+  indistinguishable from the grain of the CPU reference and from the
+  upstream: the worst z-score is 4.37 against the gate of 7.90.
 * `ColourTests` — the sRGB transfer function, the CIELAB conversion and the
   CIEDE2000 formula against the published Sharma et al. test pairs.
 * `NumericsTests` — the interpolation semantics, the geometric mean and the

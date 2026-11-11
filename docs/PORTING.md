@@ -873,14 +873,20 @@ Other measured quantities:
 | `Tests/FilmPhysicsTests/ColourTests.swift` | The sRGB transfer function, the sRGB ↔ XYZ matrices, the CIELAB conversion and the CIEDE2000 formula against the published Sharma test pairs. |
 | `Tests/FilmPhysicsTests/NumericsTests.swift` | The interpolation semantics, the geometric mean, the `NaN` aware statistics and the normal distribution function. |
 | `Tests/FilmPhysicsTests/FilmPhysicsTests.swift` | The package scaffold, the bundled profiles and the shape of the reference fixtures. |
+| `Tests/FilmPhysicsTests/FilmPlanEvaluatorTests.swift` | The validation of the render plan: the plan evaluator (in `Double`) and the `Float32` plan evaluator (the specification of the Metal kernels) against the CPU pipeline, on the slice 2, the catalogue of the slice 4 and the spatial cases of the slice 5. |
+| `Tests/FilmPhysicsTests/MetalSourceTests.swift` | The static analysis of the Metal port: the kernel names are unique, every dispatched kernel exists exactly once, the buffer indices are contiguous, the structures have the layout of their Swift counterparts and the shading language uses no `double`. |
+| `Tests/FilmPhysicsTests/GrainCounterTests.swift` | The statistical validation of the counter based grain (the reference of the GPU path) against the grain of the CPU reference and against the upstream. |
+| `Tests/FilmPhysicsMetalTests/MetalParityTests.swift` | The parity of the GPU against the CPU reference (the slice 2, a subset of the catalogue of the slice 4, the spatial cases of the slice 5, the statistical gate of the grain) and the timing of a 1024 × 1024 image. macOS only. |
+| `Tests/FilmPhysicsMetalTests/MetalAvailabilityTests.swift` | The fallback of the Metal test target on the platforms that have no Metal (the test skips). |
 
 ```
 swift build
 swift test
 ```
 
-The whole suite (67 tests) runs in **3 min 10 s** in the debug build; the
-timing of the grain is measured with
+The whole suite (77 tests) runs in **3 min 50 s** in the debug build (one
+test skips on Linux: the Metal availability one); the timing of the grain is
+measured with
 
 ```
 swift test -c release --filter testTheGrainOfALargeImageIsFast
@@ -888,7 +894,260 @@ swift test -c release --filter testTheGrainOfALargeImageIsFast
 
 ---
 
-## 7. Next steps
+## 7. The Metal port (the GPU)
+
+Status: **phase 1 implemented, validated on Linux against the CPU
+reference; nothing is validated on a Metal device yet** (the CI of the
+project is the first place where the Metal code runs, §7.8).
+
+### 7.1 The architecture
+
+The GPU port lives in the `FilmPhysicsMetal` target.  It is a **port of the
+same chain**, not a different engine: the CPU reference (`FilmPhysics`)
+stays the reference implementation and every number of the port comes from
+the same precomputed data.
+
+```
+                 FilmRenderPlan  (pure Swift, FilmPhysics)
+                          │  the precomputed data of a render
+                          │  (Float32: the payload of the GPU buffers)
+                          ▼
+   rgb_in ──▶ raw ──▶ log_e_film ──▶ cmy_film ──▶ log_e_print ──▶ cmy_print ──▶ rgb_out
+             │            │             │             │              │             │
+       filmSpectral…   filmLinear…   filmFilm…    filmPrinting…   filmPrint…   filmXYZToRGB
+       filmBoost…      filmCoupler…  filmGrain…   (the spatial     filmScanXYZ  filmGamutCompress
+       (the filters)  filmFilm…      (the grain)  effects)                     filmEncodeOutput
+```
+
+| Piece | Where | Role |
+|---|---|---|
+| `FilmRenderBackend` | `Sources/FilmPhysics/FilmRenderBackend.swift` | the protocol of a renderer; `CPUBackend` is the reference implementation |
+| `FilmRenderPlan` | `Sources/FilmPhysics/FilmRenderPlan.swift` | the precomputed data of a render (the tc LUT, the colour matrices, the characteristic curves, the DIR couplers, the spectral tables, the exposure factors, the gamut compression table) |
+| `FilmPlanEvaluator` | `Sources/FilmPhysics/FilmPlanEvaluator.swift` | the pure Swift evaluation of the plan (in `Double`) |
+| `FilmPlanEvaluatorFloat32` | `Sources/FilmPhysics/FilmPlanEvaluatorFloat32.swift` | the **executable specification** of the Metal kernels (in `Float32`) |
+| `FilmGrainPlan` / `FilmCounterRandom` | `Sources/FilmPhysics/FilmGrainPlan.swift`, `FilmCounterRandom.swift` | the plan of the grain and the counter based generator (the reference of the GPU path) |
+| `MetalBackend` | `Sources/FilmPhysicsMetal/MetalBackend.swift` | the GPU implementation of the protocol |
+| `MetalPlan` | `Sources/FilmPhysicsMetal/MetalPlan.swift` | the structures the shaders read and the builders of the convolution kernels |
+| `FilmShaders.metal` | `Sources/FilmPhysicsMetal/Shaders/FilmShaders.metal` | the 28 compute kernels |
+
+The Metal Shading Language source is **compiled at runtime**
+(`device.makeLibrary(source:options:)`): the package does not rely on
+SwiftPM compiling the `.metal` files, and the source is shipped as a
+resource of the target.
+
+### 7.2 The kernels and their mapping to the CPU
+
+Every kernel of `FilmShaders.metal` (28 of them) and the CPU function it
+implements:
+
+| Kernel | CPU function | Stage |
+|---|---|---|
+| `filmSpectralUpsample` | `SpectralUpsampling.rgbToRaw` + `FilmPlanEvaluator.spectralUpsample` | the camera image → the raw response |
+| `filmReduceMaxPartial`, `filmReduceMaxFinal` | the maximum of the field (`Halation.boostHighlights`) | the reduction of the highlight boost |
+| `filmBoostHighlights` | `Halation.boostHighlights` | the highlight boost |
+| `filmLinearToLog` | `Filming.expose` (the `log10` part) and `Printing.log10Floor` | the log exposures |
+| `filmFilmDensity` | `DensityCurves.interpolateExposureToDensity` | the development of the negative |
+| `filmCouplerCorrection` | `Couplers.exposureCorrection` (the per pixel part) | the DIR couplers |
+| `filmFilmDensityCoupled` | `DensityCurves.interpolateExposureToDensity` (the curves before the couplers) | the development of the negative, with the couplers |
+| `filmPrintingExposure` | `Printing.filmCMYToPrintLogRaw` | the exposure of the paper |
+| `filmPrintDensity` | `Printing.develop` | the development of the paper |
+| `filmScanXYZ` | `Scanning.cmyToLogXYZ` | the tristimulus values of the scan |
+| `filmXYZToRGB` | `Scanning.scan` (the XYZ → RGB step) | the linear RGB values |
+| `filmGamutCompress` | `GamutCompression.compressRGB` (`cam16ucs`) | the output gamut compression |
+| `filmEncodeOutput` | `Scanning.scan` (the output transfer function) | the encoded output |
+| `filmBlurHorizontal`, `filmBlurVertical` | `SpatialEffects.gaussianFilter` (the FIR path) | the separable Gaussian |
+| `filmDiffusionFilter` | `DiffusionFilter.apply` | the diffusion filters |
+| `filmCombine2`, `filmCombine3` | the linear combinations of the upstream filters | the combinations |
+| `filmScatterCombine` | `Halation.apply` (the in emulsion scatter) | the halation |
+| `filmHalationCombine` | `Halation.apply` (the back reflection) | the halation |
+| `filmGrainLayers` | `Grain.layerParticleModel` (the sub layer model) | the grain of the negative |
+| `filmGrainSumLayers` | `Grain.applyToDensityLayers` (the sum of the layers) | the grain |
+| `filmGrainClumping` | `Grain.addMicroStructure` | the micro structure of the emulsion |
+| `filmGrainFinalize` | `Grain.applyToDensityLayers` (the minimum density) | the grain |
+| `filmCombineMultiply` | `Grain.addMicroStructure` (the product) | the micro structure |
+| `filmGlareField` | `Glare.randomAmount` | the glare of the print |
+| `filmGlareApply` | `Glare.apply` | the glare of the print |
+
+The **order** of the passes is the order of the CPU pipeline:
+
+```
+raw = 2^EV · upsample(rgb_in)
+raw = boost(raw)                       filmBoostHighlights
+raw = diffusion_filter(raw)            filmDiffusionFilter
+raw = blur(raw, σ = lens blur)         filmBlurHorizontal / filmBlurVertical
+raw = halation(raw)                    filmScatterCombine / filmHalationCombine
+log_e_film = log10(raw · b/w + 1e-10)  filmLinearToLog
+cmy_film = curves(log_e_film)          filmFilmDensity
+cmy_film = couplers(cmy_film)          filmCouplerCorrection / filmFilmDensityCoupled
+cmy_film = grain(cmy_film)              filmGrainLayers / … / filmGrainFinalize
+log_e_print = log10(print_exposure)    filmPrintingExposure / filmLinearToLog
+cmy_print = curves(log_e_print)        filmPrintDensity
+xyz = scan(cmy_print)                  filmScanXYZ (+ the glare)
+rgb = gamut_compress(xyz)              filmXYZToRGB / filmGamutCompress
+rgb = encode(rgb)                      filmEncodeOutput
+```
+
+### 7.3 The `Float32` notes
+
+* The plan stores **every** number in `Float32`: it is the payload of the
+  GPU buffers, so the pure Swift plan evaluator and the Metal kernels see
+  exactly the same numbers.  The `Float32` epsilon is `2⁻²⁴` ≈ 6e-8
+  (relative).
+* The **arithmetic** of the GPU path is `Float32` from end to end: the
+  spectral upsampling, the interpolation of the curves, the spectral
+  integrals, the CAM16 model and the output transfer function.
+* The *conditioning* of the chain is what turns the `Float32` epsilon into
+  the measured error:
+  * the **cubic** lookup of the hanatos 2025 table is sensitive to the
+    position (its derivative is of the order of 1.5 per cell of the 192 ×
+    192 table) and the weights of the cubic kernel cancel each other: a
+    relative error of 6e-8 on the chromaticity is amplified by about
+    thirty,
+  * the CAM16 round trip of the output gamut compression divides by
+    quantities of the order of 0.1: the amplification is of the order of a
+    thousand.
+* The measured errors (the `Float32` plan evaluator against the CPU
+  pipeline, §7.5): the intermediate taps are within **5.3e-6**, the output
+  is within **2.2e-4** (a mean ΔE₀₀ of 0.0046 and a max ΔE₀₀ of 0.0107).
+* The plan evaluator in `Double` is three orders of magnitude better (the
+  taps within 2.8e-7, the output within 3e-6 of ΔE₀₀): the plan itself is
+  *not* the source of the error of the GPU, the `Float32` arithmetic is.
+
+### 7.4 The tolerances and their justification
+
+The tolerances of the Linux validation (`FilmPlanEvaluatorTests`) are
+**derived from the measured errors**, not chosen:
+
+| Quantity | Measured maximum | Tolerance | Justification |
+|---|---|---|---|
+| the intermediate taps (`log_e_film`, `cmy_film`, `log_e_print`, `cmy_print`) | 5.3e-6 | **1e-5** | the measured maximum times 1.9; the headroom covers the profiles that are not in the fixtures (a steeper curve) |
+| the mean ΔE₀₀ of the output | 0.0046 | **0.008** | the measured maximum times 1.7 |
+| the max ΔE₀₀ of the output | 0.0107 | **0.021** | the measured maximum times 2.0 |
+
+The **headroom is at most a factor of two** of the measured maximum, and
+the measured maximum is itself the `Float32` epsilon times the measured
+conditioning of the chain (§7.3): the tolerance is not a "loose floor" but
+a bound on the rounding of the GPU arithmetic.
+
+The tolerance of the Metal tests (the macOS CI) is the acceptance criterion
+of the plan (a mean ΔE₀₀ below 0.5) plus the comparison of the GPU with
+the executable specification of the kernels (a max abs error below 1e-3 on
+the encoded output, i.e. about four times the measured error of the
+`Float32` evaluator).
+
+### 7.5 The measured errors (Linux, against the CPU reference)
+
+The `Float32` plan evaluator (the specification of the kernels) against the
+CPU pipeline, over the four cases of the slice 2, the 148 looks of the
+catalogue of the slice 4 and the ten cases of the slice 5:
+
+| Family | the taps (max abs) | `rgb_out` (max abs) | `rgb_out` (mean ΔE₀₀) | `rgb_out` (max ΔE₀₀) |
+|---|---|---|---|---|
+| the slice 2 (4 cases) | 5.32e-6 | 2.23e-4 | 0.00245 | 0.01073 |
+| the slice 4 (148 looks) | 2.33e-6 | 1.61e-4 | 0.00460 | 0.00937 |
+| the slice 5 (10 cases) | 5.06e-6 | 1.00e-4 | 0.00109 | 0.00780 |
+
+The plan evaluator in `Double` against the same reference: the taps within
+**2.8e-7**, the output within **6.4e-6** of ΔE₀₀.
+
+### 7.6 The RNG design (the grain and the glare)
+
+The GPU has **no order**: the pixels are processed in parallel.  A
+sequential generator (the xoshiro256\*\* of the CPU reference) cannot be
+used, because the value of a variate would depend on the order of the
+pixels.
+
+The GPU port therefore uses a **counter based** generator
+(`FilmCounterRandom`, transliterated into the shading language as
+`filmHash32` / `filmCounter` / `filmUniform`):
+
+* the variate of a pixel is a pure function of
+  `(seed, pixel, layer, channel, stream)`,
+* the hash is the 32 bit avalanche finaliser of Chris Wellons
+  (`lowbias32`), mixed with the odd constants of the golden ratio,
+* the uniforms use the 24 high bits of the hash (the resolution of a
+  `float` mantissa),
+* the normal variate is the Box-Muller transform of two uniforms (it needs
+  exactly two, which is what a counter based generator can afford).
+
+The **distributions** are the ones of the upstream fast kernels (the ones
+the CPU reference reproduces): the Poisson variate is Knuth's product method
+below a mean of thirty and a normal approximation above it, the binomial
+variate is a direct simulation below twenty five trials, a normal
+approximation when the variance is above ten and the inversion of the
+cumulative distribution otherwise.  The realisation differs (a different
+source of randomness), the distribution does not.
+
+The consequence is that the grain of the GPU is **not** bit identical with
+the grain of the CPU: it is validated **statistically**, with the gate of
+§3.4:
+
+* the pure Swift reference of the GPU path (`FilmGrainPlan.apply`) is
+  compared with the grain of the CPU reference over the 16 cases of the
+  slice 6: the worst z-score is **4.37** (the gate is `k` = 7.90 for the
+  1140 comparisons of the family),
+* the same reference is compared with the **upstream**: the only statistics
+  above the statistical gate are the four that the model difference of the
+  samplers explains (§3.4), and they are covered by the measured sampler
+  difference (added in quadrature, exactly like the existing grain
+  validation does).
+
+The number of realisations of that comparison is six (the upstream averages
+twelve): the tolerance of the gate accounts for it
+(`k · σ · sqrt(1/m + 1/m)`), so the comparison stays honest.
+
+### 7.7 What is validated on Linux and what only on macOS
+
+| Validated on Linux (the CI of the repository, no GPU needed) | Validated only on macOS (the Metal CI job) |
+|---|---|
+| the plan reproduces the CPU pipeline tap by tap (`FilmPlanEvaluatorTests`) | the Metal kernels against the CPU pipeline (a mean ΔE₀₀ below 0.5) |
+| the `Float32` specification of the kernels against the CPU pipeline | the Metal kernels against the `Float32` specification (a max abs error below 1e-3) |
+| the static analysis of the shading language: the kernel names are unique, every dispatched kernel exists, the buffer indices are contiguous, the structures have the layout of their Swift counterparts, there is no `double` (`MetalSourceTests`) | the spatial effects on the GPU (the halation, the diffusion filters, the lens blurs, the unsharp mask) |
+| the counter based grain against the grain of the CPU and against the upstream (`GrainCounterTests`) | the grain of the GPU against the grain of the CPU (the statistical gate) |
+| the compilation of the package and of the test targets on Linux | the timing of the GPU against the CPU (a 1024 × 1024 image, the median of three runs after a warm up) |
+
+**Nothing on Metal is validated until the CI runs it on a real Metal
+device**: the MSL source, the Swift/Metal API calls and the buffer layouts
+are written to be correct, and the *logic* of the kernels is validated on
+Linux through the executable specification, but the code itself has never
+been compiled by a Metal compiler.
+
+### 7.8 The CI
+
+`.github/workflows/ci.yml` runs, on `macos-15` (a timeout of 40 minutes):
+
+1. the checkout, `swift --version` and `xcrun --show-sdk-path`,
+2. the Metal devices of the machine (`system_profiler SPDisplaysDataType`),
+3. `swift build`,
+4. `swift test 2>&1 | tee test.log` (the log is uploaded as an artifact),
+5. `xcodebuild -list` and the build of the package scheme for the iOS
+   Simulator (`-destination 'generic/platform=iOS Simulator'`), the scheme
+   being detected in the script.
+
+The tests print their measurements with the prefixes `METAL-PARITY` and
+`METAL-TIMING`, so that the log of the job can be grepped.
+
+### 7.9 The deferred items
+
+* the **single layer model** of the grain (`grain.sublayers_active = false`)
+  is not ported to the GPU: the backend raises
+  `MetalBackendError.invalidPlan` for it (the upstream default is the sub
+  layer model),
+* the **Young & van Vliet IIR** Gaussian of the CPU is replaced by the FIR
+  kernel on the GPU (the truncation at three sigmas): the difference is a
+  few ulps on a blurred field, it is *not* measured yet,
+* the **auto exposure**, the **lut modes** and the **debug switches** of
+  the upstream are not ported (they are not ported on the CPU either),
+* the **input gamut compression** is baked into the tc lookup table (as it
+  is on the CPU), it is not a GPU pass,
+* the **Metal performance** of the grain is not measured: the inversion of
+  the cumulative distribution of the binomial is a loop of up to `n`
+  iterations for the high exposure cases (the same loop as the CPU
+  reference).
+
+---
+
+## 8. Next steps
 
 * Implement the **exact** Poisson and binomial samplers (the PTRS and the
   BTPE algorithms) in `Random.swift`, so that the grain of the port matches

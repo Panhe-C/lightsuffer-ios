@@ -195,6 +195,66 @@ struct FilmExposureParams {
     }
 }
 
+/// The parameters of the grain of the negative.
+///
+/// The layout mirrors **exactly** the `FilmGrainParams` structure of
+/// `Shaders/FilmShaders.metal`.
+struct FilmGrainParams {
+    var width: UInt32 = 0
+    var height: UInt32 = 0
+    var sampleCount: UInt32 = 0
+    var layerCount: UInt32 = 0
+    var positive: UInt32 = 0
+    var reserved: UInt32 = 0
+
+    init(width: Int, height: Int, sampleCount: Int, layerCount: Int, positive: Bool) {
+        self.width = UInt32(width)
+        self.height = UInt32(height)
+        self.sampleCount = UInt32(sampleCount)
+        self.layerCount = UInt32(layerCount)
+        self.positive = positive ? 1 : 0
+    }
+}
+
+/// The parameters of the micro structure of the emulsion.
+///
+/// The layout mirrors **exactly** the `FilmGrainClumpingParams` structure
+/// of `Shaders/FilmShaders.metal`.
+struct FilmGrainClumpingParams {
+    var width: UInt32 = 0
+    var height: UInt32 = 0
+    var seed: UInt32 = 0
+    var sigma: Float = 0
+
+    init(width: Int, height: Int, seed: UInt32, sigma: Float) {
+        self.width = UInt32(width)
+        self.height = UInt32(height)
+        self.seed = seed
+        self.sigma = sigma
+    }
+}
+
+/// The parameters of the glare of the print.
+///
+/// The layout mirrors **exactly** the `FilmGlareParams` structure of
+/// `Shaders/FilmShaders.metal`.
+struct FilmGlareParams {
+    var width: UInt32 = 0
+    var height: UInt32 = 0
+    var seed: UInt32 = 0
+    var mean: Float = 0
+    var std: Float = 0
+    var reserved: Float = 0
+
+    init(width: Int, height: Int, seed: UInt32, mean: Float, std: Float) {
+        self.width = UInt32(width)
+        self.height = UInt32(height)
+        self.seed = seed
+        self.mean = mean
+        self.std = std
+    }
+}
+
 // MARK: - The convolution kernels
 
 /// The separable Gaussian kernels of the three channels.
@@ -289,6 +349,126 @@ enum MetalKernels {
 
 // MARK: - The plan buffers
 
+/// The Metal buffers of the grain of the negative.
+///
+/// The buffers hold the precomputed data of the stochastic particle model
+/// (``FilmGrainPlan``) and the parameters of the kernels.
+struct MetalGrainBuffers {
+
+    /// The parameters of the kernel `filmGrainLayers`.
+    let params: MTLBuffer
+    /// The density curves of the emulsion layers.
+    let layerCurves: MTLBuffer
+    /// The normalised density curves of the film (the axis of the
+    /// interpolation).
+    let normalisedCurves: MTLBuffer
+    /// The parameters of the layers: the maximum densities, the minimum
+    /// densities, the number of particles and the optical density of a
+    /// particle, four blocks of nine values (`[layer][channel]`).
+    let layerParameters: MTLBuffer
+    /// The uniformity of the emulsion, one value per channel.
+    let uniformity: MTLBuffer
+    /// The seed of every stream, one value per channel and per layer.
+    let seeds: MTLBuffer
+    /// The minimum density of the grain, one value per channel.
+    let densityMin: MTLBuffer
+    /// The parameters of the kernel `filmGrainClumping`.
+    let clumpingParams: MTLBuffer
+
+    /// Builds the buffers of the grain.
+    ///
+    /// - Parameters:
+    ///   - plan: the precomputed data of the grain.
+    ///   - width: the width of the image, in pixels.
+    ///   - height: the height of the image, in pixels.
+    ///   - seed: the seed of the pipeline.
+    ///   - device: the Metal device.
+    init(
+        plan: FilmGrainPlan,
+        width: Int,
+        height: Int,
+        seed: UInt64,
+        device: MTLDevice
+    ) throws {
+        func buffer(_ values: [Float]) throws -> MTLBuffer {
+            guard !values.isEmpty else {
+                throw MetalBackendError.invalidPlan("an empty buffer of the grain")
+            }
+            guard let buffer = device.makeBuffer(
+                bytes: values, length: values.count * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            ) else {
+                throw MetalBackendError.commandFailed("a buffer of the grain could not be allocated")
+            }
+            return buffer
+        }
+        var parameters = FilmGrainParams(
+            width: width,
+            height: height,
+            sampleCount: plan.sampleCount,
+            layerCount: FilmGrainPlan.layerCount,
+            positive: plan.positiveFilm
+        )
+        guard let parametersBuffer = device.makeBuffer(
+            bytes: &parameters, length: MemoryLayout<FilmGrainParams>.stride,
+            options: .storageModeShared
+        ) else {
+            throw MetalBackendError.commandFailed(
+                "the parameter buffer of the grain could not be allocated"
+            )
+        }
+        self.params = parametersBuffer
+        self.layerCurves = try buffer(plan.layerCurves)
+        self.normalisedCurves = try buffer(plan.normalisedCurves)
+
+        // The parameters of the layers: four blocks of nine values.
+        let count = FilmGrainPlan.layerCount * FilmGrainPlan.channelCount
+        var layerParameters = [Float](repeating: 0, count: count * 4)
+        for index in 0..<count {
+            layerParameters[index] = plan.densityMaxLayers[index]
+            layerParameters[count + index] = plan.densityMinLayers[index]
+            layerParameters[2 * count + index] = plan.nParticlesPerPixel[index]
+            layerParameters[3 * count + index] = plan.odParticle[index]
+        }
+        self.layerParameters = try buffer(layerParameters)
+        self.uniformity = try buffer(plan.uniformity)
+
+        // The seed of every stream (the channel and the layer of the
+        // emulsion), exactly like the pure Swift reference.
+        var seeds = [Float](repeating: 0, count: count)
+        for colour in 0..<FilmGrainPlan.channelCount {
+            for layer in 0..<FilmGrainPlan.layerCount {
+                let derived = StochasticSeed.grainLayer(
+                    seed: seed, channel: colour, layer: layer
+                )
+                seeds[colour * FilmGrainPlan.layerCount + layer] = Float(
+                    UInt32(truncatingIfNeeded: derived)
+                )
+            }
+        }
+        self.seeds = try buffer(seeds)
+        self.densityMin = try buffer(plan.densityMin)
+
+        var clumping = FilmGrainClumpingParams(
+            width: width,
+            height: height,
+            seed: UInt32(truncatingIfNeeded: StochasticSeed.grainLayer(
+                seed: seed, channel: FilmGrainPlan.channelCount, layer: 0
+            )),
+            sigma: plan.microStructureSigma
+        )
+        guard let clumpingBuffer = device.makeBuffer(
+            bytes: &clumping, length: MemoryLayout<FilmGrainClumpingParams>.stride,
+            options: .storageModeShared
+        ) else {
+            throw MetalBackendError.commandFailed(
+                "the parameter buffer of the micro structure could not be allocated"
+            )
+        }
+        self.clumpingParams = clumpingBuffer
+    }
+}
+
 /// The Metal buffers of a render plan.
 struct MetalPlanBuffers {
 
@@ -304,8 +484,8 @@ struct MetalPlanBuffers {
     let printSensitivity: MTLBuffer
     let printIlluminant: MTLBuffer
     let preflash: MTLBuffer
-    let printChannelDensity: MTLBuffer
-    let printBaseDensity: MTLBuffer
+    let scanChannelDensity: MTLBuffer
+    let scanBaseDensity: MTLBuffer
     let scanIlluminant: MTLBuffer
     let colourMatchingFunctions: MTLBuffer
     let xyzToRGB: MTLBuffer
@@ -320,16 +500,26 @@ struct MetalPlanBuffers {
             guard !values.isEmpty else {
                 throw MetalBackendError.invalidPlan("an empty buffer of the plan")
             }
-            return device.makeBuffer(
+            guard let buffer = device.makeBuffer(
                 bytes: values, length: values.count * MemoryLayout<Float>.stride,
                 options: .storageModeShared
-            )
+            ) else {
+                throw MetalBackendError.commandFailed(
+                    "a buffer of the plan could not be allocated"
+                )
+            }
+            return buffer
         }
         var parameters = FilmPlanParams(plan: plan, width: width, height: height)
-        self.params = device.makeBuffer(
+        guard let parametersBuffer = device.makeBuffer(
             bytes: &parameters, length: MemoryLayout<FilmPlanParams>.stride,
             options: .storageModeShared
-        )
+        ) else {
+            throw MetalBackendError.commandFailed(
+                "the parameter buffer of the plan could not be allocated"
+            )
+        }
+        self.params = parametersBuffer
         self.tcLUT = try buffer(plan.tcLUT)
         self.inputMatrix = try buffer(plan.inputRGBToXYZ)
         self.filmCurve = try buffer(plan.filmCurve.values)
@@ -343,8 +533,8 @@ struct MetalPlanBuffers {
         self.printSensitivity = try buffer(plan.printSensitivity)
         self.printIlluminant = try buffer(plan.printIlluminant)
         self.preflash = try buffer(plan.preflash)
-        self.printChannelDensity = try buffer(plan.printChannelDensity)
-        self.printBaseDensity = try buffer(plan.printBaseDensity)
+        self.scanChannelDensity = try buffer(plan.scanChannelDensity)
+        self.scanBaseDensity = try buffer(plan.scanBaseDensity)
         self.scanIlluminant = try buffer(plan.scanIlluminant)
         self.colourMatchingFunctions = try buffer(plan.colourMatchingFunctions)
         self.xyzToRGB = try buffer(plan.xyzToRGB)

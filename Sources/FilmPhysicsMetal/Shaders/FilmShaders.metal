@@ -119,6 +119,34 @@ struct FilmExposureParams {
     float offset;
 };
 
+/// The parameters of the grain of the negative.
+struct FilmGrainParams {
+    uint width;
+    uint height;
+    uint sampleCount;
+    uint layerCount;
+    uint positive;
+    uint reserved;
+};
+
+/// The parameters of the micro structure of the emulsion.
+struct FilmGrainClumpingParams {
+    uint width;
+    uint height;
+    uint seed;
+    float sigma;
+};
+
+/// The parameters of the glare of the print.
+struct FilmGlareParams {
+    uint width;
+    uint height;
+    uint seed;
+    float mean;
+    float std;
+    float reserved;
+};
+
 // MARK: - The helpers
 
 /// The decoding of an input value (0: none, 1: sRGB, 2: ProPhoto RGB).
@@ -578,6 +606,186 @@ inline float3 filmCAM16UCStoXYZ(
     return filmCAM16Inverse(J, C, hue, xyzWhite * 100.0, LA, Yb) / 100.0;
 }
 
+// MARK: - The counter based random number generator
+
+/// The 32 bit avalanche hash of a word.
+///
+/// The hash is the finaliser of Chris Wellons (`lowbias32`); it is the
+/// executable specification of `FilmCounterRandom.hash32` of the Swift
+/// side.
+inline uint filmHash32(uint value) {
+    uint x = value;
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+/// The hash of a counter.
+///
+/// The counter is `(seed, pixel, layer, channel, stream)`: the variate of a
+/// pixel is a pure function of its coordinates, so the field does not
+/// depend on the order of the pixels.
+inline uint filmCounter(
+    uint seed,
+    uint pixel,
+    uint layer,
+    uint channel,
+    uint stream
+) {
+    uint hash = filmHash32(seed + 0x9E3779B9u);
+    hash = filmHash32(hash ^ (pixel * 0x85EBCA6Bu));
+    hash = filmHash32(hash ^ (layer * 0xC2B2AE35u));
+    hash = filmHash32(hash ^ (channel * 0x27D4EB2Fu));
+    hash = filmHash32(hash ^ (stream * 0x165667B1u));
+    return hash;
+}
+
+/// A uniform variate in `[0, 1)` from a hash.
+///
+/// The 24 high bits of the hash are used: they are the ones a `float` can
+/// represent exactly.
+inline float filmUniform(uint hash) {
+    return float(hash >> 8) * (1.0 / 16777216.0);
+}
+
+/// A standard normal variate from two hashes (the Box-Muller transform).
+inline float filmNormal(uint first, uint second) {
+    const float u1 = max(filmUniform(first), 1e-7);
+    const float u2 = filmUniform(second);
+    return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI_F * u2);
+}
+
+/// A Poisson variate (the fast kernel of the upstream).
+inline int filmPoisson(
+    float rate,
+    uint seed,
+    uint pixel,
+    uint layer,
+    uint channel
+) {
+    if (rate <= 0.0) {
+        return 0;
+    }
+    if (rate < 30.0) {
+        // Knuth's product method.
+        const float limit = exp(-rate);
+        float product = 1.0;
+        int k = 0;
+        do {
+            product *= filmUniform(filmCounter(
+                seed, pixel, layer, channel, 0x1000u + uint(k)
+            ));
+            k += 1;
+        } while (product > limit && k < 1000);
+        return k - 1;
+    }
+    // The normal approximation of the upstream.
+    const float z = filmNormal(
+        filmCounter(seed, pixel, layer, channel, 0x2000u),
+        filmCounter(seed, pixel, layer, channel, 0x2001u)
+    );
+    const float sample = rint(rate + sqrt(rate) * z);
+    return max(0, int(sample));
+}
+
+/// A binomial variate (the fast kernel of the upstream).
+inline int filmBinomial(
+    int n,
+    float p,
+    uint seed,
+    uint pixel,
+    uint layer,
+    uint channel
+) {
+    if (n <= 0 || p <= 0.0) {
+        return 0;
+    }
+    if (p >= 1.0) {
+        return n;
+    }
+    if (n < 25) {
+        // The direct simulation of the upstream.
+        int count = 0;
+        for (int trial = 0; trial < n; ++trial) {
+            const float variate = filmUniform(filmCounter(
+                seed, pixel, layer, channel, 0x3000u + uint(trial)
+            ));
+            if (variate < p) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+    const float mean = float(n) * p;
+    const float variance = float(n) * p * (1.0 - p);
+    if (variance > 10.0) {
+        // The normal approximation of the upstream.
+        const float z = filmNormal(
+            filmCounter(seed, pixel, layer, channel, 0x4000u),
+            filmCounter(seed, pixel, layer, channel, 0x4001u)
+        );
+        const float sample = rint(mean + sqrt(variance) * z);
+        return min(max(int(sample), 0), n);
+    }
+    // The inversion of the cumulative distribution.
+    const float q = 1.0 - p;
+    const float ratio = p / q;
+    const float u = filmUniform(filmCounter(seed, pixel, layer, channel, 0x4002u));
+    float cdf = 0.0;
+    float probability = pow(q, float(n));
+    int k = 0;
+    while (cdf < u && k <= n) {
+        cdf += probability;
+        if (k < n) {
+            probability *= float(n - k) / float(k + 1) * ratio;
+        }
+        k += 1;
+    }
+    return k - 1;
+}
+
+/// A lognormal variate with the given parameters of the underlying normal.
+inline float filmLognormal(
+    float mu,
+    float sigma,
+    uint seed,
+    uint pixel,
+    uint layer,
+    uint channel
+) {
+    if (sigma < 1e-6) {
+        return exp(mu);
+    }
+    const float z = filmNormal(
+        filmCounter(seed, pixel, layer, channel, 0x5000u),
+        filmCounter(seed, pixel, layer, channel, 0x5001u)
+    );
+    return exp(mu + sigma * z);
+}
+
+/// A lognormal variate with the given mean and standard deviation in linear
+/// space.
+inline float filmLognormalFromMeanStd(
+    float mean,
+    float std,
+    uint seed,
+    uint pixel,
+    uint layer,
+    uint channel
+) {
+    float mu = 0.0;
+    float sigma = 0.0;
+    if (mean > 0.0) {
+        const float sigmaSquared = log(1.0 + (std * std) / (mean * mean));
+        sigma = sqrt(sigmaSquared);
+        mu = log(mean) - sigmaSquared / 2.0;
+    }
+    return filmLognormal(mu, sigma, seed, pixel, layer, channel);
+}
+
 // MARK: - The kernels of the per pixel chain
 
 /// The spectral upsampling: the camera image to the raw response.
@@ -666,7 +874,20 @@ kernel void filmBoostHighlights(
     }
     const uint pixel = gid.y * params.width + gid.x;
     const float maxRaw = maximum[0];
+    if (maxRaw <= 0.0 || !isfinite(maxRaw)) {
+        // Without a maximum the boost is the identity.
+        for (uint channel = 0; channel < 3; ++channel) {
+            rawOut[pixel * 3 + channel] = rawIn[pixel * 3 + channel];
+        }
+        return;
+    }
     const float rawX0 = min(max(0.184 * pow(2.0, params.protectEV), 0.0), maxRaw);
+    if (rawX0 == maxRaw) {
+        for (uint channel = 0; channel < 3; ++channel) {
+            rawOut[pixel * 3 + channel] = rawIn[pixel * 3 + channel];
+        }
+        return;
+    }
     const float a = pow(28.0, 1.0 - params.boostRange);
     const float x0 = rawX0 / maxRaw;
     const float denominator = exp(a * (1.0 - x0)) - a * (1.0 - x0) - 1.0;
@@ -1308,5 +1529,229 @@ kernel void filmHalationCombine(
             value /= (1.0 + amount);
         }
         dst[pixel * 3 + channel] = value;
+    }
+}
+
+// MARK: - The kernels of the grain of the negative
+
+/// The particle model of the emulsion layers of the negative.
+///
+/// The kernel computes the density of the developed grains of every layer
+/// of every channel of a pixel: the number of particles of the pixel is
+/// drawn from a Poisson distribution, the number of particles that develop
+/// from a binomial distribution, and the variates come from the **counter
+/// based** generator, so the field does not depend on the order of the
+/// pixels.
+///
+/// The output of the kernel is one image per colour channel, with one
+/// channel per emulsion layer: the image of the cyan is
+/// `outCyan[pixel * 3 + layer]`, and so on.
+kernel void filmGrainLayers(
+    device const float *density [[buffer(0)]],
+    device float *outCyan [[buffer(1)]],
+    device float *outMagenta [[buffer(2)]],
+    device float *outYellow [[buffer(3)]],
+    device const float *layerCurves [[buffer(4)]],
+    device const float *normalisedCurves [[buffer(5)]],
+    device const float *layerParameters [[buffer(6)]],
+    device const float *uniformity [[buffer(7)]],
+    device const float *seeds [[buffer(8)]],
+    constant FilmGrainParams &params [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    const uint samples = params.sampleCount;
+    const uint layers = params.layerCount;
+    const bool positive = params.positive > 0;
+
+    for (uint colour = 0; colour < 3; ++colour) {
+        device float *out = outCyan;
+        if (colour == 1) {
+            out = outMagenta;
+        } else if (colour == 2) {
+            out = outYellow;
+        }
+        const float value = density[pixel * 3 + colour];
+
+        // The axis of the interpolation: the normalised density curve of
+        // the channel, mirrored for a positive emulsion.
+        const float x = positive ? -value : value;
+        const float first = positive
+            ? -normalisedCurves[colour * samples]
+            : normalisedCurves[colour * samples];
+        const float last = positive
+            ? -normalisedCurves[colour * samples + samples - 1]
+            : normalisedCurves[colour * samples + samples - 1];
+
+        for (uint layer = 0; layer < layers; ++layer) {
+            float layerDensity = 0.0;
+            if (x <= first || samples < 2) {
+                layerDensity = layerCurves[(0 * 3 + layer) * 3 + colour];
+            } else if (x >= last) {
+                layerDensity = layerCurves[((samples - 1) * 3 + layer) * 3 + colour];
+            } else {
+                // The cell of the interpolation: the largest index whose
+                // value is below `x` (the axis is ascending).
+                uint low = 0;
+                while (low + 1 < samples) {
+                    const float current = positive
+                        ? -normalisedCurves[colour * samples + low + 1]
+                        : normalisedCurves[colour * samples + low + 1];
+                    if (current > x) {
+                        break;
+                    }
+                    low += 1;
+                }
+                const float lowValue = positive
+                    ? -normalisedCurves[colour * samples + low]
+                    : normalisedCurves[colour * samples + low];
+                const float highValue = positive
+                    ? -normalisedCurves[colour * samples + low + 1]
+                    : normalisedCurves[colour * samples + low + 1];
+                const float step = highValue - lowValue;
+                const float t = step != 0.0 ? (x - lowValue) / step : 0.0;
+                const float yLow = layerCurves[(low * 3 + layer) * 3 + colour];
+                const float yHigh = layerCurves[((low + 1) * 3 + layer) * 3 + colour];
+                layerDensity = yLow + t * (yHigh - yLow);
+            }
+
+            // The minimum density of the layer is added to the densities
+            // of the stack, exactly like the upstream does.
+            const float minimum = layerParameters[9 + layer * 3 + colour];
+            const float planeDensity = layerDensity + minimum;
+            const float densityMax = layerParameters[layer * 3 + colour];
+            const float nParticles = layerParameters[18 + layer * 3 + colour];
+            const float od = layerParameters[27 + layer * 3 + colour];
+            const float uniformityValue = uniformity[colour];
+
+            float probability = clamp(planeDensity / densityMax, 1e-6, 1.0 - 1e-6);
+            const float saturation = 1.0 - probability * uniformityValue * (1.0 - 1e-6);
+            const uint seed = uint(seeds[colour * 3 + layer]);
+            const int particles = filmPoisson(
+                nParticles / saturation, seed, pixel, layer, colour
+            );
+            const int developed = filmBinomial(
+                particles, probability, seed, pixel, layer, colour
+            );
+            out[pixel * 3 + layer] = float(developed) * od * saturation;
+        }
+    }
+}
+
+/// The sum of the emulsion layers of the grain.
+kernel void filmGrainSumLayers(
+    device const float *cyan [[buffer(0)]],
+    device const float *magenta [[buffer(1)]],
+    device const float *yellow [[buffer(2)]],
+    device float *dst [[buffer(3)]],
+    constant FilmPlanParams &params [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    for (uint channel = 0; channel < 3; ++channel) {
+        dst[pixel * 3 + channel] = cyan[pixel * 3 + channel]
+            + magenta[pixel * 3 + channel]
+            + yellow[pixel * 3 + channel];
+    }
+}
+
+/// The micro structure of the emulsion: the clumping of the dye clouds.
+kernel void filmGrainClumping(
+    device float *dst [[buffer(0)]],
+    constant FilmGrainClumpingParams &params [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    for (uint channel = 0; channel < 3; ++channel) {
+        dst[pixel * 3 + channel] = filmLognormalFromMeanStd(
+            1.0, params.sigma, params.seed, pixel, 0, channel
+        );
+    }
+}
+
+/// The removal of the minimum density of the grain.
+kernel void filmGrainFinalize(
+    device const float *src [[buffer(0)]],
+    device const float *densityMin [[buffer(1)]],
+    device float *dst [[buffer(2)]],
+    constant FilmPlanParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    for (uint channel = 0; channel < 3; ++channel) {
+        dst[pixel * 3 + channel] = src[pixel * 3 + channel] - densityMin[channel];
+    }
+}
+
+/// The product of two images.
+kernel void filmCombineMultiply(
+    device const float *a [[buffer(0)]],
+    device const float *b [[buffer(1)]],
+    device float *dst [[buffer(2)]],
+    constant FilmPlanParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    for (uint channel = 0; channel < 3; ++channel) {
+        dst[pixel * 3 + channel] = a[pixel * 3 + channel] * b[pixel * 3 + channel];
+    }
+}
+
+// MARK: - The kernels of the glare of the print
+
+/// The random amount of the glare of the print.
+///
+/// The field is a lognormal field, drawn from the counter based generator:
+/// the three channels hold the same value (the blur of the glare is applied
+/// to the three channels at once).
+kernel void filmGlareField(
+    device float *dst [[buffer(0)]],
+    constant FilmGlareParams &params [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    const float value = filmLognormalFromMeanStd(
+        params.mean, params.std, params.seed, pixel, 0, 0
+    );
+    dst[pixel * 3] = value;
+    dst[pixel * 3 + 1] = value;
+    dst[pixel * 3 + 2] = value;
+}
+
+/// The addition of the glare to the tristimulus values of the scan.
+kernel void filmGlareApply(
+    device const float *xyzIn [[buffer(0)]],
+    device const float *amount [[buffer(1)]],
+    device const float *illuminantXYZ [[buffer(2)]],
+    device float *dst [[buffer(3)]],
+    constant FilmPlanParams &params [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+    const uint pixel = gid.y * params.width + gid.x;
+    const float value = amount[pixel * 3] / 100.0;
+    for (uint component = 0; component < 3; ++component) {
+        dst[pixel * 3 + component] = xyzIn[pixel * 3 + component]
+            + value * illuminantXYZ[component];
     }
 }
