@@ -473,7 +473,6 @@ inline float4 filmCAM16Forward(
     const float A = filmAchromaticResponse(rgbCompressed, Nbb);
 
     const float J = 100.0 * filmSpow(A / aw, 0.69 * z);
-    const float Q = (4.0 / 0.69) * sqrt(J / 100.0) * (aw + 4.0) * filmSpow(FL, 0.25);
     const float t = ((50000.0 / 13.0) * 1.0 * Ncb)
         * (et * sqrt(a * a + b * b)
             / (rgbCompressed.x + rgbCompressed.y + 21.0 * rgbCompressed.z / 20.0));
@@ -830,16 +829,34 @@ kernel void filmSpectralUpsample(
 }
 
 /// The first stage of the maximum reduction.
+///
+/// The kernel **must** be dispatched with exactly `FILM_REDUCE_THREADS`
+/// threads (the Swift side dispatches 1024 threads, in groups of 256).
+/// The grid is split in `FILM_REDUCE_THREADS / threads_per_threadgroup`
+/// contiguous blocks — one per thread group — and the threads of a group
+/// stride over the block: every value of the field is therefore read
+/// **exactly once**, and the maximum of the field is the maximum of the
+/// `FILM_REDUCE_THREADS` partial results.
 kernel void filmReduceMaxPartial(
     device const float *values [[buffer(0)]],
     device float *partials [[buffer(1)]],
     constant FilmPlanParams &params [[buffer(2)]],
     uint gid [[thread_position_in_grid]],
-    uint threads [[threads_per_group]]
+    uint groupSize [[threads_per_threadgroup]]
 ) {
     const uint total = params.width * params.height * 3;
+    if (gid >= FILM_REDUCE_THREADS) {
+        return;
+    }
+    const uint groupCount = max(FILM_REDUCE_THREADS / groupSize, 1u);
+    const uint groupIndex = gid / groupSize;
+    const uint threadInGroup = gid % groupSize;
+    const uint block = (total + groupCount - 1) / groupCount;
+    const uint start = groupIndex * block;
+    const uint end = min(start + block, total);
+
     float maximum = -INFINITY;
-    for (uint index = gid; index < total; index += threads) {
+    for (uint index = start + threadInGroup; index < end; index += groupSize) {
         maximum = max(maximum, values[index]);
     }
     partials[gid] = maximum;
@@ -1328,7 +1345,7 @@ kernel void filmEncodeOutput(
 kernel void filmBlurHorizontal(
     device const float *src [[buffer(0)]],
     device float *dst [[buffer(1)]],
-    device const float *kernel [[buffer(2)]],
+    device const float *weights [[buffer(2)]],
     constant FilmBlurParams &params [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
@@ -1346,9 +1363,9 @@ kernel void filmBlurHorizontal(
     for (int offset = -radius; offset <= radius; ++offset) {
         const int source = filmReflectEdge(column + offset, int(params.width));
         const uint index = (gid.y * params.width + uint(source)) * 3;
-        const float w0 = kernel[uint(0 * length + (offset + radius))];
-        const float w1 = kernel[uint(1 * length + (offset + radius))];
-        const float w2 = kernel[uint(2 * length + (offset + radius))];
+        const float w0 = weights[uint(0 * length + (offset + radius))];
+        const float w1 = weights[uint(1 * length + (offset + radius))];
+        const float w2 = weights[uint(2 * length + (offset + radius))];
         s0 += src[index] * w0;
         s1 += src[index + 1] * w1;
         s2 += src[index + 2] * w2;
@@ -1362,7 +1379,7 @@ kernel void filmBlurHorizontal(
 kernel void filmBlurVertical(
     device const float *src [[buffer(0)]],
     device float *dst [[buffer(1)]],
-    device const float *kernel [[buffer(2)]],
+    device const float *weights [[buffer(2)]],
     constant FilmBlurParams &params [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
@@ -1380,9 +1397,9 @@ kernel void filmBlurVertical(
     for (int offset = -radius; offset <= radius; ++offset) {
         const int source = filmReflectEdge(row + offset, int(params.height));
         const uint index = (uint(source) * params.width + gid.x) * 3;
-        const float w0 = kernel[uint(0 * length + (offset + radius))];
-        const float w1 = kernel[uint(1 * length + (offset + radius))];
-        const float w2 = kernel[uint(2 * length + (offset + radius))];
+        const float w0 = weights[uint(0 * length + (offset + radius))];
+        const float w1 = weights[uint(1 * length + (offset + radius))];
+        const float w2 = weights[uint(2 * length + (offset + radius))];
         s0 += src[index] * w0;
         s1 += src[index + 1] * w1;
         s2 += src[index + 2] * w2;
@@ -1568,12 +1585,6 @@ kernel void filmGrainLayers(
     const bool positive = params.positive > 0;
 
     for (uint colour = 0; colour < 3; ++colour) {
-        device float *out = outCyan;
-        if (colour == 1) {
-            out = outMagenta;
-        } else if (colour == 2) {
-            out = outYellow;
-        }
         const float value = density[pixel * 3 + colour];
 
         // The axis of the interpolation: the normalised density curve of
@@ -1636,7 +1647,15 @@ kernel void filmGrainLayers(
             const int developed = filmBinomial(
                 particles, probability, seed, pixel, layer, colour
             );
-            out[pixel * 3 + layer] = float(developed) * od * saturation;
+            const float developedDensity = float(developed) * od * saturation;
+            // The output of the kernel is one image per colour channel.
+            if (colour == 0) {
+                outCyan[pixel * 3 + layer] = developedDensity;
+            } else if (colour == 1) {
+                outMagenta[pixel * 3 + layer] = developedDensity;
+            } else {
+                outYellow[pixel * 3 + layer] = developedDensity;
+            }
         }
     }
 }

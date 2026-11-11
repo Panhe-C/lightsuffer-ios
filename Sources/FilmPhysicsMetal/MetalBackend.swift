@@ -916,6 +916,23 @@ public final class MetalBackend: FilmRenderBackend {
         return buffer
     }
 
+    /// The number of the threads of the first stage of the maximum
+    /// reduction.
+    ///
+    /// The kernel `filmReduceMaxPartial` of the shading language assumes
+    /// **exactly** this number of threads (the constant
+    /// `FILM_REDUCE_THREADS` of the shading language): the grid is split in
+    /// contiguous blocks, one per thread group, and the threads of a group
+    /// stride over their block, so that every value of the field is read
+    /// exactly once.
+    private static let reduceThreads = 1024
+
+    /// The number of the threads of a thread group of the reduction.
+    ///
+    /// It must divide ``reduceThreads``: the number of the thread groups
+    /// is the number of the blocks of the reduction.
+    private static let reduceGroupThreads = 256
+
     /// The highlight boost of the negative.
     private func applyHighlightBoost(
         _ encoder: MTLComputeCommandEncoder,
@@ -928,7 +945,8 @@ public final class MetalBackend: FilmRenderBackend {
         height: Int
     ) throws {
         let partials = device.makeBuffer(
-            length: 1024 * MemoryLayout<Float>.stride, options: .storageModeShared
+            length: Self.reduceThreads * MemoryLayout<Float>.stride,
+            options: .storageModeShared
         )
         let maximum = device.makeBuffer(
             length: MemoryLayout<Float>.stride, options: .storageModeShared
@@ -938,14 +956,22 @@ public final class MetalBackend: FilmRenderBackend {
         }
 
         // The first stage of the reduction.
+        //
+        // The kernel expects exactly `reduceThreads` threads, in groups of
+        // `reduceGroupThreads` threads (the constant `FILM_REDUCE_THREADS`
+        // of the shading language).
+        precondition(
+            Self.reduceThreads % Self.reduceGroupThreads == 0,
+            "the threads of the reduction must be a whole number of thread groups"
+        )
         let partialState = try pipeline(named: "filmReduceMaxPartial", library: library)
         encoder.setComputePipelineState(partialState)
         encoder.setBuffer(source, offset: 0, index: 0)
         encoder.setBuffer(partials, offset: 0, index: 1)
         encoder.setBuffer(planBuffers.params, offset: 0, index: 2)
         encoder.dispatchThreads(
-            MTLSize(width: 1024, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
+            MTLSize(width: Self.reduceThreads, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: Self.reduceGroupThreads, height: 1, depth: 1)
         )
 
         // The second stage of the reduction.

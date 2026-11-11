@@ -16,7 +16,13 @@
 //  * the structures the shaders read have **exactly** the layout of their
 //    Swift counterparts (the same members, in the same order, with the
 //    same widths),
-//  * the shading language uses no `double` (the GPU path is `Float32`).
+//  * the shading language uses no `double` (the GPU path is `Float32`),
+//  * the shading language uses no **keyword** as an identifier (a keyword
+//    is a reserved word of the language: `kernel`, `constant`, `device`,
+//    `threadgroup`, … — the compiler rejects them),
+//  * the attributes of the kernels (`[[…]]`) belong to the **whitelist**
+//    of the valid Metal attributes (a typo, e.g. `[[threads_per_group]]`,
+//    is a compile error, not a warning).
 //
 //  This file is part of a GPLv3 licensed project; see LICENSE at the repo root.
 //
@@ -154,12 +160,161 @@ final class MetalSourceTests: XCTestCase {
               let bodyRange = Range(match.range(at: 1), in: source) else { return nil }
         let indexPattern = try? NSRegularExpression(pattern: #"\[\[buffer\((\d+)\)\]\]"#)
         guard let indexPattern else { return nil }
-        let indices = indexPattern.matches(in: String(source[bodyRange]), range: range)
+        // The range must be the range of the string the expression is run
+        // on: the source of the kernel is a *substring* of the file, and
+        // the range of the file would be out of its bounds (the crash of
+        // the macOS run).
+        let body = String(source[bodyRange])
+        let bodySearchRange = NSRange(body.startIndex..., in: body)
+        let indices = indexPattern.matches(in: body, range: bodySearchRange)
             .compactMap { match -> Int? in
-                guard let swiftRange = Range(match.range(at: 1), in: source) else { return nil }
-                return Int(source[swiftRange])
+                guard let swiftRange = Range(match.range(at: 1), in: body) else { return nil }
+                return Int(body[swiftRange])
             }
         return indices.sorted()
+    }
+
+    // MARK: - The lexical analysis of the shading language
+
+    /// The keywords of the Metal shading language.
+    ///
+    /// A keyword is a reserved word of the language: it cannot be the name
+    /// of a variable, of a parameter, of a function or of a member.  The
+    /// Metal compiler rejects it (`invalid parameter name: 'kernel' is a
+    /// keyword`).
+    private static let metalKeywords: Set<String> = [
+        "kernel", "vertex", "fragment", "constant", "device", "threadgroup",
+        "thread", "sampler", "texture", "bool", "break", "case", "char",
+        "class", "const", "continue", "default", "do", "double", "else",
+        "enum", "extern", "float", "for", "goto", "half", "if", "inline",
+        "int", "long", "namespace", "new", "operator", "private",
+        "protected", "public", "register", "return", "short", "signed",
+        "sizeof", "static", "struct", "switch", "typedef", "union",
+        "unsigned", "using", "virtual", "void", "volatile", "while",
+    ]
+
+    /// The words that introduce a **name** in the shading language.
+    ///
+    /// When one of them is followed by a keyword, the keyword is used as a
+    /// name: it is a compile error.
+    private static let metalTypeWords: Set<String> = [
+        "bool", "char", "float", "float2", "float3", "float4", "half",
+        "half2", "half3", "half4", "int", "int2", "int3", "int4", "long",
+        "short", "size_t", "uint", "uint2", "uint3", "uint4", "void",
+    ]
+
+    /// The words that are skipped when the analysis looks for the type of
+    /// a name (the qualifiers and the pointers).
+    private static let metalQualifierWords: Set<String> = [
+        "const", "device", "constant", "threadgroup", "inline", "static",
+        "volatile", "unsigned", "signed",
+    ]
+
+    /// The valid attributes of the Metal shading language.
+    ///
+    /// The whitelist is the one of the compute kernels (the buffer, the
+    /// texture and the sampler bindings, and the attributes of the
+    /// position of the thread); the attributes of the graphics pipeline
+    /// are listed too, for the sake of the completeness.
+    private static let metalAttributes: Set<String> = [
+        "buffer", "texture", "sampler", "id", "color",
+        "thread_position_in_grid", "thread_position_in_threadgroup",
+        "threadgroup_position_in_grid", "thread_index_in_threadgroup",
+        "threads_per_threadgroup", "threads_per_grid",
+        "position", "point_size", "stage_in", "stage_out", "vertex_id",
+        "instance_id", "primitive_id", "base_vertex", "base_instance",
+    ]
+
+    /// The source of the shading language without its comments.
+    ///
+    /// The analysis of the keywords and of the attributes looks at the
+    /// **code** only: the comments of the source mention the keywords of
+    /// the language (e.g. `the 'reflect' boundary`), and they must not be
+    /// taken for code.
+    ///
+    /// - Parameter source: the source of the shading language.
+    /// - Returns: the source without its comments (the line breaks are
+    ///   kept, so that the line numbers stay right).
+    private static func code(of source: String) -> String {
+        var output = ""
+        var index = source.startIndex
+        var inBlockComment = false
+        while index < source.endIndex {
+            let character = source[index]
+            let next = source.index(after: index)
+            if inBlockComment {
+                if character == "*", next < source.endIndex, source[next] == "/" {
+                    inBlockComment = false
+                    index = source.index(after: next)
+                    continue
+                }
+                if character == "\n" { output.append(character) }
+                index = next
+                continue
+            }
+            if character == "/", next < source.endIndex {
+                if source[next] == "/" {
+                    while index < source.endIndex, source[index] != "\n" {
+                        index = source.index(after: index)
+                    }
+                    continue
+                }
+                if source[next] == "*" {
+                    inBlockComment = true
+                    index = source.index(after: next)
+                    continue
+                }
+            }
+            output.append(character)
+            index = next
+        }
+        return output
+    }
+
+    /// The tokens of a piece of code.
+    ///
+    /// A token is either an identifier (a letter, a digit or an
+    /// underscore, followed by letters, digits or underscores) or a single
+    /// symbol.
+    ///
+    /// - Parameter code: the code to tokenise.
+    /// - Returns: the tokens of the code.
+    private static func tokens(of code: String) -> [String] {
+        var tokens: [String] = []
+        var index = code.startIndex
+        while index < code.endIndex {
+            let character = code[index]
+            if character.isWhitespace {
+                index = code.index(after: index)
+                continue
+            }
+            if character.isLetter || character == "_" {
+                var end = index
+                while end < code.endIndex {
+                    let next = code[end]
+                    if next.isLetter || next.isNumber || next == "_" {
+                        end = code.index(after: end)
+                    } else {
+                        break
+                    }
+                }
+                tokens.append(String(code[index..<end]))
+                index = end
+                continue
+            }
+            if character.isNumber {
+                var end = index
+                while end < code.endIndex, code[end].isNumber || code[end] == "." {
+                    end = code.index(after: end)
+                }
+                tokens.append(String(code[index..<end]))
+                index = end
+                continue
+            }
+            tokens.append(String(character))
+            index = code.index(after: index)
+        }
+        return tokens
     }
 
     // MARK: - The tests
@@ -266,6 +421,70 @@ final class MetalSourceTests: XCTestCase {
             XCTAssertFalse(
                 trimmed.contains("double"),
                 "the line \(number + 1) of the shading language uses a double: \(trimmed)"
+            )
+        }
+    }
+
+    /// The shading language uses no keyword as an identifier.
+    ///
+    /// A keyword of the Metal shading language is a reserved word: it
+    /// cannot be the name of a variable, of a parameter, of a function or
+    /// of a member.  The compiler rejects it (`invalid parameter name:
+    /// 'kernel' is a keyword`), and the error shows up only on a machine
+    /// with a Metal compiler — so it is checked here, statically.
+    func testTheShadingLanguageUsesNoKeywordAsAnIdentifier() throws {
+        let code = Self.code(of: Self.shaderSource)
+        let tokens = Self.tokens(of: code)
+        var reported: Set<String> = []
+
+        for (index, token) in tokens.enumerated() where Self.metalKeywords.contains(token) {
+            // The token before the keyword is looked for, through the
+            // qualifiers and the pointers: when it is a type, the keyword
+            // is used as a name.
+            var previous = index - 1
+            while previous >= 0,
+                  Self.metalQualifierWords.contains(tokens[previous])
+                    || tokens[previous] == "*" || tokens[previous] == "&" {
+                previous -= 1
+            }
+            guard previous >= 0 else { continue }
+            let before = tokens[previous]
+            let isAName = Self.metalTypeWords.contains(before) || before == "."
+            guard isAName else { continue }
+            guard reported.insert(token).inserted else { continue }
+            XCTFail(
+                "the shading language uses the keyword '\(token)' as an "
+                    + "identifier (after '\(before)'): the Metal compiler "
+                    + "rejects it (invalid parameter name)"
+            )
+        }
+    }
+
+    /// The attributes of the shading language are valid Metal attributes.
+    ///
+    /// A typo in an attribute (`[[threads_per_group]]` instead of
+    /// `[[threads_per_threadgroup]]`) is a compile error of the Metal
+    /// compiler, and it is only seen on a machine with Metal — so it is
+    /// checked here, statically, against the whitelist of the valid
+    /// attributes.
+    func testTheAttributesOfTheShadingLanguageAreValid() throws {
+        let code = Self.code(of: Self.shaderSource)
+        let pattern = try? NSRegularExpression(pattern: #"\[\[([A-Za-z_][A-Za-z0-9_]*)"#)
+        guard let pattern else {
+            XCTFail("the pattern of the attributes could not be built")
+            return
+        }
+        let range = NSRange(code.startIndex..., in: code)
+        let attributes = pattern.matches(in: code, range: range).compactMap { match -> String? in
+            guard let swiftRange = Range(match.range(at: 1), in: code) else { return nil }
+            return String(code[swiftRange])
+        }
+        XCTAssertFalse(attributes.isEmpty, "the shading language holds attributes")
+        for attribute in attributes {
+            XCTAssertTrue(
+                Self.metalAttributes.contains(attribute),
+                "the attribute '\(attribute)' of the shading language is not a "
+                    + "valid Metal attribute"
             )
         }
     }
