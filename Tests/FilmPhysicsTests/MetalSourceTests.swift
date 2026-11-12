@@ -425,6 +425,20 @@ final class MetalSourceTests: XCTestCase {
         }
     }
 
+    /// The shading language uses no C/libm functions that Metal does not provide.
+    func testTheShadingLanguageUsesNoUnavailableLibmFunctions() throws {
+        let unavailable: Set<String> = [
+            "log1p", "expm1", "lgamma", "tgamma", "loggamma", "erf", "erfc",
+        ]
+        let tokens = Self.tokens(of: Self.code(of: Self.shaderSource))
+        for name in unavailable.sorted() {
+            XCTAssertFalse(
+                tokens.contains(name),
+                "the shading language uses '\(name)', which Metal does not provide"
+            )
+        }
+    }
+
     /// The shading language uses no keyword as an identifier.
     ///
     /// A keyword of the Metal shading language is a reserved word: it

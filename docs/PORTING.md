@@ -1068,6 +1068,22 @@ six realisations, the family of 1444 comparisons, `k` = 8.3045):
 | the counter based grain against the upstream **default** samplers, adjusted | 304 | 11.36 (`ultramax_400__flat_ev_plus2`, `mean_0`) | 3.20 σ **+ the measured sampler difference in quadrature** |
 | the counter based grain with the **exact** samplers against the upstream **default** samplers | 304 | **5.9241** (`portra_400__flat_ev_minus2`, `acf_2`) | 3.20 σ, **no allowance** |
 
+The Metal device measurements from CI run
+<https://github.com/Panhe-C/lightsuffer-ios/actions/runs/43149838375>
+(commit `2477537`) add the following results beside the CPU and counter
+based numbers above (see §7.13 for the tests and the other measurements of
+the run):
+
+| Comparison | max \|z\| | Reporting and gate |
+|---|---|---|
+| the GPU grain with the **exact** samplers against the counter based **CPU exact** reference | **4.131** | raw, `k = 7.8362`, **no allowance** |
+| the GPU grain with the **exact** samplers against the upstream **default** path | **4.412** (`ultramax_400__flat_ev_plus2`, `std_1`) | raw, `k = 7.8362`, **no allowance** |
+| the GPU grain with the default **fast** samplers against the CPU reference | **1.059** | raw, the existing GPU-vs-CPU gate, `k = 7.8362` |
+
+All three are below the unchanged critical value.  These are **raw**
+z-scores: no adjusted figures or sampler-difference allowances are used for
+the exact-mode GPU comparisons, and no threshold was loosened.
+
 The five worst z-scores of each comparison (the gate prints them at every
 run):
 
@@ -1113,10 +1129,11 @@ Other measured quantities:
 | `Tests/FilmPhysicsTests/NumericsTests.swift` | The interpolation semantics, the geometric mean, the `NaN` aware statistics and the normal distribution function. |
 | `Tests/FilmPhysicsTests/FilmPhysicsTests.swift` | The package scaffold, the bundled profiles and the shape of the reference fixtures. |
 | `Tests/FilmPhysicsTests/FilmPlanEvaluatorTests.swift` | The validation of the render plan: the plan evaluator (in `Double`) and the `Float32` plan evaluator (the specification of the Metal kernels) against the CPU pipeline, on the slice 2, the catalogue of the slice 4 and the spatial cases of the slice 5. |
-| `Tests/FilmPhysicsTests/MetalSourceTests.swift` | The static analysis of the Metal port: the kernel names are unique, every dispatched kernel exists exactly once, the buffer indices are contiguous, the structures have the layout of their Swift counterparts, the shading language uses no `double`, no keyword as an identifier and only the valid Metal attributes. |
+| `Tests/FilmPhysicsTests/MetalSourceTests.swift` | The static analysis of the Metal port: the kernel names are unique, every dispatched kernel exists exactly once, the buffer indices are contiguous, the structures have the layout of their Swift counterparts, the shading language uses no `double`, no unavailable C/libm functions (`log1p`, `expm1`, `lgamma`, `tgamma`, `loggamma`, `erf`, `erfc`), no keyword as an identifier and only the valid Metal attributes. |
 | `Tests/FilmPhysicsTests/GrainCounterTests.swift` | The statistical validation of the counter based grain (the reference of the GPU path) against the grain of the CPU reference, against the upstream **fast** path (the algorithm gate, no allowance), against the upstream **default** path (raw and adjusted) and with the **exact** samplers against the upstream **default** path (no allowance). |
 | `Tests/FilmPhysicsTests/ExactSamplerTests.swift` | The unit tests of the exact samplers of the grain: the moments of the exact Poisson and of the exact binomial, the reproducibility of the counter based exact sampler and the underflow of the upstream fast inversion. |
 | `Tests/FilmPhysicsMetalTests/MetalParityTests.swift` | The parity of the GPU against the CPU reference (the slice 2, a subset of the catalogue of the slice 4, the spatial cases of the slice 5, the statistical gate of the grain) and the timing of a 1024 × 1024 image. macOS only. |
+| `Tests/FilmPhysicsMetalTests/MetalExactGrainTests.swift` | The exact grain of the GPU against the counter based exact CPU reference and against the upstream default path, both with the existing `k = 7.8362` gate and no allowance. macOS only. |
 | `Tests/FilmPhysicsMetalTests/MetalAvailabilityTests.swift` | The fallback of the Metal test target on the platforms that have no Metal (the test skips). |
 
 ```
@@ -1377,13 +1394,12 @@ arithmetic, not of the algorithm.
 | the counter based grain against the grain of the CPU, against the upstream **fast** path (no allowance) and against the upstream **default** path (raw and adjusted), with the fast and with the exact samplers (`GrainCounterTests`, `GrainStatisticsTests`, `ExactSamplerTests`) | the grain of the GPU against the grain of the CPU (the statistical gate), with the fast and with the exact samplers (§7.13) |
 | the compilation of the package and of the test targets on Linux | the timing of the GPU against the CPU (a 1024 × 1024 image, the median of three runs after a warm up, in **release**) — note that the CPU side of that measurement costs about **100 s per run** in a debug build (the release build is about twenty times faster) |
 
-**Nothing on Metal is validated until the CI runs it on a real Metal
-device**: the MSL source, the Swift/Metal API calls and the buffer layouts
-are written to be correct, and the *logic* of the kernels is validated on
-Linux through the executable specification, but the code itself has never
-been compiled by a Metal compiler.  The first run on a device (the CI of
-the project, §7.12) has confirmed the per pixel chain and has found the
-two bugs of the spatial effects and of the grain.
+**Metal execution is validated only by the CI on a real Metal device**:
+the *logic* of the kernels is validated on Linux through the executable
+specification, but Linux neither compiles nor runs the MSL.  The first
+device run (§7.12) confirmed the per pixel chain and found the two bugs of
+the spatial effects and of the grain; run `43149838375` at commit `2477537`
+subsequently compiled and passed the exact sampler path as well (§7.13).
 
 **The static checks are not an execution.**  The `MetalSourceTests` read
 the Metal Shading Language source and check it *textually* (the kernel
@@ -1710,6 +1726,24 @@ reference, i.e. the GPU and the CPU draw their variates from the **same**
 uniforms (they differ only for the uniforms that fall within `1e-5` of a
 boundary of the cumulative distribution).
 
+#### The `log1p` gap of the shading language
+
+Metal Shading Language has no `log1p`.  A direct `log(1.0 + x)` is not an
+adequate replacement in the cancellation free log probabilities: for a
+small `x`, the addition can round away some or all of `x` before the
+logarithm is evaluated.  The shaders therefore use `filmLog1p`, a
+cancellation-aware form of `log(1 + x)` whose result is comparable to the
+true `log1p` used by the Swift `Float32ExactSamplers`:
+
+* with `y = 1 + x`, return `x` when `y == 1`;
+* otherwise return `log(y) * (x / (y - 1))`.
+
+The factor `x / (y - 1)` corrects the logarithm for the rounding of the
+addition, so small `x` keeps digits comparable to a true `log1p` and to the
+Swift executable specification.  This works around the libm gap without
+changing the inversion algorithm or claiming precision beyond `Float32`;
+the single precision limits below still apply.
+
 #### The executable specification of the kernels
 
 The Metal kernels cannot run on Linux (there is no GPU on the CI box of
@@ -1760,10 +1794,12 @@ single precision viable: without them, the terms of the order of `n`
 mode of the dense layers would be off by several percents — i.e. the
 grain would be wrong.
 
-#### What the CI must confirm
+#### What the CI confirms
 
-The Metal CI (the job of §7.8) runs the two parity tests of
-`Tests/FilmPhysicsMetalTests/MetalExactGrainTests.swift`:
+CI run <https://github.com/Panhe-C/lightsuffer-ios/actions/runs/43149838375>
+(commit `2477537`) is green in **both** the Metal job and the CPU/iOS job.
+The Metal job compiled the shaders, including `filmLog1p`, and ran the two
+parity tests of `Tests/FilmPhysicsMetalTests/MetalExactGrainTests.swift`:
 
 1. the **exact grain of the GPU** against the **counter based exact**
    reference of the CPU (`FilmGrainPlan` in exact mode): the gate is the
@@ -1773,33 +1809,53 @@ The Metal CI (the job of §7.8) runs the two parity tests of
    scale of the difference — and the statistics are compared **mean with
    mean** and **standard deviation with standard deviation**,
 2. the **exact grain of the GPU** against the **upstream default** path
-   (the exact SciPy generators): the plain statistical gate, with **no
-   allowance at all** — this is the comparison the fast path cannot pass
-   (the fast kernels of the upstream develop every particle of the dense
-   layers, and the grain is therefore systematically denser than the one of
-   the default path, §3.4).
+   (the exact SciPy generators): the plain statistical gate — this is the
+   comparison the fast path cannot pass (the fast kernels of the upstream
+   develop every particle of the dense layers, and the grain is therefore
+   systematically denser than the one of the default path, §3.4).
 
-The subset of the cases is three (the family of the slice 6 holds
-sixteen): `portra_400__flat_ev_minus2` (the case the exact mode of the CPU
-was measured on), `ultramax_400__flat_ev_plus2` (the case the fast
-samplers fail on) and `portra_400__textured_ev_0` (a textured case).  The
-other thirteen cases are validated on the CPU reference, which exercises
-the same algorithm.
+For **both** comparisons the tolerance remains exactly the existing gate
+with `k = 7.8362`: **no allowance, no adjusted variant and no loosened
+threshold**.  The measured results are raw z-scores:
+
+* exact GPU versus counter based CPU exact: worst **z = 4.131**;
+* exact GPU versus upstream default: worst **z = 4.412**, at
+  `ultramax_400__flat_ev_plus2` `std_1`;
+* the existing default fast GPU grain comparison against the CPU: worst
+  **z = 1.059**.
+
+All are below `k = 7.8362`.  The grain numbers are also listed beside the
+CPU and counter based measurements in §5.4.  The subset of the cases is
+three (the family of the slice 6 holds sixteen):
+`portra_400__flat_ev_minus2` (the case the exact mode of the CPU was
+measured on), `ultramax_400__flat_ev_plus2` (the case the fast samplers
+fail on) and `portra_400__textured_ev_0` (a textured case).  The other
+thirteen cases are validated on the CPU reference, which exercises the
+same algorithm.
 
 The lines of the log are `METAL-PARITY exact slice6 <case>: the grain
 <statistic>: the GPU <value>, the CPU (or the upstream) <value>, the
 deviation <deviation>, the tolerance <tolerance>, the z-score <z>`, and
-the worst z-score of the family.
+the worst z-score of the family.  In the same run, mean ΔE₀₀ stayed well
+under the existing **0.5** gate (worst mean approximately **0.00419**;
+worst per-pixel maximum approximately **0.0113**).  The release timing of
+a 1024 × 1024 image was **0.297 s on the GPU** and **16.662 s on the CPU**,
+about **56.2×** faster on the GPU.
+
+The source-level guard for this libm gap is
+`MetalSourceTests.testTheShadingLanguageUsesNoUnavailableLibmFunctions`,
+which runs with the CPU tests in the CPU/iOS CI job.  It tokenizes the
+comment-stripped MSL source and rejects `log1p`, `expm1`,
+`lgamma`, `tgamma`, `loggamma`, `erf` and `erfc`.  Consequently a comment
+that mentions `log1p` does not fail the check, and the whole identifier
+`filmLog1p` is not mistaken for a call to `log1p`.  This source check
+complements, rather than replaces, compilation and execution on the Metal
+device.
 
 ---
 
 ## 8. Next steps
 
-* Measure the **exact mode of the GPU** on the Metal CI (the two parity
-  tests of §7.13) and record the measured z-scores here, next to the ones
-  of the CPU reference (the algorithm is validated on Linux by
-  `Float32ExactSamplerTests`, but the *numbers* of the GPU are only known
-  from the CI).
 * Regenerate the slice 6 fixture with **more upstream seeds** (12 today): the
   spread of the upstream is known to ±21 %, which is why the critical value
   of the gate is the Student t quantile (7.84) and not the normal quantile
@@ -1812,5 +1868,6 @@ the worst z-score of the family.
   `oklrab`, `jzazbz`) and the `mallett2019` RGB → raw method.
 * Bundle the other stocks and papers (the upstream ships 20 films and 8
   papers, i.e. 132 looks) and extend the parity fixtures to them.
-* Port the engine to Metal (phase P3), parity tested against this CPU
-  reference.
+* The Metal port of the engine (phase P3) is in place and parity-tested
+  against this CPU reference (§7, CI run 43149838375).  The next product
+  phase is the SwiftUI app shell (P4); it is not started here.
