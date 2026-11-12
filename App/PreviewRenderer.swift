@@ -12,8 +12,11 @@ struct RenderedPreview: @unchecked Sendable {
 enum PreviewRenderer {
 
     /// Runs synchronously; the view model calls this from a detached task.
-    static func render(_ photo: PreparedPhoto) throws -> RenderedPreview {
-        let params = try PreviewLook.pipelineParams()
+    static func render(
+        _ photo: PreparedPhoto,
+        request: PreviewRenderRequest
+    ) throws -> RenderedPreview {
+        let params = try request.pipelineParams()
 
         // A Metal device alone is not enough: MetalBackend can return nil for
         // a missing command queue and can report a shader compilation error

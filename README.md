@@ -11,14 +11,14 @@ back — not a set of baked LUTs.
 
 ## Status
 
-**P3 (the Metal port) is on `main`; P4 App shell is in progress with the minimal preview loop.**
+**P3 (the Metal port) is on `main`; P4 App shell is in progress with the interactive catalogue and basic physical adjustments.**
 
 | Phase | Scope | State |
 |---|---|---|
 | P1 | `FilmPhysics`: pure-Swift port of the spektrafilm pipeline (CPU reference), validated tap by tap against the Python engine | **in progress** (slices 1, 2 and 4 ported: profile loading, the hanatos 2025 spectral upsampling and the whole camera → print → scan chain, negative development with DIR couplers, enlarger printing, print development, scanning, the cam16ucs gamut compression and the whole stock catalogue — parity with the Python engine, mean ΔE2000 ≈ 0.0021) |
 | P2 | Spatial effects (halation, grain, DIR-coupler diffusion, diffusion filters, glare, blur, unsharp) | **in progress** (slice 5 ported: the highlight boost, the in-emulsion scatter, the back-reflection halation, the DIR-coupler diffusion, the four diffusion-filter families, the lens blurs and the unsharp mask — parity with the Python engine, mean ΔE2000 ≈ 0.0011. The **grain** and the **glare** are ported in slice 6 and validated statistically against the upstream) |
 | P3 | Metal port of the engine, parity-tested against the CPU reference | **on `main`** (`FilmPhysicsMetal`): the render plan, the pure-Swift plan evaluator and its `Float32` specification, 28 Metal kernels (the whole per-pixel chain, the spatial effects, the grain and the glare) and the `MetalBackend`, with macOS Metal CI |
-| P4 | SwiftUI app shell | **in progress**: the minimal iOS 17 preview loop (photo selection, EXIF-upright whole-frame 1280 px input, Portra 400 × Portra Endura, Metal with CPU fallback, hold-to-compare). Export, borders, RAW and the parameter panel are not in this slice |
+| P4 | SwiftUI app shell | **in progress**: the iOS 17 preview loop (EXIF-upright whole-frame 1280 px input, Metal with CPU fallback, hold-to-compare), a bottom catalogue of all 20 films, eight print media / direct scan, and a debounced basic panel for camera EV, physical grain and halation. Default: Portra 400 × Portra Endura. Export, borders, RAW and the full advanced panel are not in this slice |
 | P5 | Release | not started |
 
 See [`docs/PLAN.md`](docs/PLAN.md) for the full plan and [`docs/APP.md`](docs/APP.md)
