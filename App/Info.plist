@@ -24,6 +24,8 @@
     <true/>
     <key>NSPhotoLibraryUsageDescription</key>
     <string>Choose a photo from your library to render a film-simulation preview.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>Save your full-resolution film-simulation export to your photo library.</string>
     <key>UILaunchScreen</key>
     <dict/>
     <key>UISupportedInterfaceOrientations</key>

@@ -11,14 +11,14 @@ back — not a set of baked LUTs.
 
 ## Status
 
-**P3 (the Metal port) is on `main`; P4 App shell is in progress with the interactive catalogue and basic physical adjustments.**
+**P3 (the Metal port) is on `main`; P4 App shell is in progress with the interactive catalogue, the basic physical adjustments and the full-resolution export.**
 
 | Phase | Scope | State |
 |---|---|---|
 | P1 | `FilmPhysics`: pure-Swift port of the spektrafilm pipeline (CPU reference), validated tap by tap against the Python engine | **in progress** (slices 1, 2 and 4 ported: profile loading, the hanatos 2025 spectral upsampling and the whole camera → print → scan chain, negative development with DIR couplers, enlarger printing, print development, scanning, the cam16ucs gamut compression and the whole stock catalogue — parity with the Python engine, mean ΔE2000 ≈ 0.0021) |
 | P2 | Spatial effects (halation, grain, DIR-coupler diffusion, diffusion filters, glare, blur, unsharp) | **in progress** (slice 5 ported: the highlight boost, the in-emulsion scatter, the back-reflection halation, the DIR-coupler diffusion, the four diffusion-filter families, the lens blurs and the unsharp mask — parity with the Python engine, mean ΔE2000 ≈ 0.0011. The **grain** and the **glare** are ported in slice 6 and validated statistically against the upstream) |
 | P3 | Metal port of the engine, parity-tested against the CPU reference | **on `main`** (`FilmPhysicsMetal`): the render plan, the pure-Swift plan evaluator and its `Float32` specification, 28 Metal kernels (the whole per-pixel chain, the spatial effects, the grain and the glare) and the `MetalBackend`, with macOS Metal CI |
-| P4 | SwiftUI app shell | **in progress**: the iOS 17 preview loop (EXIF-upright whole-frame 1280 px input, Metal with CPU fallback, hold-to-compare), a bottom catalogue of all 20 films, eight print media / direct scan, and a debounced basic panel for camera EV, physical grain and halation. Default: Portra 400 × Portra Endura. Export, borders, RAW and the full advanced panel are not in this slice |
+| P4 | SwiftUI app shell | **in progress**: the iOS 17 preview loop (EXIF-upright whole-frame 1280 px input, Metal with CPU fallback, hold-to-compare), a bottom catalogue of all 20 films, eight print media / direct scan, and a debounced basic panel for camera EV, physical grain and halation. Default: Portra 400 × Portra Endura. The **full-resolution export** (GPU, tiled when the device budget needs it, never cropping the grade) writes a JPEG or a HEIC with the EXIF of the source (upright pixels, orientation 1, the other tags carried) and saves it in the photo library with the add-only authorization; the six offered borders are painted around the picture. RAW and the full advanced panel are not in this slice |
 | P5 | Release | not started |
 
 See [`docs/PLAN.md`](docs/PLAN.md) for the full plan and [`docs/APP.md`](docs/APP.md)
@@ -119,6 +119,27 @@ Sources/FilmPhysicsMetal/         the Metal port of the engine (GPU)
                                   plan and the builders of the convolution kernels
   Shaders/FilmShaders.metal       the 28 compute kernels (the chain, the spatial
                                   effects, the grain and the glare)
+Sources/FrameCore/                the vendored border painter (unchanged)
+                                  (lightsuffer-border-mac @ f6de465)
+App/                              the Xcode-only SwiftUI application target
+  PreviewViewModel.swift          the preview session and the export state
+  PreviewRenderer.swift           the 1280 px preview render (Metal / CPU)
+  ExportOrchestrator.swift        the tiled full-resolution GPU export
+  ExportPipeline.swift            decode → plan → render → frame → encode → save
+  PhotoLibraryWriter.swift        the add-only write into the photo library
+  FramedImageRenderer.swift       the border around the untouched picture
+  ExportImageEncoder.swift        the JPEG / HEIC writer and its EXIF policy
+Sources/LightSufferPreview/       the platform-neutral helpers of the app shell
+  PreviewGeometry.swift           the EXIF orientation and the preview sizes
+  PreviewLook.swift               the catalogue look and the basic adjustments
+  PreviewSession.swift            the debounced session and its generations
+  SRGBPixelBuffer.swift           the sRGB display buffer and the colour contract
+  ExportRequest.swift             the snapshot, the metadata plan and the progress
+  ExportSpatialPolicy.swift       the overlap the spatial effects need
+  ExportTilePlanner.swift         the overlapped tiles of the export
+  ExportDeviceBudget.swift        the tile budget of the device
+  ExportImageBuffer.swift         the crop and the stitch of the tiles
+  ExportPlanner.swift             the complete plan of one export
 Tests/FilmPhysicsMetalTests/      the Metal test target (macOS only)
   MetalParityTests.swift          the parity of the GPU against the CPU reference and
                                   the timing of a 1024 x 1024 image

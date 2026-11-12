@@ -1,4 +1,5 @@
 import CoreGraphics
+import FrameCore
 import LightSufferPreview
 import PhotosUI
 import SwiftUI
@@ -13,7 +14,9 @@ struct ContentView: View {
         if holdingOriginal {
             return model.originalImage
         }
-        return model.gradedImage ?? model.originalImage
+        // The framed preview shows the border of the export with the layout
+        // of the full resolution frame.
+        return model.framedImage ?? model.gradedImage ?? model.originalImage
     }
 
     var body: some View {
@@ -122,6 +125,10 @@ struct ContentView: View {
                 .accessibilityIdentifier("open-adjustments")
             }
 
+            exportControls
+
+            exportStatus
+
             if model.gradedImage != nil {
                 Text("Hold the photo to compare with the original")
                     .font(.caption2)
@@ -132,6 +139,110 @@ struct ContentView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(.ultraThinMaterial)
+    }
+
+    /// The compact export control: the border, the format and the button.
+    private var exportControls: some View {
+        HStack(spacing: 10) {
+            Menu {
+                ForEach(ExportRequest.offeredBorderStyles, id: \.self) { style in
+                    Button {
+                        model.selectBorder(style: style)
+                    } label: {
+                        if style == model.exportBorderStyle {
+                            Label(style.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(style.displayName)
+                        }
+                    }
+                }
+            } label: {
+                Label(model.exportBorderStyle.displayName, systemImage: "rectangle.dashed")
+                    .font(.callout)
+                    .lineLimit(1)
+            }
+            .disabled(model.isExportRunning)
+            .accessibilityIdentifier("export-border")
+
+            Menu {
+                ForEach(ExportFormat.allCases, id: \.self) { format in
+                    Button {
+                        model.selectFormat(format: format)
+                    } label: {
+                        if format == model.exportFormat {
+                            Label(format.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(format.displayName)
+                        }
+                    }
+                }
+            } label: {
+                Label(model.exportFormat.displayName, systemImage: "photo")
+                    .font(.callout)
+            }
+            .disabled(model.isExportRunning)
+            .accessibilityIdentifier("export-format")
+
+            Spacer(minLength: 0)
+
+            Button {
+                model.startExport()
+            } label: {
+                Label("Export", systemImage: "square.and.arrow.up")
+                    .font(.callout.weight(.medium))
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!model.canExport)
+            .accessibilityIdentifier("export-button")
+        }
+    }
+
+    /// The progress of the export, and its cancel control.
+    @ViewBuilder
+    private var exportStatus: some View {
+        switch model.exportState {
+        case .idle:
+            EmptyView()
+        case .running(let progress):
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    ProgressView(value: progress.fractionCompleted)
+                        .progressViewStyle(.linear)
+                    Text(model.exportProgressText(progress))
+                        .font(.caption)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    Button("Cancel") {
+                        model.cancelExport()
+                    }
+                    .font(.caption.weight(.medium))
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("export-cancel")
+                }
+                if let snapshot = model.exportSnapshotName {
+                    Text("Exporting \(snapshot)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        case .cancelled:
+            Label("Export cancelled.", systemImage: "xmark.circle")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        case .saved(let summary):
+            Label(summary, systemImage: "checkmark.circle.fill")
+                .font(.footnote)
+                .foregroundStyle(.green)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .font(.footnote)
+                .foregroundStyle(.red)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private var filmStrip: some View {
@@ -230,7 +341,7 @@ struct ContentView: View {
                 Section("Halation") {
                     Toggle("Halation", isOn: $model.adjustments.halationEnabled)
                     HStack {
-                        Text("Amount")
+                        Text("Halation amount")
                         Spacer()
                         Text("\(model.adjustments.halationAmount, specifier: "%.2f")×")
                             .foregroundStyle(.secondary)

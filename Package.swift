@@ -23,6 +23,7 @@ let package = Package(
     products: [
         .library(name: "FilmPhysics", targets: ["FilmPhysics"]),
         .library(name: "FilmPhysicsMetal", targets: ["FilmPhysicsMetal"]),
+        .library(name: "FrameCore", targets: ["FrameCore"]),
         .library(name: "LightSufferPreview", targets: ["LightSufferPreview"]),
     ],
     targets: [
@@ -46,8 +47,12 @@ let package = Package(
             ]
         ),
         .target(
+            name: "FrameCore",
+            exclude: ["README.md"]
+        ),
+        .target(
             name: "LightSufferPreview",
-            dependencies: ["FilmPhysics"]
+            dependencies: ["FilmPhysics", "FrameCore"]
         ),
         .testTarget(
             name: "FilmPhysicsTests",
@@ -62,7 +67,7 @@ let package = Package(
         ),
         .testTarget(
             name: "LightSufferPreviewTests",
-            dependencies: ["LightSufferPreview", "FilmPhysics"]
+            dependencies: ["LightSufferPreview", "FilmPhysics", "FrameCore"]
         ),
     ]
 )
