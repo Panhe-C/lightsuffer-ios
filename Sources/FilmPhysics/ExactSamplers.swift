@@ -45,7 +45,7 @@ import Foundation
 /// The default is ``fast``: the algorithm of the CPU reference (and of the
 /// Metal kernels) must not change, so that the existing fixtures and the
 /// existing validations stay valid.
-public enum GrainSampler: Sendable {
+public enum GrainSampler: Sendable, Equatable {
 
     /// The fast kernels of the upstream (`spektrafilm.utils.fast_stats`).
     ///

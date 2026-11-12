@@ -251,14 +251,27 @@ struct FilmGrainParams {
     var sampleCount: UInt32 = 0
     var layerCount: UInt32 = 0
     var positive: UInt32 = 0
-    var reserved: UInt32 = 0
+    /// The sampler of the variates of the particles: zero for the fast
+    /// kernels of the upstream (the default), one for the exact samplers.
+    ///
+    /// (`sampler` is a keyword of the shading language, so the member is
+    /// named `samplerMode`.)
+    var samplerMode: UInt32 = 0
 
-    init(width: Int, height: Int, sampleCount: Int, layerCount: Int, positive: Bool) {
+    init(
+        width: Int,
+        height: Int,
+        sampleCount: Int,
+        layerCount: Int,
+        positive: Bool,
+        sampler: GrainSampler = .fast
+    ) {
         self.width = UInt32(width)
         self.height = UInt32(height)
         self.sampleCount = UInt32(sampleCount)
         self.layerCount = UInt32(layerCount)
         self.positive = positive ? 1 : 0
+        self.samplerMode = sampler == .exact ? 1 : 0
     }
 }
 
@@ -530,12 +543,15 @@ struct MetalGrainBuffers {
     ///   - width: the width of the image, in pixels.
     ///   - height: the height of the image, in pixels.
     ///   - seed: the seed of the pipeline.
+    ///   - sampler: the sampler of the variates of the particles: the fast
+    ///     kernels of the upstream (the default) or the exact samplers.
     ///   - device: the Metal device.
     init(
         plan: FilmGrainPlan,
         width: Int,
         height: Int,
         seed: UInt64,
+        sampler: GrainSampler = .fast,
         device: MTLDevice
     ) throws {
         func buffer(_ values: [Float]) throws -> MTLBuffer {
@@ -567,7 +583,8 @@ struct MetalGrainBuffers {
             height: height,
             sampleCount: plan.sampleCount,
             layerCount: FilmGrainPlan.layerCount,
-            positive: plan.positiveFilm
+            positive: plan.positiveFilm,
+            sampler: sampler
         )
         guard let parametersBuffer = device.makeBuffer(
             bytes: &parameters, length: MemoryLayout<FilmGrainParams>.stride,

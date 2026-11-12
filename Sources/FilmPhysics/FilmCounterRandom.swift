@@ -382,6 +382,83 @@ public enum FilmCounterRandom {
         return ExactSamplers.binomial(n: n, p: Double(p), uniform: u)
     }
 
+    /// An exact Poisson variate, in the precision of the GPU.
+    ///
+    /// The variate is drawn from the **exact** Poisson distribution, with
+    /// the single precision arithmetic of the GPU: this function is the
+    /// **executable specification** of the Metal kernel `filmPoissonExact`
+    /// of `Shaders/FilmShaders.metal`.
+    ///
+    /// The uniform variate is the 24 high bits of the hash of the first
+    /// stream of the exact Poisson: they are the 24 high bits of the 53
+    /// bit uniform of ``poissonExact(lambda:seed:pixel:layer:channel:)``,
+    /// i.e. the two implementations draw their variates from the **same**
+    /// uniforms (the single precision inversion resolves them to the same
+    /// variate, except for the uniforms that fall within `1e-5` of a
+    /// boundary of the cumulative distribution).
+    ///
+    /// - Parameters:
+    ///   - lambda: the mean of the distribution.
+    ///   - seed: the seed of the stream.
+    ///   - pixel: the index of the pixel.
+    ///   - layer: the index of the emulsion layer.
+    ///   - channel: the index of the colour channel.
+    /// - Returns: the variate.
+    public static func poissonExactFloat32(
+        lambda: Float,
+        seed: UInt32,
+        pixel: UInt32,
+        layer: UInt32,
+        channel: UInt32
+    ) -> Int {
+        guard lambda > 0 else { return 0 }
+        let u = uniform(
+            counter(
+                seed: seed, pixel: pixel, layer: layer, channel: channel,
+                stream: Stream.poissonExactA
+            )
+        )
+        return Float32ExactSamplers.poisson(lambda: lambda, uniform: u)
+    }
+
+    /// An exact binomial variate, in the precision of the GPU.
+    ///
+    /// The variate is drawn from the **exact** binomial distribution, with
+    /// the single precision arithmetic of the GPU: this function is the
+    /// **executable specification** of the Metal kernel `filmBinomialExact`
+    /// of `Shaders/FilmShaders.metal`.
+    ///
+    /// The uniform variate is the 24 high bits of the hash of the first
+    /// stream of the exact binomial (see
+    /// ``poissonExactFloat32(lambda:seed:pixel:layer:channel:)``).
+    ///
+    /// - Parameters:
+    ///   - n: the number of trials.
+    ///   - p: the probability of a success.
+    ///   - seed: the seed of the stream.
+    ///   - pixel: the index of the pixel.
+    ///   - layer: the index of the emulsion layer.
+    ///   - channel: the index of the colour channel.
+    /// - Returns: the variate.
+    public static func binomialExactFloat32(
+        n: Int,
+        p: Float,
+        seed: UInt32,
+        pixel: UInt32,
+        layer: UInt32,
+        channel: UInt32
+    ) -> Int {
+        guard n > 0, p > 0 else { return 0 }
+        guard p < 1 else { return n }
+        let u = uniform(
+            counter(
+                seed: seed, pixel: pixel, layer: layer, channel: channel,
+                stream: Stream.binomialExactA
+            )
+        )
+        return Float32ExactSamplers.binomial(n: n, p: p, uniform: u)
+    }
+
     /// A lognormal variate with the given parameters of the underlying
     /// normal.
     ///

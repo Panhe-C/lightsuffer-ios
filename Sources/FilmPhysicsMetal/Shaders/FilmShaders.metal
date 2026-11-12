@@ -153,7 +153,12 @@ struct FilmGrainParams {
     uint sampleCount;
     uint layerCount;
     uint positive;
-    uint reserved;
+    // The sampler of the variates of the particles: zero for the fast
+    // kernels of the upstream (the default), one for the exact samplers
+    // (the inversion of the cumulative distribution, around the mode of the
+    // distribution).  (`sampler` is a keyword of the shading language, so
+    // the member is named `samplerMode`.)
+    uint samplerMode;
 };
 
 /// The parameters of the micro structure of the emulsion.
@@ -810,6 +815,552 @@ inline float filmLognormalFromMeanStd(
         mu = log(mean) - sigmaSquared / 2.0;
     }
     return filmLognormal(mu, sigma, seed, pixel, layer, channel);
+}
+
+// MARK: - The exact samplers of the grain
+
+// The largest uniform variate the single precision can represent below one
+// (`1 - 2^-24`).  The uniform of the counter based generator is built from
+// the 24 high bits of a hash, so it is always below this bound; the clamp
+// only protects the samplers against a uniform of one.
+#define FILM_MAX_UNIFORM 0.99999994
+// The bound of the walk of the inversion of the cumulative distribution.
+//
+// The terms of a distribution decay geometrically beyond the mode, so the
+// walk stops on the underflow of the probability or on the stall of the
+// accumulation long before the bound: the bound is a safety net (a
+// parameter that is not a number would otherwise make the walk run for
+// billions of iterations).
+#define FILM_MAX_EXACT_STEPS 1048576
+
+/// The natural logarithm of the gamma function.
+///
+/// The Lanczos approximation (the nine coefficients of `g = 7`), i.e. the
+/// executable specification of `Float32ExactSamplers.logGamma` of the
+/// Swift side (`Sources/FilmPhysics/Float32ExactSamplers.swift`).
+///
+/// - Parameter z: the argument.
+/// - Returns: the natural logarithm of the gamma function.
+inline float filmLogGamma(float z) {
+    if (z < 0.5) {
+        // The reflection formula.
+        return log(M_PI_F / abs(sin(M_PI_F * z))) - filmLogGamma(1.0 - z);
+    }
+    const float shifted = z - 1.0;
+    float sum = 0.99999999999980993;
+    sum += 676.5203681218851 / (shifted + 1.0);
+    sum += -1259.1392167224028 / (shifted + 2.0);
+    sum += 771.32342877765313 / (shifted + 3.0);
+    sum += -176.61502916214059 / (shifted + 4.0);
+    sum += 12.507343278686905 / (shifted + 5.0);
+    sum += -0.13857109526572012 / (shifted + 6.0);
+    sum += 9.9843695780195716e-6 / (shifted + 7.0);
+    sum += 1.5056327351493116e-7 / (shifted + 8.0);
+    const float t = shifted + 7.5;
+    return 0.5 * log(2.0 * M_PI_F) + (shifted + 0.5) * log(t) - t + log(sum);
+}
+
+/// The correction of the Stirling expansion of the logarithm of the gamma
+/// function.
+///
+/// It is the difference between the exact logarithm of the gamma function
+/// and its main term.  For a large argument the Bernoulli series is used;
+/// for a small argument the exact difference is computed (both terms are
+/// small, so the difference is accurate).
+///
+/// - Parameter z: the argument.
+/// - Returns: the correction.
+inline float filmStirlingCorrection(float z) {
+    if (z <= 0.0) {
+        return 0.0;
+    }
+    if (z < 8.0) {
+        return filmLogGamma(z) - ((z - 0.5) * log(z) - z + 0.5 * log(2.0 * M_PI_F));
+    }
+    // The Bernoulli numbers `B(2j)` divided by `2j(2j-1)`, the powers of
+    // `z` computed by repeated multiplication (the series is truncated by
+    // the single precision anyway).
+    const float z2 = z * z;
+    float power = z;
+    float sum = 0.0;
+    sum += (1.0 / 12.0) / power;
+    power *= z2;
+    sum += (-1.0 / 360.0) / power;
+    power *= z2;
+    sum += (1.0 / 1260.0) / power;
+    power *= z2;
+    sum += (-1.0 / 1680.0) / power;
+    power *= z2;
+    sum += (1.0 / 1188.0) / power;
+    power *= z2;
+    sum += (-691.0 / 360360.0) / power;
+    power *= z2;
+    sum += (1.0 / 156.0) / power;
+    power *= z2;
+    sum += (-3617.0 / 122400.0) / power;
+    power *= z2;
+    sum += (43867.0 / 244188.0) / power;
+    power *= z2;
+    sum += (-174611.0 / 125400.0) / power;
+    return sum;
+}
+
+/// The logarithm of the probability of a Poisson distribution.
+///
+/// The evaluation is **cancellation free**: the terms of the Stirling
+/// expansion are combined into the relative entropy of the distribution, so
+/// that the error of the result is of the order of the rounding of the
+/// result itself (and not of the order of the rounding of the terms, which
+/// are of the order of `k·log(λ)`).
+///
+/// - Parameters:
+///   - lambda: the mean of the distribution.
+///   - k: the value.
+/// - Returns: the logarithm of the probability of `k`.
+inline float filmLogPoissonProbability(float lambda, int k) {
+    if (lambda <= 0.0 || k < 0) {
+        return -INFINITY;
+    }
+    if (k == 0) {
+        return -lambda;
+    }
+    const float count = float(k);
+    const float excess = count + 1.0 - lambda;
+    float value = -count * log1p(excess / lambda) + excess;
+    value -= 0.5 * log(2.0 * M_PI_F * (count + 1.0));
+    value -= filmStirlingCorrection(count + 1.0);
+    return value;
+}
+
+/// The logarithm of the probability of a binomial distribution.
+///
+/// The evaluation is **cancellation free**, like the one of the Poisson.
+///
+/// - Parameters:
+///   - n: the number of trials.
+///   - k: the number of successes.
+///   - p: the probability of a success.
+/// - Returns: the logarithm of the probability of `k`.
+inline float filmLogBinomialProbability(int n, int k, float p) {
+    if (n <= 0 || k < 0 || k > n) {
+        return -INFINITY;
+    }
+    if (p <= 0.0 || p >= 1.0) {
+        return -INFINITY;
+    }
+    const float q = 1.0 - p;
+    if (k == 0) {
+        return float(n) * log(q);
+    }
+    if (k == n) {
+        return float(n) * log(p);
+    }
+    const float trials = float(n);
+    const float successes = float(k);
+    const float failures = float(n - k);
+    float value = successes * log1p(
+        (p * (trials + 1.0) - (successes + 1.0)) / (successes + 1.0)
+    );
+    value += failures * log1p(
+        (q * (trials + 1.0) - (failures + 1.0)) / (failures + 1.0)
+    );
+    value += 0.5 * log(
+        (trials + 1.0) / (2.0 * M_PI_F * (successes + 1.0) * (failures + 1.0))
+    );
+    value += 1.0;
+    value += filmStirlingCorrection(trials + 1.0);
+    value -= filmStirlingCorrection(successes + 1.0);
+    value -= filmStirlingCorrection(failures + 1.0);
+    return value;
+}
+
+/// The series expansion of the lower incomplete gamma function.
+///
+/// - Parameters:
+///   - a: the shape of the gamma distribution.
+///   - x: the argument.
+///   - front: the front factor of the expansion.
+/// - Returns: the value of the series.
+inline float filmGammaSeries(float a, float x, float front) {
+    // The convergence threshold of the single precision (the CPU reference
+    // uses `3e-16`, the threshold of the double precision).
+    const float epsilon = 1e-7;
+    float ap = a;
+    float sum = 1.0 / a;
+    float delta = sum;
+    int iterations = 0;
+    while (iterations < 1000) {
+        ap += 1.0;
+        delta *= x / ap;
+        sum += delta;
+        if (abs(delta) < abs(sum) * epsilon) {
+            break;
+        }
+        iterations += 1;
+    }
+    return sum * front;
+}
+
+/// The continued fraction expansion of the upper incomplete gamma function.
+///
+/// - Parameters:
+///   - a: the shape of the gamma distribution.
+///   - x: the argument.
+///   - front: the front factor of the expansion.
+/// - Returns: the value of the continued fraction.
+inline float filmGammaContinuedFraction(float a, float x, float front) {
+    const float epsilon = 1e-7;
+    // The floor of the denominators: the single precision cannot represent
+    // `1e-300` (it would be a zero, and the division by it an infinity).
+    const float tiny = 1e-30;
+    float b = x + 1.0 - a;
+    float c = 1.0 / tiny;
+    float d = 1.0 / b;
+    float h = d;
+    int iterations = 0;
+    while (iterations < 1000) {
+        const float i = float(iterations + 1);
+        const float an = -i * (i - a);
+        b += 2.0;
+        d = an * d + b;
+        if (abs(d) < tiny) { d = tiny; }
+        c = b + an / c;
+        if (abs(c) < tiny) { c = tiny; }
+        d = 1.0 / d;
+        const float delta = d * c;
+        h *= delta;
+        if (abs(delta - 1.0) < epsilon) { break; }
+        iterations += 1;
+    }
+    return front * h;
+}
+
+/// The regularised upper incomplete gamma function `Q(a, x)`, with the
+/// **cancellation free** evaluation of its front factor.
+///
+/// `Q(a, x) = Γ(a, x) / Γ(a)` is the tail of the gamma distribution; the
+/// cumulative distribution of a Poisson distribution is
+/// `P(X ≤ k) = Q(k + 1, λ)`.
+///
+/// - Parameters:
+///   - a: the shape of the gamma distribution (an integer ≥ 1).
+///   - x: the argument.
+/// - Returns: the value of `Q(a, x)`.
+inline float filmRegularizedGammaQ(int a, float x) {
+    if (a <= 0) { return 1.0; }
+    if (x <= 0.0) { return 1.0; }
+    if (!isfinite(x)) { return 0.0; }
+    const float shape = float(a);
+    const float front = exp(filmLogPoissonProbability(x, a - 1) + log(x));
+    if (x < shape + 1.0) {
+        return 1.0 - filmGammaSeries(shape, x, front);
+    }
+    return filmGammaContinuedFraction(shape, x, front);
+}
+
+/// The continued fraction of the incomplete beta function (the modified
+/// Lentz method).
+///
+/// - Parameters:
+///   - a: the first shape.
+///   - b: the second shape.
+///   - x: the argument, in `[0, 1]`.
+/// - Returns: the value of the continued fraction.
+inline float filmBetaContinuedFraction(float a, float b, float x) {
+    const float epsilon = 1e-7;
+    const float tiny = 1e-30;
+    const float qab = a + b;
+    const float qap = a + 1.0;
+    const float qam = a - 1.0;
+    float c = 1.0;
+    float d = 1.0 - qab * x / qap;
+    if (abs(d) < tiny) { d = tiny; }
+    d = 1.0 / d;
+    float h = d;
+    int m = 1;
+    while (m <= 300) {
+        const float m2 = 2.0 * float(m);
+        // The even step.
+        float numerator = float(m) * (b - float(m)) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + numerator * d;
+        if (abs(d) < tiny) { d = tiny; }
+        c = 1.0 + numerator / c;
+        if (abs(c) < tiny) { c = tiny; }
+        d = 1.0 / d;
+        h *= d * c;
+        // The odd step.
+        numerator = -(a + float(m)) * (qab + float(m)) * x
+            / ((a + m2) * (qap + m2));
+        d = 1.0 + numerator * d;
+        if (abs(d) < tiny) { d = tiny; }
+        c = 1.0 + numerator / c;
+        if (abs(c) < tiny) { c = tiny; }
+        d = 1.0 / d;
+        const float delta = d * c;
+        h *= delta;
+        if (abs(delta - 1.0) < epsilon) { break; }
+        m += 1;
+    }
+    return h;
+}
+
+/// The regularised incomplete beta function `I_x(a, b)`, with the
+/// **cancellation free** evaluation of its front factor.
+///
+/// `I_x(a, b)` is the cumulative distribution function of the beta
+/// distribution; the cumulative distribution of a binomial distribution is
+/// `P(X ≤ k) = I_p(k + 1, n - k)`.
+///
+/// - Parameters:
+///   - a: the first shape (an integer ≥ 1).
+///   - b: the second shape (an integer ≥ 1).
+///   - x: the argument, in `[0, 1]`.
+/// - Returns: the value of `I_x(a, b)`.
+inline float filmRegularizedIncompleteBeta(int a, int b, float x) {
+    if (a <= 0 || b <= 0) { return NAN; }
+    if (x <= 0.0) { return 0.0; }
+    if (x >= 1.0) { return 1.0; }
+    const int n = a + b - 1;
+    // The front factor is `x·b·P(a - 1; n, x)`: the probability of the
+    // binomial distribution of `n` trials at `a - 1` successes, times the
+    // factor of the tail of the beta distribution.
+    const float front = exp(
+        filmLogBinomialProbability(n, a - 1, x) + log(x) + log(float(b))
+    );
+    if (x < (float(a) + 1.0) / (float(a + b) + 2.0)) {
+        return front * filmBetaContinuedFraction(float(a), float(b), x) / float(a);
+    }
+    return 1.0 - front * filmBetaContinuedFraction(float(b), float(a), 1.0 - x) / float(b);
+}
+
+/// An exact Poisson variate.
+///
+/// The variate is drawn from the **exact** Poisson distribution, i.e. the
+/// distribution of the default path of the upstream (the SciPy `poisson`
+/// generator) and not from the normal approximation of the fast kernel of
+/// the upstream: the inversion of the cumulative distribution, around the
+/// mode of the distribution (the mode of a Poisson distribution is
+/// `floor(λ)`).
+///
+/// The uniform variate is the 24 high bits of the hash of the stream
+/// `0x6000` (the high bits of the 53 bit uniform of the CPU reference,
+/// `FilmCounterRandom.Stream.poissonExactA`): the two implementations draw
+/// their variates from the **same** uniforms.
+///
+/// The algorithm is the executable specification of
+/// `Float32ExactSamplers.poisson(lambda:uniform:)` of the Swift side.
+///
+/// - Parameters:
+///   - rate: the mean of the distribution.
+///   - seed: the seed of the stream.
+///   - pixel: the index of the pixel.
+///   - layer: the index of the emulsion layer.
+///   - channel: the index of the colour channel.
+/// - Returns: the variate.
+inline int filmPoissonExact(
+    float rate,
+    uint seed,
+    uint pixel,
+    uint layer,
+    uint channel
+) {
+    if (rate <= 0.0 || !isfinite(rate)) {
+        return 0;
+    }
+    const float u = min(max(
+        filmUniform(filmCounter(seed, pixel, layer, channel, 0x6000u)), 0.0
+    ), FILM_MAX_UNIFORM);
+
+    // The mode of the distribution and its probability.
+    const int mode = int(floor(rate));
+    const float modeProbability = exp(filmLogPoissonProbability(rate, mode));
+    if (!(modeProbability > 0.0) || !isfinite(modeProbability)) {
+        return mode;
+    }
+
+    // The cumulative distribution below the mode: `P(X ≤ mode - 1)`.
+    const float below = mode > 0 ? filmRegularizedGammaQ(mode, rate) : 0.0;
+    const float top = below + modeProbability;
+
+    if (u < below) {
+        // The variate is below the mode: the cumulative distribution is
+        // walked **down** from the mode.  The mass that is subtracted from
+        // the cumulative distribution is accumulated with a compensated
+        // summation, so that the rounding of the accumulation stays of the
+        // order of the rounding of the result.
+        int k = mode;
+        float probability = modeProbability;     // P(k)
+        float mass = 0.0;                        // the mass of (k, mode]
+        float compensation = 0.0;
+        while (k > 0) {
+            // The cumulative distribution of `k - 1`.
+            const float previous = top - mass - probability;
+            if (previous <= u) { break; }
+            const float adjusted = probability - compensation;
+            const float updated = mass + adjusted;
+            compensation = (updated - mass) - adjusted;
+            mass = updated;
+            probability *= float(k) / rate;      // P(k - 1)
+            k -= 1;
+        }
+        return k;
+    }
+
+    if (u < top) {
+        // The variate is the mode itself.
+        return mode;
+    }
+
+    // The variate is above the mode: the cumulative distribution is walked
+    // **up** from the mode.
+    int k = mode;
+    float probability = modeProbability;         // P(k)
+    float mass = 0.0;                            // the mass of (mode, k]
+    float compensation = 0.0;
+    while (k < FILM_MAX_EXACT_STEPS) {
+        const float next = probability * rate / float(k + 1);   // P(k + 1)
+        if (next == 0.0) {
+            // The probability underflowed: the mass of the tail beyond
+            // this point is below the resolution of the single precision,
+            // so the uniform cannot fall in it.
+            break;
+        }
+        const float updated = mass + next;
+        if (updated == mass && top + mass > u) {
+            // The accumulation of the cumulative distribution stalled: the
+            // remaining mass is below the rounding of the sum.  The
+            // variate is the last `k` whose probability is not negligible
+            // (and **not** a far outlier).
+            break;
+        }
+        const float adjusted = next - compensation;
+        const float summed = mass + adjusted;
+        compensation = (summed - mass) - adjusted;
+        mass = summed;
+        probability = next;
+        k += 1;
+        if (top + mass > u) { break; }
+    }
+    return k;
+}
+
+/// An exact binomial variate.
+///
+/// The variate is drawn from the **exact** binomial distribution, i.e. the
+/// distribution of the default path of the upstream (the SciPy `binom`
+/// generator) and not from the normal approximation of the fast kernel of
+/// the upstream: the inversion of the cumulative distribution, around the
+/// mode of the distribution (the mode of a binomial distribution is
+/// `floor((n + 1) p)`).
+///
+/// The uniform variate is the 24 high bits of the hash of the stream
+/// `0x7000` (the high bits of the 53 bit uniform of the CPU reference,
+/// `FilmCounterRandom.Stream.binomialExactA`).
+///
+/// The algorithm is the executable specification of
+/// `Float32ExactSamplers.binomial(n:p:uniform:)` of the Swift side.
+///
+/// - Parameters:
+///   - n: the number of trials.
+///   - p: the probability of a success.
+///   - seed: the seed of the stream.
+///   - pixel: the index of the pixel.
+///   - layer: the index of the emulsion layer.
+///   - channel: the index of the colour channel.
+/// - Returns: the number of successes.
+inline int filmBinomialExact(
+    int n,
+    float p,
+    uint seed,
+    uint pixel,
+    uint layer,
+    uint channel
+) {
+    if (n <= 0 || p <= 0.0) {
+        return 0;
+    }
+    if (p >= 1.0) {
+        return n;
+    }
+    const float u = min(max(
+        filmUniform(filmCounter(seed, pixel, layer, channel, 0x7000u)), 0.0
+    ), FILM_MAX_UNIFORM);
+    const float q = 1.0 - p;
+
+    // The mode of the distribution and its probability.
+    const int mode = min(max(int(floor((float(n) + 1.0) * p)), 0), n);
+    const float modeProbability = exp(filmLogBinomialProbability(n, mode, p));
+    if (!(modeProbability > 0.0) || !isfinite(modeProbability)) {
+        return mode;
+    }
+
+    // The cumulative distribution below the mode: `P(X ≤ mode - 1)`.  The
+    // identity of the binomial distribution is
+    // `P(X ≤ k) = I_(1-p)(n - k, k + 1)`.
+    const float below = mode > 0
+        ? filmRegularizedIncompleteBeta(n - mode + 1, mode, q)
+        : 0.0;
+    const float top = below + modeProbability;
+
+    if (u < below) {
+        // The variate is below the mode: the cumulative distribution is
+        // walked **down** from the mode.
+        int k = mode;
+        float probability = modeProbability;     // P(k)
+        float mass = 0.0;                        // the mass of (k, mode]
+        float compensation = 0.0;
+        while (k > 0) {
+            const float previous = top - mass - probability;
+            if (previous <= u) { break; }
+            const float adjusted = probability - compensation;
+            const float updated = mass + adjusted;
+            compensation = (updated - mass) - adjusted;
+            mass = updated;
+            probability *= float(k) * q / (float(n - k + 1) * p);   // P(k - 1)
+            k -= 1;
+        }
+        return k;
+    }
+
+    if (u < top) {
+        // The variate is the mode itself.
+        return mode;
+    }
+
+    // The variate is above the mode: the cumulative distribution is walked
+    // **up** from the mode, until the end of the support (the binomial
+    // distribution is bounded, so the walk always terminates).
+    int k = mode;
+    float probability = modeProbability;         // P(k)
+    float mass = 0.0;                            // the mass of (mode, k]
+    float compensation = 0.0;
+    while (k < n) {
+        const float next = probability * float(n - k) * p
+            / (float(k + 1) * q);                // P(k + 1)
+        if (next == 0.0) {
+            // The probability underflowed: the mass of the tail beyond
+            // this point is negligible.
+            break;
+        }
+        const float updated = mass + next;
+        if (updated == mass && top + mass > u) {
+            // The accumulation stalled: the variate is the last `k` whose
+            // probability is not negligible.
+            break;
+        }
+        const float adjusted = next - compensation;
+        const float summed = mass + adjusted;
+        compensation = (summed - mass) - adjusted;
+        mass = summed;
+        probability = next;
+        k += 1;
+        if (top + mass > u) { break; }
+    }
+    // The support ends at `n`: when the accumulated cumulative distribution
+    // never exceeds the uniform (the sum of the terms of the distribution
+    // is one, up to the rounding of the arithmetic), the variate is the
+    // last `k` of the support.
+    return k;
 }
 
 // MARK: - The kernels of the per pixel chain
@@ -1769,6 +2320,12 @@ kernel void filmHalationCombine(
 /// based** generator, so the field does not depend on the order of the
 /// pixels.
 ///
+/// The **sampler** of the variates is the one of the parameters: the fast
+/// kernels of the upstream (the default) or the exact samplers (the
+/// inversion of the cumulative distribution, around the mode of the
+/// distribution, which draw from the very same distributions as the SciPy
+/// generators of the default path of the upstream).
+///
 /// The output of the kernel is one image per colour channel, with one
 /// channel per emulsion layer: the image of the cyan is
 /// `outCyan[pixel * 3 + layer]`, and so on.
@@ -1792,6 +2349,8 @@ kernel void filmGrainLayers(
     const uint samples = params.sampleCount;
     const uint layers = params.layerCount;
     const bool positive = params.positive > 0;
+    // The sampler of the variates of the particles.
+    const bool exact = params.samplerMode > 0;
 
     for (uint colour = 0; colour < 3; ++colour) {
         const float value = density[pixel * 3 + colour];
@@ -1863,12 +2422,26 @@ kernel void filmGrainLayers(
             float probability = clamp(planeDensity / densityMax, 1e-6, 1.0 - 1e-6);
             const float saturation = 1.0 - probability * uniformityValue * (1.0 - 1e-6);
             const uint seed = uint(seeds[colour * 3 + layer]);
-            const int particles = filmPoisson(
-                nParticles / saturation, seed, pixel, layer, colour
-            );
-            const int developed = filmBinomial(
-                particles, probability, seed, pixel, layer, colour
-            );
+            int particles = 0;
+            int developed = 0;
+            if (exact) {
+                // The exact samplers: the inversion of the cumulative
+                // distribution, around the mode of the distribution.
+                particles = filmPoissonExact(
+                    nParticles / saturation, seed, pixel, layer, colour
+                );
+                developed = filmBinomialExact(
+                    particles, probability, seed, pixel, layer, colour
+                );
+            } else {
+                // The fast kernels of the upstream (the default).
+                particles = filmPoisson(
+                    nParticles / saturation, seed, pixel, layer, colour
+                );
+                developed = filmBinomial(
+                    particles, probability, seed, pixel, layer, colour
+                );
+            }
             const float developedDensity = float(developed) * od * saturation;
             // The output of the kernel is one image per colour channel.
             if (colour == 0) {

@@ -866,11 +866,15 @@ the distribution of the upstream default path, and the discrepancy of the
 fast path is therefore **resolved** (by the exact mode) and **explained**
 (by the underflow).
 
-The Metal kernels have **no** exact mode yet: the shading language has no
-log gamma function, and the inversion from the mode needs it.  The GPU
-therefore reproduces the fast path (and its underflow), like the CPU
-reference does by default; the exact mode of the GPU is a deferred item
-(§7.9).
+The Metal kernels have an **exact mode** too (§7.13): the shading
+language has no log gamma function, but the Lanczos approximation of it
+(and the whole inversion around the mode) can be written in `Float32` —
+the executable specification of the kernels is
+`Float32ExactSamplers` of the Swift side, and the limits of the single
+precision are documented in §7.13.  The **default** of the GPU is still the
+fast path (and its underflow), like the default of the CPU reference; the
+exact mode is opt in (`PipelineParams.stochastic.grainSampler`, or the
+`sampler` argument of the render of the Metal backend).
 
 ---
 
@@ -1199,7 +1203,7 @@ implements:
 | `filmCombine2`, `filmCombine3` | the linear combinations of the upstream filters | the combinations |
 | `filmScatterCombine` | `Halation.apply` (the in emulsion scatter) | the halation |
 | `filmHalationCombine` | `Halation.apply` (the back reflection) | the halation |
-| `filmGrainLayers` | `Grain.layerParticleModel` (the sub layer model) | the grain of the negative |
+| `filmGrainLayers` | `Grain.layerParticleModel` (the sub layer model), with the fast kernels or the exact samplers (§7.13) | the grain of the negative |
 | `filmGrainSumLayers` | `Grain.applyToDensityLayers` (the sum of the layers) | the grain |
 | `filmGrainClumping` | `Grain.addMicroStructure` | the micro structure of the emulsion |
 | `filmGrainFinalize` | `Grain.applyToDensityLayers` (the minimum density) | the grain |
@@ -1341,11 +1345,14 @@ The number of realisations of that comparison is six (the upstream averages
 twelve): the tolerance of the gate accounts for it
 (`k · σ · sqrt(1/m + 1/m)`), so the comparison stays honest.
 
-The **exact** samplers (§3.4) have **no** Metal counterpart yet: the
-inversion from the mode of the distribution needs the log gamma function,
-which the shading language does not have.  The GPU therefore reproduces the
-fast path (and its underflow), like the CPU reference does by default; the
-exact mode of the GPU is a deferred item (§7.9).
+The **exact** samplers (§3.4) have a Metal counterpart (§7.13): the
+inversion from the mode of the distribution needs the logarithm of the
+gamma function, which the shading language does not have, but the Lanczos
+approximation of it can be written in `Float32`.  The GPU therefore
+reproduces the fast path (and its underflow) **by default**, like the CPU
+reference does; the exact mode of the GPU is opt in
+(`PipelineParams.stochastic.grainSampler`, or the `sampler` argument of the
+render of the Metal backend).
 
 One more difference between the two implementations of the fast path must be
 recorded: the CPU reference computes the inversion of the binomial in
@@ -1367,7 +1374,7 @@ arithmetic, not of the algorithm.
 | the plan reproduces the CPU pipeline tap by tap (`FilmPlanEvaluatorTests`) | the Metal kernels against the CPU pipeline (a mean ΔE₀₀ below 0.5) |
 | the `Float32` specification of the kernels against the CPU pipeline | the Metal kernels against the `Float32` specification (a max abs error below 1e-3) |
 | the static analysis of the shading language: the kernel names are unique, every dispatched kernel exists, the buffer indices are contiguous, the structures have the layout of their Swift counterparts, there is no `double`, no keyword is used as an identifier, the attributes belong to the whitelist of the valid Metal attributes, the loops are bounded and the bound of the radius is the same on the two sides (`MetalSourceTests`) | the spatial effects on the GPU (the halation, the diffusion filters, the lens blurs, the unsharp mask) |
-| the counter based grain against the grain of the CPU, against the upstream **fast** path (no allowance) and against the upstream **default** path (raw and adjusted), with the fast and with the exact samplers (`GrainCounterTests`, `GrainStatisticsTests`, `ExactSamplerTests`) | the grain of the GPU against the grain of the CPU (the statistical gate) |
+| the counter based grain against the grain of the CPU, against the upstream **fast** path (no allowance) and against the upstream **default** path (raw and adjusted), with the fast and with the exact samplers (`GrainCounterTests`, `GrainStatisticsTests`, `ExactSamplerTests`) | the grain of the GPU against the grain of the CPU (the statistical gate), with the fast and with the exact samplers (§7.13) |
 | the compilation of the package and of the test targets on Linux | the timing of the GPU against the CPU (a 1024 × 1024 image, the median of three runs after a warm up, in **release**) — note that the CPU side of that measurement costs about **100 s per run** in a debug build (the release build is about twenty times faster) |
 
 **Nothing on Metal is validated until the CI runs it on a real Metal
@@ -1516,12 +1523,13 @@ corrupt its memory.  The findings and the fixes:
   the cumulative distribution of the binomial is a loop of up to `n`
   iterations for the high exposure cases (the same loop as the CPU
   reference),
-* the **exact samplers** (§3.4) have no Metal counterpart: the shading
-  language has no log gamma function, so the inversion from the mode of the
-  distribution cannot be written as it is in Swift.  The GPU reproduces the
-  fast path (and its underflow) until the exact mode is ported to the
-  shading language (a Stirling approximation of the log gamma would be
-  needed, and its accuracy would have to be validated on Linux).
+* the **exact samplers** (§3.4) have a Metal counterpart since the
+  exact mode of the GPU (§7.13): the shading language has no log gamma
+  function, so the Lanczos approximation of it is used, in `Float32` (the
+  executable specification of the kernels is `Float32ExactSamplers` of the
+  Swift side, and the limits of the single precision are documented in
+  §7.13).  The GPU reproduces the fast path (and its underflow) by
+  default; the exact mode is opt in.
 
 ### 7.12 The first run on a Metal device: the measured errors and the two bugs
 
@@ -1642,14 +1650,156 @@ count of the seeds) is untouched.
 
 ---
 
+### 7.13 The exact mode of the GPU (the exact samplers)
+
+The GPU port has **two** modes for the variates of the particles of the
+grain:
+
+| The mode | The kernels | The distributions |
+|---|---|---|
+| **fast** (the default) | `filmPoisson`, `filmBinomial` | the fast kernels of the upstream (`spektrafilm.utils.fast_stats`): Knuth's product method and the normal approximations, with the **underflow** of the inversion of the binomial for the dense layers of the emulsion (§3.4) |
+| **exact** (opt in) | `filmPoissonExact`, `filmBinomialExact` | the exact distributions, i.e. the ones of the SciPy generators of the **default** path of the upstream |
+
+**The default does not change.**  The exact mode is opt in, in two places:
+
+* `PipelineParams.stochastic.grainSampler` (a new field, `.fast` by
+  default: the digested parameters of the upstream keep producing the fast
+  path), which the CPU pipeline and the Metal backend both honour,
+* the `sampler` argument of the render of the Metal backend
+  (`MetalBackend.render(_:plan:sampler:)`), which overrides the field of
+  the parameters for that render.
+
+The kernel `filmGrainLayers` reads the mode from the parameters of the
+grain (`FilmGrainParams.samplerMode`: zero for the fast kernels, one for
+the exact samplers) and dispatches the two paths; the fast kernels are
+untouched.
+
+#### The algorithm of the MSL inversion
+
+The kernels implement the **same** algorithm as `ExactSamplers` (§3.4), in
+`Float32`:
+
+1. the probability of the **mode** of the distribution is computed in log
+   space, with the **cancellation free** evaluation of the log
+   probabilities (`filmLogPoissonProbability`, `filmLogBinomialProbability`:
+   the terms of the Stirling expansion are combined into the relative
+   entropy of the distribution, so that the cancellation of the terms of
+   the order of `n` does not cost any digit),
+2. the cumulative distribution **below** the mode is computed with the
+   regularised incomplete gamma function (`filmRegularizedGammaQ`, the
+   Poisson) and with the regularised incomplete beta function
+   (`filmRegularizedIncompleteBeta`, the binomial), the front factors of
+   which are evaluated with the cancellation free forms above,
+3. the variate is found by walking from the mode towards the side the
+   uniform falls on, with the recurrence of the probabilities
+   (`P(k ∓ 1) = P(k)·k/λ` for the Poisson,
+   `P(k ∓ 1) = P(k)·k·q/((n - k + 1)·p)` for the binomial), the mass
+   being accumulated with a compensated (Kahan) summation.
+
+**No probability mass is dropped**: the walk is bounded by the support of
+the distribution (the binomial) or by the underflow of the probabilities
+(the Poisson), never by an arbitrary tolerance; the tail of the range of
+the uniforms stops on the underflow or on the stall of the accumulation and
+returns the **last** `k` whose probability is not negligible (and never a
+far outlier).
+
+The uniform variate is the 24 high bits of the hash of the counter (the
+streams `0x6000` and `0x7000`, the same ones as the CPU reference): they
+are the 24 high bits of the 53 bit uniform of the double precision
+reference, i.e. the GPU and the CPU draw their variates from the **same**
+uniforms (they differ only for the uniforms that fall within `1e-5` of a
+boundary of the cumulative distribution).
+
+#### The executable specification of the kernels
+
+The Metal kernels cannot run on Linux (there is no GPU on the CI box of
+the repository), so the algorithm of the shading language is validated in
+Swift, in the same arithmetic: `Float32ExactSamplers`
+(`Sources/FilmPhysics/Float32ExactSamplers.swift`) is the **executable
+specification** of `filmPoissonExact` and `filmBinomialExact` (the same
+expressions, the same constants, the same order of the operations), and
+`FilmCounterRandom.poissonExactFloat32` / `binomialExactFloat32` are the
+specification of the two kernels of the counter based generator.
+
+The tests of `Tests/FilmPhysicsTests/Float32ExactSamplerTests.swift`
+validate that specification on Linux:
+
+| The check | The gate |
+|---|---|
+| the law of the single precision Poisson (a mean of 3.5 and of 2 500) and of the single precision binomial (40 trials and 3 768 trials with a probability of 0.998) | a chi-square test against the exact distributions (the probabilities computed by the direct formula, in double precision): the probability of the statistic must be above `1e-3` |
+| the moments of the samplers | five standard errors of the estimate |
+| the agreement with the double precision samplers | the single precision inversion must resolve the same variates, except for the uniforms that fall on a boundary (the measured rate is below `1e-3`) |
+| the consistency of the inversion (`F(k - 1) ≤ u < F(k)`) | the cumulative distributions are computed by the direct sums, in double precision |
+| the failure mode of the fast kernel (the underflow) | the single precision exact sampler does **not** develop every particle of a dense layer |
+
+#### The limits of the single precision
+
+The shading language of the package is `Float32` from end to end (§7.3),
+so the inversion is evaluated in single precision.  The honest limits are:
+
+| The source of the error | Its order | The consequence |
+|---|---|---|
+| the **uniform variate** (24 bits, the resolution of a `Float32` mantissa) | `6e-8` of probability | the inversion is exact up to `6e-8` of probability (the double precision reference resolves `1e-15`) |
+| the **log gamma function** (the Lanczos approximation, in single precision) | `6e-8` (relative) | the probability of the mode is off by `6e-8` (relative) |
+| the **representation** of `n·p` and of `λ` | `n·eps`, i.e. `7e-4` for the densest layer | the probability of the mode is off by `7e-4` (relative) |
+| the **special functions** (the series and the continued fractions, with the convergence threshold of the single precision) | `1e-5` (absolute, on the cumulative distribution) | the variate is off by `1e-5·σ`, i.e. by `1e-3` particles for the densest layer (a relative bias of `1e-7` on the mean of the variate) |
+| the **recurrence** of the walk | `k·eps` | the cumulative distribution is off by `1e-4` (relative) |
+
+The **total variation distance** between the law of the single precision
+samplers and the exact law is therefore of the order of **`1e-5`** (and
+not of the order of `1e-12` as in the double precision reference): it is
+the resolution of the uniform variate of the GPU that dominates.  The
+consequence on the grain is a relative bias of the order of `1e-7` on the
+mean of the field — six orders of magnitude below the resolution of the
+statistical gate of §3.4 (which is of the order of `1e-3` of the mean of
+the field).
+
+The `cancellation free` forms of the log probabilities are what makes the
+single precision viable: without them, the terms of the order of `n`
+(the `n·log(p)` of the binomial) would cancel and the probability of the
+mode of the dense layers would be off by several percents — i.e. the
+grain would be wrong.
+
+#### What the CI must confirm
+
+The Metal CI (the job of §7.8) runs the two parity tests of
+`Tests/FilmPhysicsMetalTests/MetalExactGrainTests.swift`:
+
+1. the **exact grain of the GPU** against the **counter based exact**
+   reference of the CPU (`FilmGrainPlan` in exact mode): the gate is the
+   one of the existing GPU-vs-CPU grain test — the critical value
+   `k = 7.8362`, the six realisations of the port, the twelve
+   realisations of the upstream, and the spread of the upstream as the
+   scale of the difference — and the statistics are compared **mean with
+   mean** and **standard deviation with standard deviation**,
+2. the **exact grain of the GPU** against the **upstream default** path
+   (the exact SciPy generators): the plain statistical gate, with **no
+   allowance at all** — this is the comparison the fast path cannot pass
+   (the fast kernels of the upstream develop every particle of the dense
+   layers, and the grain is therefore systematically denser than the one of
+   the default path, §3.4).
+
+The subset of the cases is three (the family of the slice 6 holds
+sixteen): `portra_400__flat_ev_minus2` (the case the exact mode of the CPU
+was measured on), `ultramax_400__flat_ev_plus2` (the case the fast
+samplers fail on) and `portra_400__textured_ev_0` (a textured case).  The
+other thirteen cases are validated on the CPU reference, which exercises
+the same algorithm.
+
+The lines of the log are `METAL-PARITY exact slice6 <case>: the grain
+<statistic>: the GPU <value>, the CPU (or the upstream) <value>, the
+deviation <deviation>, the tolerance <tolerance>, the z-score <z>`, and
+the worst z-score of the family.
+
+---
+
 ## 8. Next steps
 
-* Port the **exact** samplers (the inversion from the mode, `ExactSamplers`)
-  to the **Metal** kernels, so that the GPU reproduces the **default**
-  upstream path (the exact SciPy generators) and not only its fast kernels.
-  The model difference of the samplers is measured in §3.4 (the underflow of
-  the upstream fast inversion), and the CPU reference already has the exact
-  mode (`GrainSampler.exact`) with its statistical validation.
+* Measure the **exact mode of the GPU** on the Metal CI (the two parity
+  tests of §7.13) and record the measured z-scores here, next to the ones
+  of the CPU reference (the algorithm is validated on Linux by
+  `Float32ExactSamplerTests`, but the *numbers* of the GPU are only known
+  from the CI).
 * Regenerate the slice 6 fixture with **more upstream seeds** (12 today): the
   spread of the upstream is known to ±21 %, which is why the critical value
   of the gate is the Student t quantile (7.84) and not the normal quantile

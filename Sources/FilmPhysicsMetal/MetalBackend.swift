@@ -418,24 +418,49 @@ public final class MetalBackend: FilmRenderBackend {
 
     /// Renders an image.
     ///
+    /// The sampler of the variates of the grain is the one of the
+    /// parameters (`params.stochastic.grainSampler`, which is `.fast`
+    /// unless it is explicitly set).
+    ///
     /// - Parameters:
     ///   - image: the camera image, in the input colourspace of the
     ///     parameters.
     ///   - params: the parameters of the simulation.
     /// - Returns: the scanned print.
     public func render(_ image: RGBImage, params: PipelineParams) throws -> RGBImage {
+        try render(image, params: params, sampler: nil)
+    }
+
+    /// Renders an image.
+    ///
+    /// - Parameters:
+    ///   - image: the camera image, in the input colourspace of the
+    ///     parameters.
+    ///   - params: the parameters of the simulation.
+    ///   - sampler: the sampler of the variates of the grain: `nil` (the
+    ///     default) takes the sampler of the parameters
+    ///     (`params.stochastic.grainSampler`, which is `.fast` unless it is
+    ///     explicitly set).
+    /// - Returns: the scanned print.
+    public func render(
+        _ image: RGBImage, params: PipelineParams, sampler: GrainSampler?
+    ) throws -> RGBImage {
         let plan = try FilmRenderPlan.build(params: params)
-        return try render(image, plan: plan, collectTaps: false).rgbOut
+        return try render(image, plan: plan, sampler: sampler, collectTaps: false).rgbOut
     }
 
     /// Renders an image with a precomputed plan.
+    ///
+    /// The sampler of the variates of the grain is the one of the
+    /// parameters (`plan.params.stochastic.grainSampler`, which is `.fast`
+    /// unless it is explicitly set).
     ///
     /// - Parameters:
     ///   - image: the camera image, in the input colourspace of the plan.
     ///   - plan: the precomputed data of the render.
     /// - Returns: the taps of the render.
     public func render(_ image: RGBImage, plan: FilmRenderPlan) throws -> MetalRenderTaps {
-        try render(image, plan: plan, collectTaps: true)
+        try render(image, plan: plan, sampler: nil)
     }
 
     /// Renders an image with a precomputed plan.
@@ -443,12 +468,33 @@ public final class MetalBackend: FilmRenderBackend {
     /// - Parameters:
     ///   - image: the camera image, in the input colourspace of the plan.
     ///   - plan: the precomputed data of the render.
+    ///   - sampler: the sampler of the variates of the grain: `nil` (the
+    ///     default) takes the sampler of the parameters
+    ///     (`plan.params.stochastic.grainSampler`, which is `.fast` unless
+    ///     it is explicitly set).
+    /// - Returns: the taps of the render.
+    public func render(
+        _ image: RGBImage, plan: FilmRenderPlan, sampler: GrainSampler?
+    ) throws -> MetalRenderTaps {
+        try render(image, plan: plan, sampler: sampler, collectTaps: true)
+    }
+
+    /// Renders an image with a precomputed plan.
+    ///
+    /// - Parameters:
+    ///   - image: the camera image, in the input colourspace of the plan.
+    ///   - plan: the precomputed data of the render.
+    ///   - sampler: the sampler of the variates of the grain: `nil` (the
+    ///     default) takes the sampler of the parameters.
     ///   - collectTaps: whether the intermediate taps are read back (the
     ///     read back of the taps is a measurable part of the time of a
     ///     render, so the timing runs skip it).
     /// - Returns: the taps of the render.
     private func render(
-        _ image: RGBImage, plan: FilmRenderPlan, collectTaps: Bool
+        _ image: RGBImage,
+        plan: FilmRenderPlan,
+        sampler: GrainSampler?,
+        collectTaps: Bool
     ) throws -> MetalRenderTaps {
         guard let library else {
             throw initializationError ?? MetalBackendError.noDevice
@@ -669,6 +715,7 @@ public final class MetalBackend: FilmRenderBackend {
                 width: width,
                 height: height,
                 seed: plan.params.stochastic.seed,
+                sampler: sampler ?? plan.params.stochastic.grainSampler,
                 device: device
             )
             let cyan = try pool.acquire()

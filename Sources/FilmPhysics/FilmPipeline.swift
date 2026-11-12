@@ -212,9 +212,23 @@ public struct PrintRenderParams: Equatable, Sendable {
 public struct StochasticParams: Equatable, Sendable {
     /// The seed of the random number generator.
     public var seed: UInt64
+    /// The sampler of the variates of the particles of the grain.
+    ///
+    /// The default is ``GrainSampler/fast``: the fast kernels of the
+    /// upstream (`spektrafilm.utils.fast_stats`), i.e. the algorithm the
+    /// port reproduces by default.  The exact samplers
+    /// (``GrainSampler/exact``) draw from the very same distributions as
+    /// the SciPy generators of the default path of the upstream; they are
+    /// **opt in**, so that the digested parameters of the upstream keep
+    /// producing the fast path (see `docs/PORTING.md` §3.4).
+    public var grainSampler: GrainSampler
 
-    public init(seed: UInt64 = StochasticParams.defaultSeed) {
+    public init(
+        seed: UInt64 = StochasticParams.defaultSeed,
+        grainSampler: GrainSampler = .fast
+    ) {
         self.seed = seed
+        self.grainSampler = grainSampler
     }
 
     /// The default seed of the port.
@@ -590,7 +604,8 @@ public struct FilmPipeline {
             enlarger: enlargerInputs,
             scanner: scannerInputs,
             filmRender: filmRenderInputs,
-            seed: params.stochastic.seed
+            seed: params.stochastic.seed,
+            grainSampler: params.stochastic.grainSampler
         )
     }
 

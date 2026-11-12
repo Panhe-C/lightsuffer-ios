@@ -287,19 +287,26 @@ public struct Slice1Inputs: Equatable, Sendable {
     /// state); the port makes the seed an explicit parameter, so that a
     /// render is exactly reproducible.
     public var seed: UInt64
+    /// The sampler of the variates of the particles of the grain.
+    ///
+    /// The default is ``GrainSampler/fast`` (the fast kernels of the
+    /// upstream); the exact samplers are opt in.
+    public var grainSampler: GrainSampler
 
     public init(
         spectral: SpectralInputs,
         enlarger: EnlargerInputs,
         scanner: ScannerInputs,
         filmRender: FilmRenderInputs = FilmRenderInputs(),
-        seed: UInt64 = StochasticParams.defaultSeed
+        seed: UInt64 = StochasticParams.defaultSeed,
+        grainSampler: GrainSampler = .fast
     ) {
         self.spectral = spectral
         self.enlarger = enlarger
         self.scanner = scanner
         self.filmRender = filmRender
         self.seed = seed
+        self.grainSampler = grainSampler
     }
 }
 
@@ -519,7 +526,8 @@ public struct Slice1Pipeline {
             densityCurves: normalized,
             densityCurvesLayers: film.data.densityCurvesLayers,
             positiveFilm: film.info.type == .positive,
-            seed: inputs.seed
+            seed: inputs.seed,
+            sampler: inputs.grainSampler
         )
 
         return RGBImage(width: logRaw.width, height: logRaw.height, data: density)
