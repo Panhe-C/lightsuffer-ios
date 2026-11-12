@@ -917,6 +917,19 @@ inline float filmStirlingCorrection(float z) {
 ///   - lambda: the mean of the distribution.
 ///   - k: the value.
 /// - Returns: the logarithm of the probability of `k`.
+/// Natural log of (1 + x).
+///
+/// Metal has no `log1p`. This is the classic cancellation-aware form so
+/// that small `x` keep the same digits as `log1p` on the Swift side
+/// (`Float32ExactSamplers`).
+inline float filmLog1p(float x) {
+    const float y = 1.0 + x;
+    if (y == 1.0) {
+        return x;
+    }
+    return log(y) * (x / (y - 1.0));
+}
+
 inline float filmLogPoissonProbability(float lambda, int k) {
     if (lambda <= 0.0 || k < 0) {
         return -INFINITY;
@@ -926,7 +939,7 @@ inline float filmLogPoissonProbability(float lambda, int k) {
     }
     const float count = float(k);
     const float excess = count + 1.0 - lambda;
-    float value = -count * log1p(excess / lambda) + excess;
+    float value = -count * filmLog1p(excess / lambda) + excess;
     value -= 0.5 * log(2.0 * M_PI_F * (count + 1.0));
     value -= filmStirlingCorrection(count + 1.0);
     return value;
@@ -958,10 +971,10 @@ inline float filmLogBinomialProbability(int n, int k, float p) {
     const float trials = float(n);
     const float successes = float(k);
     const float failures = float(n - k);
-    float value = successes * log1p(
+    float value = successes * filmLog1p(
         (p * (trials + 1.0) - (successes + 1.0)) / (successes + 1.0)
     );
-    value += failures * log1p(
+    value += failures * filmLog1p(
         (q * (trials + 1.0) - (failures + 1.0)) / (failures + 1.0)
     );
     value += 0.5 * log(
