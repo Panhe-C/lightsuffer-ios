@@ -1621,6 +1621,25 @@ and the executable specification of the grain to 1e-3 (the particles that
 develop are the same, up to the cells of the interpolation whose boundary
 falls on a different side).  The CI must confirm the two gates.
 
+**The third bug was in the test itself, not in the port.**  The run
+<https://github.com/Panhe-C/lightsuffer-ios/actions/runs/43135477473>
+(commit `e9f12a0`) confirms the two fixes — the ten cases of the spatial
+family pass (the halation mean ΔE₀₀ 0.00148 and max 0.00519, the
+diffusion of the DIR couplers 0.00107 and 0.00800, the `all_effects`
+0.00067 and 0.00235) and the three means of the grain are inside the
+gate (the `mean_0` −0.00279 against −0.00281 of the CPU, the deviation
+2.2e-5 for a tolerance of 0.00212) — but the three standard deviations
+still failed.  The cause is a bug of the test: the loop of the grain
+compared the **standard deviation** of the GPU with the **mean** of the
+CPU (the log shows it: the `std_0` reports "the GPU 0.013398, the CPU
+−0.002814", and −0.002814 is the mean of the CPU, while the standard
+deviation of the upstream is 0.013421, i.e. the GPU is right; the same
+for the `std_1`, 0.01191 against 0.01180, and the `std_2`, 0.01985
+against 0.01974).  The test now averages the standard deviations of the
+CPU for the standard deviations and the means of the CPU for the means;
+the tolerance of the gate (the `k`, the Bonferroni correction and the
+count of the seeds) is untouched.
+
 ---
 
 ## 8. Next steps

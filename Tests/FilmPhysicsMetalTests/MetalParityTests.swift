@@ -393,7 +393,12 @@ final class MetalParityTests: XCTestCase {
         var worst = 0.0
         for channel in 0..<3 {
             for (name, values) in [("mean", gpuMeans[channel]), ("std", gpuStds[channel])] {
-                let cpuValue = cpuMeans[channel].reduce(0, +) / Double(seeds.count)
+                // The CPU reference of the statistic: the mean of the means
+                // for the mean, the mean of the standard deviations for the
+                // standard deviation (the two statistics are never compared
+                // to each other).
+                let cpuValues = name == "std" ? cpuStds[channel] : cpuMeans[channel]
+                let cpuValue = cpuValues.reduce(0, +) / Double(seeds.count)
                 let gpuValue = values.reduce(0, +) / Double(seeds.count)
                 let upstream = try XCTUnwrap(aggregate["\(name)_\(channel)"])
                 let upstreamMean = try XCTUnwrap(upstream["mean"]?.double)
