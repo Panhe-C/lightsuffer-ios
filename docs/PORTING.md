@@ -1134,8 +1134,9 @@ swift test -c release --filter testTheGrainOfALargeImageIsFast
 ## 7. The Metal port (the GPU)
 
 Status: **phase 1 implemented, validated on Linux against the CPU
-reference; nothing is validated on a Metal device yet** (the CI of the
-project is the first place where the Metal code runs, §7.8).
+reference; the first run on a real Metal device (the CI of the project,
+§7.8) has measured the parity of the whole chain and has found two bugs in
+the spatial effects and in the grain (§7.12)**.
 
 ### 7.1 The architecture
 
@@ -1165,7 +1166,7 @@ the same precomputed data.
 | `FilmGrainPlan` / `FilmCounterRandom` | `Sources/FilmPhysics/FilmGrainPlan.swift`, `FilmCounterRandom.swift` | the plan of the grain and the counter based generator (the reference of the GPU path) |
 | `MetalBackend` | `Sources/FilmPhysicsMetal/MetalBackend.swift` | the GPU implementation of the protocol |
 | `MetalPlan` | `Sources/FilmPhysicsMetal/MetalPlan.swift` | the structures the shaders read and the builders of the convolution kernels |
-| `FilmShaders.metal` | `Sources/FilmPhysicsMetal/Shaders/FilmShaders.metal` | the 28 compute kernels |
+| `FilmShaders.metal` | `Sources/FilmPhysicsMetal/Shaders/FilmShaders.metal` | the 30 compute kernels |
 
 The Metal Shading Language source is **compiled at runtime**
 (`device.makeLibrary(source:options:)`): the package does not rely on
@@ -1174,7 +1175,7 @@ resource of the target.
 
 ### 7.2 The kernels and their mapping to the CPU
 
-Every kernel of `FilmShaders.metal` (28 of them) and the CPU function it
+Every kernel of `FilmShaders.metal` (30 of them) and the CPU function it
 implements:
 
 | Kernel | CPU function | Stage |
@@ -1193,6 +1194,7 @@ implements:
 | `filmGamutCompress` | `GamutCompression.compressRGB` (`cam16ucs`) | the output gamut compression |
 | `filmEncodeOutput` | `Scanning.scan` (the output transfer function) | the encoded output |
 | `filmBlurHorizontal`, `filmBlurVertical` | `SpatialEffects.gaussianFilter` (the FIR path) | the separable Gaussian |
+| `filmBlurIIRHorizontal`, `filmBlurIIRVertical` | `SpatialEffects.filterPlane` (the Young & van Vliet path) | the separable Gaussian |
 | `filmDiffusionFilter` | `DiffusionFilter.apply` | the diffusion filters |
 | `filmCombine2`, `filmCombine3` | the linear combinations of the upstream filters | the combinations |
 | `filmScatterCombine` | `Halation.apply` (the in emulsion scatter) | the halation |
@@ -1372,7 +1374,9 @@ arithmetic, not of the algorithm.
 device**: the MSL source, the Swift/Metal API calls and the buffer layouts
 are written to be correct, and the *logic* of the kernels is validated on
 Linux through the executable specification, but the code itself has never
-been compiled by a Metal compiler.
+been compiled by a Metal compiler.  The first run on a device (the CI of
+the project, §7.12) has confirmed the per pixel chain and has found the
+two bugs of the spatial effects and of the grain.
 
 **The static checks are not an execution.**  The `MetalSourceTests` read
 the Metal Shading Language source and check it *textually* (the kernel
@@ -1504,9 +1508,6 @@ corrupt its memory.  The findings and the fixes:
   is not ported to the GPU: the backend raises
   `MetalBackendError.invalidPlan` for it (the upstream default is the sub
   layer model),
-* the **Young & van Vliet IIR** Gaussian of the CPU is replaced by the FIR
-  kernel on the GPU (the truncation at three sigmas): the difference is a
-  few ulps on a blurred field, it is *not* measured yet,
 * the **auto exposure**, the **lut modes** and the **debug switches** of
   the upstream are not ported (they are not ported on the CPU either),
 * the **input gamut compression** is baked into the tc lookup table (as it
@@ -1521,6 +1522,104 @@ corrupt its memory.  The findings and the fixes:
   fast path (and its underflow) until the exact mode is ported to the
   shading language (a Stirling approximation of the log gamma would be
   needed, and its accuracy would have to be validated on Linux).
+
+### 7.12 The first run on a Metal device: the measured errors and the two bugs
+
+The run
+<https://github.com/Panhe-C/lightsuffer-ios/actions/runs/43130037957>
+(commit `60cef06`, `macos-15`, a Metal device present) is the **first run
+of the Metal port on a real device**: the shader library compiles at
+runtime and the kernels run.  It measures the parity of the whole chain
+and it finds two bugs.
+
+**What the run measured (and passed).**
+
+| Family | the mean ΔE₀₀ | the max ΔE₀₀ | The other measurements |
+|---|---|---|---|
+| the slice 2 (4 cases) | 0.0020 – 0.0025 | 0.0078 – 0.0107 | the taps within 5.9e-7 – 7.0e-6; the GPU against the `Float32` specification within 2.9e-6 – 5.2e-6 |
+| the slice 4 (the four looks of the subset) | 0.0014 – 0.0042 | 0.0055 – 0.0083 | — |
+| the slice 5, the cases that pass | 0.0009 – 0.0015 | 0.0022 – 0.0113 | `baseline` 0.0011, `defaults_grain_off` 0.0010, `highlight_boost` 0.0011, `camera_diffusion_filter` 0.0015, `enlarger_diffusion_filter` 0.0011, `camera_lens_blur` 0.0009, `scanner_blur_unsharp` 0.0010 |
+| the timing (1024 × 1024, **release**) | — | — | the GPU 0.218 s, the CPU 18.72 s, i.e. **86×** faster; the timing is correctly skipped in the debug step |
+
+The numbers of the per pixel chain are the ones of the `Float32` plan
+evaluator (§7.5): the GPU reproduces the CPU pipeline to the rounding of
+the arithmetic, and it reproduces the **executable specification of the
+kernels** to the same rounding.
+
+**The first bug: the halation (and the diffusion of the DIR couplers).**
+
+| Case | the mean ΔE₀₀ | the max ΔE₀₀ |
+|---|---|---|
+| `halation` | **2.955** | 19.04 |
+| `all_effects` | **1.799** | 7.92 |
+| `dir_coupler_diffusion` | 0.269 | **1.38** |
+
+The root cause is **not** the halation itself: it is the **Gaussian
+filter**.  The CPU reference filters a channel with the recursive filter of
+Young & van Vliet when its sigma is three pixels or more
+(`SpatialEffects.filterPlane`), and with the truncated FIR kernel below
+that.  The GPU used the FIR kernel **always**: the two filters are not two
+roundings of the same thing (the recursion replicates the edge samples
+where the FIR kernel reflects them, and it is an approximation of the
+Gaussian of the upstream), and on the fields of the fixtures they differ by
+several percents — 14 % and 32 % of the mean absolute difference for the
+sigmas of nine and sixteen pixels of the exponential tail of the scatter.
+
+The cases that fail are exactly the cases whose sigmas reach three pixels:
+the `halation` case (a pixel is 31.25 µm there, so the exponential tail of
+the scatter has the sigmas 3.2, 9.1 and 16.5, and the third bounce of the
+halation has the sigma 3.6), and the `dir_coupler_diffusion` case (the
+exponential tail of the inhibitors has the sigmas 3.4, 9.8 and 17.7).  The
+cases that pass are the cases whose sigmas stay below three pixels (on a
+35 mm frame of a 32 × 32 image a pixel is 1093.75 µm, so every effect is
+below one pixel).
+
+The fix ports the recursion to the GPU: the kernels
+`filmBlurIIRHorizontal` and `filmBlurIIRVertical` reproduce the recursion
+of the CPU (the same forward and backward sweeps, the same replicated
+boundary, the same coefficients — the Swift side builds them with
+`SpatialEffects.youngVanVlietCoefficients`, the function of the CPU
+reference itself).  The recursion is sequential along the axis of the
+filter, so the passes are dispatched with **one thread per row** (the
+horizontal pass) and **one thread per column** (the vertical pass).  The
+choice of the path is **per channel**, exactly like the CPU (which filters
+the channels one by one), so a channel with a small sigma still uses the
+FIR kernel: the two kernels of the new path do both.
+
+**The second bug: the sum of the emulsion layers of the grain.**
+
+The grain of the GPU was not the grain of the CPU, and not statistically
+either: the worst z-score of the gate was **3103.7** (the gate is 7.84).
+
+| The statistic | the GPU | the CPU | the upstream | the tolerance |
+|---|---|---|---|---|
+| `mean_0` | 0.8364 | −0.00281 | −0.00284 ± 0.00054 | 0.00212 |
+| `mean_1` | −0.3485 | 0.00115 | 0.00103 ± 0.00051 | 0.00199 |
+| `mean_2` | −0.4920 | −0.00261 | −0.00236 ± 0.00085 | 0.00333 |
+
+The root cause is the **layout of the layers**: the kernel
+`filmGrainLayers` writes the three emulsion layers of a colour in the
+three channels of its image, and the kernel `filmGrainSumLayers` summed
+the three images **at the same layer index** — it mixed the colours and
+kept a single layer, instead of summing the layers of each colour.  The
+sum is now the sum of the **layers of each colour**, which is what the CPU
+reference (`Grain.applyToDensityLayers`) and the executable specification
+(`FilmGrainPlan.apply`) do.
+
+Two smaller fixes come with it: the seeds of the streams of the grain are
+now a buffer of 32 bit integers instead of a buffer of `float`s (a `float`
+holds twenty four bits of them, so the GPU drew another realisation of the
+distribution than the specification), and the micro structure of the
+emulsion is applied above the same sigma of 0.05 as the CPU reference
+(`Grain.addMicroStructure`).
+
+**What the fixes are worth.**  The transliteration of the two new kernels
+and of the grain kernels (the shading language, line by line, in
+`Float32`) reproduces the CPU reference to 1.1e-4 on the blurred field of
+the largest sigma (the accumulation of the recursion in single precision)
+and the executable specification of the grain to 1e-3 (the particles that
+develop are the same, up to the cells of the interpolation whose boundary
+falls on a different side).  The CI must confirm the two gates.
 
 ---
 

@@ -107,6 +107,25 @@ struct FilmBlurParams {
     float weightB;
     float weightC;
     float scatterFraction;
+    // The Young & van Vliet recursion of the large sigmas: the flag of
+    // every channel (one when the channel uses the recursion, zero when it
+    // uses the truncated FIR kernel) and the four coefficients of the
+    // recursion (`b`, `b1`, `b2` and `b3`).
+    float iirFlagA;
+    float iirB0A;
+    float iirB1A;
+    float iirB2A;
+    float iirB3A;
+    float iirFlagB;
+    float iirB0B;
+    float iirB1B;
+    float iirB2B;
+    float iirB3B;
+    float iirFlagC;
+    float iirB0C;
+    float iirB1C;
+    float iirB2C;
+    float iirB3C;
 };
 
 /// The parameters of the linear combinations.
@@ -1422,6 +1441,183 @@ kernel void filmBlurVertical(
     dst[pixel * 3 + 2] = s2;
 }
 
+/// The flag that tells whether a channel uses the Young & van Vliet
+/// recursion (one) or the truncated FIR kernel (zero).
+///
+/// The CPU reference chooses the path of the filter **per channel**: the
+/// FIR kernel below `SpatialEffects.smallSigmaMax` (three pixels) and the
+/// recursive filter of Young & van Vliet above it.  The two filters are
+/// not two roundings of the same thing: they differ by several percents
+/// on a blurred field, so the GPU must use the same path as the CPU.
+inline float filmIIRFlag(constant FilmBlurParams &params, uint channel) {
+    if (channel == 0) {
+        return params.iirFlagA;
+    }
+    if (channel == 1) {
+        return params.iirFlagB;
+    }
+    return params.iirFlagC;
+}
+
+/// The coefficients of the Young & van Vliet recursion of a channel.
+///
+/// The order is `b`, `b1`, `b2` and `b3`: the executable specification of
+/// `SpatialEffects.youngVanVlietCoefficients` of the Swift side, which
+/// builds them (the CPU reference uses the very same function).
+inline float4 filmIIRCoefficients(constant FilmBlurParams &params, uint channel) {
+    if (channel == 0) {
+        return float4(params.iirB0A, params.iirB1A, params.iirB2A, params.iirB3A);
+    }
+    if (channel == 1) {
+        return float4(params.iirB0B, params.iirB1B, params.iirB2B, params.iirB3B);
+    }
+    return float4(params.iirB0C, params.iirB1C, params.iirB2C, params.iirB3C);
+}
+
+/// The horizontal pass of the Gaussian filter, with the Young & van Vliet
+/// recursion.
+///
+/// The recursion is sequential along the axis of the filter, so the kernel
+/// is dispatched with **one thread per row**: the `y` of the thread is the
+/// row and its `x` is zero.  The channels whose sigma is below three
+/// pixels use the truncated FIR kernel, exactly like the CPU reference.
+kernel void filmBlurIIRHorizontal(
+    device const float *src [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    device const float *weights [[buffer(2)]],
+    constant FilmBlurParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint row = gid.y;
+    if (gid.x != 0 || row >= params.height || params.width == 0) {
+        return;
+    }
+    const int width = int(params.width);
+    const int radius = min(int(params.radius), FILM_MAX_BLUR_RADIUS);
+    const int length = 2 * radius + 1;
+    const uint base = row * params.width;
+
+    for (uint channel = 0; channel < 3; ++channel) {
+        if (filmIIRFlag(params, channel) > 0.5) {
+            // The recursion of Young & van Vliet: the forward sweep, then
+            // the backward one.  The boundary is the replication of the
+            // edge samples, like the CPU reference.
+            const float4 coefficients = filmIIRCoefficients(params, channel);
+            const float b = coefficients.x;
+            const float b1 = coefficients.y;
+            const float b2 = coefficients.z;
+            const float b3 = coefficients.w;
+
+            float w1 = src[base * 3 + channel];
+            float w2 = w1;
+            float w3 = w1;
+            for (int column = 0; column < width; ++column) {
+                const uint index = (base + uint(column)) * 3 + channel;
+                const float value = b * src[index] + b1 * w1 + b2 * w2 + b3 * w3;
+                dst[index] = value;
+                w3 = w2;
+                w2 = w1;
+                w1 = value;
+            }
+            float y1 = dst[(base + uint(width - 1)) * 3 + channel];
+            float y2 = y1;
+            float y3 = y1;
+            for (int step = 0; step < width; ++step) {
+                const int column = width - 1 - step;
+                const uint index = (base + uint(column)) * 3 + channel;
+                const float value = b * dst[index] + b1 * y1 + b2 * y2 + b3 * y3;
+                dst[index] = value;
+                y3 = y2;
+                y2 = y1;
+                y1 = value;
+            }
+        } else {
+            // The truncated FIR kernel.
+            for (int column = 0; column < width; ++column) {
+                float sum = 0.0;
+                for (int offset = -radius; offset <= radius; ++offset) {
+                    const int source = filmReflectEdge(column + offset, width);
+                    const uint index = (base + uint(source)) * 3 + channel;
+                    sum += src[index]
+                        * weights[uint(channel) * uint(length) + uint(offset + radius)];
+                }
+                dst[(base + uint(column)) * 3 + channel] = sum;
+            }
+        }
+    }
+}
+
+/// The vertical pass of the Gaussian filter, with the Young & van Vliet
+/// recursion.
+///
+/// The kernel is dispatched with **one thread per column**: the `x` of the
+/// thread is the column and its `y` is zero.
+kernel void filmBlurIIRVertical(
+    device const float *src [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    device const float *weights [[buffer(2)]],
+    constant FilmBlurParams &params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint column = gid.x;
+    if (gid.y != 0 || column >= params.width || params.height == 0) {
+        return;
+    }
+    const int height = int(params.height);
+    const int radius = min(int(params.radius), FILM_MAX_BLUR_RADIUS);
+    const int length = 2 * radius + 1;
+    const uint width = params.width;
+
+    for (uint channel = 0; channel < 3; ++channel) {
+        if (filmIIRFlag(params, channel) > 0.5) {
+            // The recursion of Young & van Vliet: the forward sweep, then
+            // the backward one.  The boundary is the replication of the
+            // edge samples, like the CPU reference.
+            const float4 coefficients = filmIIRCoefficients(params, channel);
+            const float b = coefficients.x;
+            const float b1 = coefficients.y;
+            const float b2 = coefficients.z;
+            const float b3 = coefficients.w;
+
+            float w1 = src[column * 3 + channel];
+            float w2 = w1;
+            float w3 = w1;
+            for (int row = 0; row < height; ++row) {
+                const uint index = (uint(row) * width + column) * 3 + channel;
+                const float value = b * src[index] + b1 * w1 + b2 * w2 + b3 * w3;
+                dst[index] = value;
+                w3 = w2;
+                w2 = w1;
+                w1 = value;
+            }
+            float y1 = dst[(uint(height - 1) * width + column) * 3 + channel];
+            float y2 = y1;
+            float y3 = y1;
+            for (int step = 0; step < height; ++step) {
+                const int row = height - 1 - step;
+                const uint index = (uint(row) * width + column) * 3 + channel;
+                const float value = b * dst[index] + b1 * y1 + b2 * y2 + b3 * y3;
+                dst[index] = value;
+                y3 = y2;
+                y2 = y1;
+                y1 = value;
+            }
+        } else {
+            // The truncated FIR kernel.
+            for (int row = 0; row < height; ++row) {
+                float sum = 0.0;
+                for (int offset = -radius; offset <= radius; ++offset) {
+                    const int source = filmReflectEdge(row + offset, height);
+                    const uint index = (uint(source) * width + column) * 3 + channel;
+                    sum += src[index]
+                        * weights[uint(channel) * uint(length) + uint(offset + radius)];
+                }
+                dst[(uint(row) * width + column) * 3 + channel] = sum;
+            }
+        }
+    }
+}
+
 /// The two dimensional convolution of the diffusion filter.
 kernel void filmDiffusionFilter(
     device const float *src [[buffer(0)]],
@@ -1585,7 +1781,7 @@ kernel void filmGrainLayers(
     device const float *normalisedCurves [[buffer(5)]],
     device const float *layerParameters [[buffer(6)]],
     device const float *uniformity [[buffer(7)]],
-    device const float *seeds [[buffer(8)]],
+    device const uint *seeds [[buffer(8)]],
     constant FilmGrainParams &params [[buffer(9)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
@@ -1617,28 +1813,41 @@ kernel void filmGrainLayers(
             } else if (x >= last) {
                 layerDensity = layerCurves[((samples - 1) * 3 + layer) * 3 + colour];
             } else {
-                // The cell of the interpolation: the largest index whose
-                // value is below `x` (the axis is ascending).
+                // The cell of the interpolation: the binary search of the
+                // CPU reference (`Numerics.searchSortedRight`), which finds
+                // the first sample whose value is above `x`.  The axis of
+                // the emulsion ascends in both cases (the density curve of
+                // a positive emulsion descends, and it is mirrored), so the
+                // search is the one of the CPU reference.
                 uint low = 0;
-                while (low + 1 < samples) {
+                uint high = samples;
+                while (low < high) {
+                    const uint middle = (low + high) / 2;
                     const float current = positive
-                        ? -normalisedCurves[colour * samples + low + 1]
-                        : normalisedCurves[colour * samples + low + 1];
-                    if (current > x) {
-                        break;
+                        ? -normalisedCurves[colour * samples + middle]
+                        : normalisedCurves[colour * samples + middle];
+                    if (current <= x) {
+                        low = middle + 1;
+                    } else {
+                        high = middle;
                     }
-                    low += 1;
                 }
+                // `low` is the index of the first sample on the other side
+                // of `x`: the cell of the interpolation is the one below
+                // it.  The axis of the emulsion ascends (the density curve
+                // of a positive emulsion descends, and it is mirrored), so
+                // `low` is never zero here.
+                const uint cell = low > 0 ? low - 1 : 0;
                 const float lowValue = positive
-                    ? -normalisedCurves[colour * samples + low]
-                    : normalisedCurves[colour * samples + low];
+                    ? -normalisedCurves[colour * samples + cell]
+                    : normalisedCurves[colour * samples + cell];
                 const float highValue = positive
-                    ? -normalisedCurves[colour * samples + low + 1]
-                    : normalisedCurves[colour * samples + low + 1];
+                    ? -normalisedCurves[colour * samples + cell + 1]
+                    : normalisedCurves[colour * samples + cell + 1];
                 const float step = highValue - lowValue;
                 const float t = step != 0.0 ? (x - lowValue) / step : 0.0;
-                const float yLow = layerCurves[(low * 3 + layer) * 3 + colour];
-                const float yHigh = layerCurves[((low + 1) * 3 + layer) * 3 + colour];
+                const float yLow = layerCurves[(cell * 3 + layer) * 3 + colour];
+                const float yHigh = layerCurves[((cell + 1) * 3 + layer) * 3 + colour];
                 layerDensity = yLow + t * (yHigh - yLow);
             }
 
@@ -1674,6 +1883,12 @@ kernel void filmGrainLayers(
 }
 
 /// The sum of the emulsion layers of the grain.
+///
+/// The three images hold the three emulsion layers of the three colour
+/// channels: the channels of the image of the cyan are the layers of the
+/// cyan, and so on.  The density of a colour is therefore the sum of the
+/// **layers of that colour**, and the sum of the three images (one colour
+/// each) would mix the colours and keep a single layer.
 kernel void filmGrainSumLayers(
     device const float *cyan [[buffer(0)]],
     device const float *magenta [[buffer(1)]],
@@ -1686,11 +1901,9 @@ kernel void filmGrainSumLayers(
         return;
     }
     const uint pixel = gid.y * params.width + gid.x;
-    for (uint channel = 0; channel < 3; ++channel) {
-        dst[pixel * 3 + channel] = cyan[pixel * 3 + channel]
-            + magenta[pixel * 3 + channel]
-            + yellow[pixel * 3 + channel];
-    }
+    dst[pixel * 3] = cyan[pixel * 3] + cyan[pixel * 3 + 1] + cyan[pixel * 3 + 2];
+    dst[pixel * 3 + 1] = magenta[pixel * 3] + magenta[pixel * 3 + 1] + magenta[pixel * 3 + 2];
+    dst[pixel * 3 + 2] = yellow[pixel * 3] + yellow[pixel * 3 + 1] + yellow[pixel * 3 + 2];
 }
 
 /// The micro structure of the emulsion: the clumping of the dye clouds.

@@ -717,31 +717,32 @@ public final class MetalBackend: FilmRenderBackend {
             )
 
             // The micro structure of the emulsion.
-            let clumping = try pool.acquire()
-            try dispatch(
-                context, "filmGrainClumping",
-                [clumping, grainBuffers.clumpingParams],
-                library: library, width: width, height: height
-            )
-            if Double(grainPlan.microStructureBlur) > 0.4 {
-                let blurred = try pool.acquire()
-                try applyBlur(
-                    context, source: clumping, destination: blurred,
-                    sigmas: [Double(grainPlan.microStructureBlur)],
-                    width: width, height: height, library: library, pool: pool
-                )
-                let multiplied = try pool.acquire()
+            //
+            // The CPU reference applies the clumping of the dye clouds only
+            // above a sigma of 0.05 (`Grain.addMicroStructure`): below it
+            // the emulsion has no micro structure and the field of the
+            // densities is left alone.
+            if grainPlan.microStructureSigma > 0.05 {
+                let clumping = try pool.acquire()
                 try dispatch(
-                    context, "filmCombineMultiply",
-                    [sum, blurred, multiplied, planBuffers.params],
+                    context, "filmGrainClumping",
+                    [clumping, grainBuffers.clumpingParams],
                     library: library, width: width, height: height
                 )
-                sum = multiplied
-            } else {
+                var clumpingField = clumping
+                if Double(grainPlan.microStructureBlur) > 0.4 {
+                    let blurred = try pool.acquire()
+                    try applyBlur(
+                        context, source: clumping, destination: blurred,
+                        sigmas: [Double(grainPlan.microStructureBlur)],
+                        width: width, height: height, library: library, pool: pool
+                    )
+                    clumpingField = blurred
+                }
                 let multiplied = try pool.acquire()
                 try dispatch(
                     context, "filmCombineMultiply",
-                    [sum, clumping, multiplied, planBuffers.params],
+                    [sum, clumpingField, multiplied, planBuffers.params],
                     library: library, width: width, height: height
                 )
                 sum = multiplied
@@ -1074,6 +1075,73 @@ public final class MetalBackend: FilmRenderBackend {
         }
     }
 
+    /// Encodes a compute dispatch of **one thread per row**.
+    ///
+    /// The Young & van Vliet recursion is sequential along the axis of the
+    /// filter: a thread owns a whole row (the horizontal pass) or a whole
+    /// column (the vertical pass).  The thread group holds thirty two
+    /// threads (the thread execution width of the Apple GPUs).
+    ///
+    /// - Parameters:
+    ///   - context: the context of the render.
+    ///   - name: the name of the kernel.
+    ///   - buffers: the buffers of the kernel, in the order of its
+    ///     bindings.
+    ///   - library: the compiled shader library.
+    ///   - height: the number of rows (one thread per row).
+    private func dispatchRows(
+        _ context: MetalCommandContext,
+        _ name: String,
+        _ buffers: [MTLBuffer],
+        library: MTLLibrary,
+        height: Int
+    ) throws {
+        let state = try pipeline(named: name, library: library)
+        let encoder = try context.encoder()
+        encoder.setComputePipelineState(state)
+        for (index, buffer) in buffers.enumerated() {
+            encoder.setBuffer(buffer, offset: 0, index: index)
+        }
+        encoder.dispatchThreads(
+            MTLSize(width: 1, height: height, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1, height: 32, depth: 1)
+        )
+        if context.diagnostic {
+            try context.commit(stage: name)
+        }
+    }
+
+    /// Encodes a compute dispatch of **one thread per column**.
+    ///
+    /// - Parameters:
+    ///   - context: the context of the render.
+    ///   - name: the name of the kernel.
+    ///   - buffers: the buffers of the kernel, in the order of its
+    ///     bindings.
+    ///   - library: the compiled shader library.
+    ///   - width: the number of columns (one thread per column).
+    private func dispatchColumns(
+        _ context: MetalCommandContext,
+        _ name: String,
+        _ buffers: [MTLBuffer],
+        library: MTLLibrary,
+        width: Int
+    ) throws {
+        let state = try pipeline(named: name, library: library)
+        let encoder = try context.encoder()
+        encoder.setComputePipelineState(state)
+        for (index, buffer) in buffers.enumerated() {
+            encoder.setBuffer(buffer, offset: 0, index: index)
+        }
+        encoder.dispatchThreads(
+            MTLSize(width: width, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        if context.diagnostic {
+            try context.commit(stage: name)
+        }
+    }
+
     /// The width of the thread groups of a pipeline.
     private func groupWidth(for state: MTLComputePipelineState) -> Int {
         let maximum = state.maxTotalThreadsPerThreadgroup
@@ -1195,6 +1263,13 @@ public final class MetalBackend: FilmRenderBackend {
     }
 
     /// The separable Gaussian filter.
+    ///
+    /// The path of the filter is the one of the CPU reference
+    /// (`SpatialEffects`): the truncated FIR kernel for the channels whose
+    /// sigma is below three pixels, the Young & van Vliet recursion for the
+    /// others.  The recursion is sequential along the axis of the filter,
+    /// so its passes are dispatched with one thread per row (the horizontal
+    /// pass) and one thread per column (the vertical pass).
     private func applyBlur(
         _ context: MetalCommandContext,
         source: MTLBuffer,
@@ -1205,14 +1280,14 @@ public final class MetalBackend: FilmRenderBackend {
         library: MTLLibrary,
         pool: MetalBufferPool
     ) throws {
-        let (radius, kernels) = MetalKernels.gaussian(sigmas: sigmas)
+        let plan = MetalKernels.blur(sigmas: sigmas)
         guard let kernelBuffer = device.makeBuffer(
-            bytes: kernels, length: kernels.count * MemoryLayout<Float>.stride,
+            bytes: plan.kernels, length: plan.kernels.count * MemoryLayout<Float>.stride,
             options: .storageModeShared
         ) else {
             throw MetalBackendError.commandFailed("a kernel buffer could not be allocated")
         }
-        var blurParams = FilmBlurParams(width: width, height: height, radius: radius)
+        var blurParams = FilmBlurParams(width: width, height: height, plan: plan)
         guard let paramsBuffer = device.makeBuffer(
             bytes: &blurParams, length: MemoryLayout<FilmBlurParams>.stride,
             options: .storageModeShared
@@ -1220,16 +1295,29 @@ public final class MetalBackend: FilmRenderBackend {
             throw MetalBackendError.commandFailed("a parameter buffer could not be allocated")
         }
         let temporary = try pool.acquire()
-        try dispatch(
-            context, "filmBlurHorizontal",
-            [source, temporary, kernelBuffer, paramsBuffer],
-            library: library, width: width, height: height
-        )
-        try dispatch(
-            context, "filmBlurVertical",
-            [temporary, destination, kernelBuffer, paramsBuffer],
-            library: library, width: width, height: height
-        )
+        if plan.usesIIR {
+            try dispatchRows(
+                context, "filmBlurIIRHorizontal",
+                [source, temporary, kernelBuffer, paramsBuffer],
+                library: library, height: height
+            )
+            try dispatchColumns(
+                context, "filmBlurIIRVertical",
+                [temporary, destination, kernelBuffer, paramsBuffer],
+                library: library, width: width
+            )
+        } else {
+            try dispatch(
+                context, "filmBlurHorizontal",
+                [source, temporary, kernelBuffer, paramsBuffer],
+                library: library, width: width, height: height
+            )
+            try dispatch(
+                context, "filmBlurVertical",
+                [temporary, destination, kernelBuffer, paramsBuffer],
+                library: library, width: width, height: height
+            )
+        }
         pool.release(temporary)
     }
 

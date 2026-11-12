@@ -146,11 +146,57 @@ struct FilmBlurParams {
     var weightB: Float = 0
     var weightC: Float = 0
     var scatterFraction: Float = 0
+    // The Young & van Vliet recursion of the large sigmas: the flag of
+    // every channel (one when the channel uses the recursion, zero when it
+    // uses the truncated FIR kernel) and the four coefficients of the
+    // recursion (`b`, `b1`, `b2` and `b3`).
+    var iirFlagA: Float = 0
+    var iirB0A: Float = 0
+    var iirB1A: Float = 0
+    var iirB2A: Float = 0
+    var iirB3A: Float = 0
+    var iirFlagB: Float = 0
+    var iirB0B: Float = 0
+    var iirB1B: Float = 0
+    var iirB2B: Float = 0
+    var iirB3B: Float = 0
+    var iirFlagC: Float = 0
+    var iirB0C: Float = 0
+    var iirB1C: Float = 0
+    var iirB2C: Float = 0
+    var iirB3C: Float = 0
 
     init(width: Int, height: Int, radius: Int) {
         self.width = UInt32(width)
         self.height = UInt32(height)
         self.radius = UInt32(radius)
+    }
+
+    /// The parameters of a blur, with the coefficients of the recursion.
+    ///
+    /// - Parameters:
+    ///   - width: the width of the image, in pixels.
+    ///   - height: the height of the image, in pixels.
+    ///   - plan: the plan of the blur.
+    init(width: Int, height: Int, plan: MetalKernels.BlurPlan) {
+        self.width = UInt32(width)
+        self.height = UInt32(height)
+        self.radius = UInt32(plan.radius)
+        self.iirFlagA = plan.iirFlags[0]
+        self.iirB0A = plan.iirCoefficients[0][0]
+        self.iirB1A = plan.iirCoefficients[0][1]
+        self.iirB2A = plan.iirCoefficients[0][2]
+        self.iirB3A = plan.iirCoefficients[0][3]
+        self.iirFlagB = plan.iirFlags[1]
+        self.iirB0B = plan.iirCoefficients[1][0]
+        self.iirB1B = plan.iirCoefficients[1][1]
+        self.iirB2B = plan.iirCoefficients[1][2]
+        self.iirB3B = plan.iirCoefficients[1][3]
+        self.iirFlagC = plan.iirFlags[2]
+        self.iirB0C = plan.iirCoefficients[2][0]
+        self.iirB1C = plan.iirCoefficients[2][1]
+        self.iirB2C = plan.iirCoefficients[2][2]
+        self.iirB3C = plan.iirCoefficients[2][3]
     }
 }
 
@@ -280,6 +326,80 @@ enum MetalKernels {
     /// conversion to an integer trap, or the loop of the kernel run for
     /// billions of iterations.
     static let maxBlurRadius = 1024
+
+    /// The plan of a separable Gaussian blur.
+    ///
+    /// The CPU reference chooses the path of the filter **per channel**:
+    /// the truncated FIR kernel below `SpatialEffects.smallSigmaMax` (three
+    /// pixels) and the recursive filter of Young & van Vliet above it.
+    ///
+    /// The two filters are **not** two roundings of the same thing: the
+    /// recursion has its own boundary (the replication of the edge
+    /// samples, where the FIR kernel reflects them) and it is an
+    /// approximation of the Gaussian of the upstream.  On a field of the
+    /// size of the fixtures the two differ by several percents, so the GPU
+    /// must use the path of the CPU, not its own.
+    ///
+    /// The plan holds the two paths at once: the FIR kernels of the
+    /// channels that use them, and the coefficients of the recursion of the
+    /// channels that use it.
+    struct BlurPlan {
+        /// The radius of the FIR kernels.
+        var radius: Int = 0
+        /// The FIR kernels, channel major.
+        var kernels: [Float] = [1, 1, 1]
+        /// Whether the channel uses the recursion (one) or the FIR kernel
+        /// (zero).
+        var iirFlags: [Float] = [0, 0, 0]
+        /// The coefficients of the recursion of every channel: `b`, `b1`,
+        /// `b2` and `b3`.
+        var iirCoefficients: [[Float]] = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+        /// Whether the recursion is used at all.
+        var usesIIR: Bool = false
+    }
+
+    /// The plan of the separable Gaussian blur of the given sigmas.
+    ///
+    /// The decision is the one of the CPU reference (`SpatialEffects`):
+    /// a sigma of three pixels or more uses the Young & van Vliet
+    /// recursion, a smaller one the truncated FIR kernel.  The choice is
+    /// **per channel**, because the CPU filters the channels one by one.
+    ///
+    /// - Parameter sigmas: the standard deviations, in pixels, one per
+    ///   channel (a single value applies to the three channels).
+    /// - Returns: the plan of the blur.
+    static func blur(sigmas: [Double]) -> BlurPlan {
+        let channels = sigmas.count == 3 ? sigmas : [sigmas[0], sigmas[0], sigmas[0]]
+        var plan = BlurPlan()
+        // The sigmas of the FIR channels: the channels that use the
+        // recursion do not need any kernel.
+        var firSigmas = [Double](repeating: 0, count: 3)
+        for channel in 0..<3 {
+            let sigma = channels[channel]
+            // A sigma that is not a positive number is the identity.
+            guard sigma.isFinite, sigma > 0 else { continue }
+            if sigma >= SpatialEffects.smallSigmaMax {
+                // The recursion of Young & van Vliet: the coefficients come
+                // from the CPU reference itself, so the two sides cannot
+                // drift apart.
+                let coefficients = SpatialEffects.youngVanVlietCoefficients(sigma: sigma)
+                plan.iirFlags[channel] = 1
+                plan.iirCoefficients[channel] = [
+                    Float(coefficients.b),
+                    Float(coefficients.b1),
+                    Float(coefficients.b2),
+                    Float(coefficients.b3),
+                ]
+                plan.usesIIR = true
+            } else {
+                firSigmas[channel] = sigma
+            }
+        }
+        let (radius, kernels) = gaussian(sigmas: firSigmas)
+        plan.radius = radius
+        plan.kernels = kernels
+        return plan
+    }
 
     /// The separable Gaussian kernels of the given sigmas.
     ///
@@ -430,6 +550,18 @@ struct MetalGrainBuffers {
             }
             return buffer
         }
+        func uintBuffer(_ values: [UInt32]) throws -> MTLBuffer {
+            guard !values.isEmpty else {
+                throw MetalBackendError.invalidPlan("an empty buffer of the grain")
+            }
+            guard let buffer = device.makeBuffer(
+                bytes: values, length: values.count * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            ) else {
+                throw MetalBackendError.commandFailed("a buffer of the grain could not be allocated")
+            }
+            return buffer
+        }
         var parameters = FilmGrainParams(
             width: width,
             height: height,
@@ -463,18 +595,24 @@ struct MetalGrainBuffers {
 
         // The seed of every stream (the channel and the layer of the
         // emulsion), exactly like the pure Swift reference.
-        var seeds = [Float](repeating: 0, count: count)
+        //
+        // The seeds are **32 bit integers**: they are the payload of a
+        // `uint` buffer, so the GPU draws the very same variates as the
+        // executable specification of the kernels (`FilmGrainPlan.apply`).
+        // A `float` buffer would round the seeds to twenty four bits and
+        // the GPU would draw another realisation of the same distribution.
+        var seeds = [UInt32](repeating: 0, count: count)
         for colour in 0..<FilmGrainPlan.channelCount {
             for layer in 0..<FilmGrainPlan.layerCount {
                 let derived = StochasticSeed.grainLayer(
                     seed: seed, channel: colour, layer: layer
                 )
-                seeds[colour * FilmGrainPlan.layerCount + layer] = Float(
-                    UInt32(truncatingIfNeeded: derived)
+                seeds[colour * FilmGrainPlan.layerCount + layer] = UInt32(
+                    truncatingIfNeeded: derived
                 )
             }
         }
-        self.seeds = try buffer(seeds)
+        self.seeds = try uintBuffer(seeds)
         self.densityMin = try buffer(plan.densityMin)
 
         var clumping = FilmGrainClumpingParams(
