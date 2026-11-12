@@ -6,8 +6,15 @@ name: CI
 #
 # The two jobs run **in parallel**: the CPU tests take about twenty
 # minutes and the Metal tests about ten, and the two of them together
-# exceeded the cap of the single job of the previous layout (the job was
-# cancelled in the middle of the Metal tests, which looked like a hang).
+# exceeded the cap of the single job of the previous layout.
+#
+# The cancellation of the run 43008312020 is **not** known to be the cap
+# of the job alone: the first GPU test produced **no output at all** for
+# more than eighteen minutes, and the cause of that silence is
+# **undetermined** (a hang of the GPU, a hang of the driver, or the loss
+# of the device are all possible).  The split of the jobs, the bounded
+# waits of the backend and the unbuffered log make the failure visible
+# instead of silent, but they do not explain it.
 on:
   push:
     branches:
@@ -93,8 +100,10 @@ jobs:
     name: macOS (the CPU reference and the iOS build)
     runs-on: macos-15
     # The cap of the job: the build of the tests (a few minutes) plus the
-    # two steps below (35 + 15 minutes).
-    timeout-minutes: 55
+    # two steps below (35 + 25 minutes).  It must be **larger** than the
+    # sum of the caps of the steps, or the cap of the job kills a step
+    # that is still running (which is what happened before).
+    timeout-minutes: 70
     env:
       NSUnbufferedIO: YES
     steps:
@@ -131,21 +140,35 @@ jobs:
 
       - name: The iOS build
         if: always()
-        timeout-minutes: 15
+        timeout-minutes: 25
         run: |
           set -o pipefail
-          # The scheme of the package: `xcodebuild -list` prints it under
-          # the "Schemes:" heading.
-          SCHEME="$(xcodebuild -list 2>/dev/null \
-            | awk '/Schemes:/ {found=1; next} found && NF {print $1; exit}')"
-          if [ -z "${SCHEME}" ]; then
-            SCHEME="lightsuffer-ios-Package"
+          # **Every** scheme of the package is built for the iOS
+          # simulator: the scheme that `xcodebuild -list` prints first is
+          # the one of the first library target (`FilmPhysics`), so the
+          # Metal port (`FilmPhysicsMetal`) was never built for the iOS.
+          # A target that is not built is not tested, so the loop below
+          # fails the step as soon as one scheme does not build.
+          SCHEMES="$(xcodebuild -list 2>/dev/null | awk '/Schemes:/ {found=1; next} found && /^[[:space:]]+[^[:space:]]/ && $0 !~ /:$/ {print $1}')"
+          if [ -z "${SCHEMES}" ]; then
+            SCHEMES="lightsuffer-ios-Package"
           fi
-          echo "the scheme of the package: ${SCHEME}"
-          xcodebuild -scheme "${SCHEME}" \
-            -destination 'generic/platform=iOS Simulator' build 2>&1 \
-            | while IFS= read -r l; do printf '%s %s\n' "$(date -u +%H:%M:%S)" "$l"; done \
-            | tee ios.log
+          echo "the schemes of the package:"
+          echo "${SCHEMES}"
+          STATUS=0
+          for SCHEME in ${SCHEMES}; do
+            echo "--- the build of the scheme ${SCHEME} ---"
+            if xcodebuild -scheme "${SCHEME}" \
+              -destination 'generic/platform=iOS Simulator' build 2>&1 \
+              | while IFS= read -r l; do printf '%s %s\n' "$(date -u +%H:%M:%S)" "$l"; done \
+              | tee -a ios.log; then
+              echo "IOS-BUILD ${SCHEME} OK"
+            else
+              echo "IOS-BUILD ${SCHEME} FAILED"
+              STATUS=1
+            fi
+          done
+          exit ${STATUS}
 
       - name: The log of the iOS build
         if: always()

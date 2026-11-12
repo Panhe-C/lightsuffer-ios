@@ -1396,11 +1396,17 @@ the timing) exist **only** from those CI runs.
 | The job | The cap | The steps |
 |---|---|---|
 | `metal` | 30 minutes | the checkout, the toolchain, the Metal devices, `swift build --build-tests`, the **Metal tests only** (`swift test --skip-build --filter FilmPhysicsMetalTests`, cap 15 minutes), the **timing** in release (`swift test -c release --filter testTheTimingOfTheGPUAndOfTheCPU`, cap 10 minutes, `if: always()`), the upload of `metal.log` and `timing.log` (`if: always()`) |
-| `cpu-and-ios` | 55 minutes | the checkout, the toolchain, `swift build --build-tests`, the **CPU tests** (`swift test --skip-build --skip FilmPhysicsMetalTests`, cap 35 minutes), the upload of `cpu.log` (`if: always()`), `xcodebuild -list`, the **iOS build** (`xcodebuild -scheme <detected> -destination 'generic/platform=iOS Simulator' build`, cap 15 minutes, `if: always()`), the upload of `ios.log` (`if: always()`) |
+| `cpu-and-ios` | 70 minutes | the checkout, the toolchain, `swift build --build-tests`, the **CPU tests** (`swift test --skip-build --skip FilmPhysicsMetalTests`, cap 35 minutes), the upload of `cpu.log` (`if: always()`), `xcodebuild -list`, the **iOS build** of **every** scheme of the package (`xcodebuild -scheme <scheme> -destination 'generic/platform=iOS Simulator' build`, the loop over the schemes of `xcodebuild -list`, cap 25 minutes, `if: always()`, `IOS-BUILD <scheme> OK/FAILED` for each of them), the upload of `ios.log` (`if: always()`) |
 
 The cap of a job is **larger** than the sum of the caps of its steps (the
 build of the tests is not capped): the cap of the job must never kill a
 step that is still running.
+
+The iOS build builds **every** scheme of the package, not only the first
+one: `xcodebuild -list` prints the scheme of the first library target
+(`FilmPhysics`) first, so the Metal port (`FilmPhysicsMetal`) was never
+built for the iOS.  A target that is not built is not tested, so the step
+fails as soon as one scheme does not build.
 
 Every test step writes its output **unbuffered and timestamped**:
 

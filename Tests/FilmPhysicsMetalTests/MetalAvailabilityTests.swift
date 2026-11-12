@@ -14,6 +14,12 @@
 
 import XCTest
 
+// The Metal module is imported only where it exists: the test below uses
+// `MTLCreateSystemDefaultDevice()`, which lives in it.
+#if canImport(Metal)
+import Metal
+#endif
+
 final class MetalAvailabilityTests: XCTestCase {
 
     /// The Metal tests run on the platforms that have a Metal device.

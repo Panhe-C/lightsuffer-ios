@@ -26,6 +26,7 @@
 #if canImport(Metal)
 
 import Foundation
+import Dispatch
 import Metal
 import FilmPhysics
 
@@ -88,7 +89,11 @@ final class MetalCommandContext {
     /// The command buffer of the render.
     private var commandBuffer: MTLCommandBuffer?
     /// The encoder of the render.
-    private var encoder: MTLComputeCommandEncoder?
+    ///
+    /// The property is **not** named `encoder`: the method ``encoder()``
+    /// (which creates the encoder on the first call) would collide with it,
+    /// and the Swift compiler rejects the redeclaration.
+    private var activeEncoder: MTLComputeCommandEncoder?
     /// The number of the committed stages.
     private(set) var stageCount = 0
 
@@ -108,13 +113,13 @@ final class MetalCommandContext {
     ///
     /// - Returns: the encoder, created on the first call.
     func encoder() throws -> MTLComputeCommandEncoder {
-        if let encoder { return encoder }
+        if let activeEncoder { return activeEncoder }
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw MetalBackendError.commandFailed("the command buffer could not be created")
         }
         self.commandBuffer = commandBuffer
-        self.encoder = encoder
+        self.activeEncoder = encoder
         return encoder
     }
 
@@ -123,9 +128,9 @@ final class MetalCommandContext {
     /// - Parameter stage: the name of the stage (the name of the kernel),
     ///   which is reported when the GPU does not finish.
     func commit(stage: String) throws {
-        guard let commandBuffer, let encoder else { return }
-        encoder.endEncoding()
-        self.encoder = nil
+        guard let commandBuffer, let activeEncoder else { return }
+        activeEncoder.endEncoding()
+        self.activeEncoder = nil
         self.commandBuffer = nil
         let start = Date()
         try Self.wait(
@@ -343,8 +348,8 @@ public final class MetalBackend: FilmRenderBackend {
     /// - Parameter name: the name of the variable.
     /// - Returns: `true` when the variable is set to `1` or to `true`.
     private static func environmentFlag(_ name: String) -> Bool {
-        guard let value = ProcessInfo.processInfo.environment[name] else { return false }
-        let value = value.trimmingCharacters(in: .whitespaces).lowercased()
+        guard let raw = ProcessInfo.processInfo.environment[name] else { return false }
+        let value = raw.trimmingCharacters(in: .whitespaces).lowercased()
         return value == "1" || value == "true" || value == "yes"
     }
 
