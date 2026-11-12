@@ -217,7 +217,7 @@ final class PreviewViewModel: ObservableObject {
 
     private func render(_ request: PreviewRenderRequest) {
         guard session.isCurrent(request.generation),
-              let preparedPhoto else { return }
+              let currentPhoto = preparedPhoto else { return }
 
         activity = .rendering
         renderTask?.cancel()
@@ -231,12 +231,12 @@ final class PreviewViewModel: ObservableObject {
                     // WB and input-space changes require new pixels, not merely
                     // new IO tags. Decode the retained original bytes after the
                     // same debounce used by physical adjustments.
-                    let decoded = try preparedPhoto.inputSettings == request.inputSettings
-                        ? preparedPhoto
+                    let decoded = try currentPhoto.inputSettings == request.inputSettings
+                        ? currentPhoto
                         : PhotoDecoder.decode(
-                            data: preparedPhoto.source.data,
-                            typeIdentifier: preparedPhoto.source.typeIdentifier,
-                            filename: preparedPhoto.source.filename,
+                            data: currentPhoto.source.data,
+                            typeIdentifier: currentPhoto.source.typeIdentifier,
+                            filename: currentPhoto.source.filename,
                             settings: request.inputSettings
                         )
                     let rendered = try PreviewRenderer.render(decoded, request: request)
@@ -248,7 +248,7 @@ final class PreviewViewModel: ObservableObject {
                     for: request.generation
                 ) else { return }
 
-                preparedPhoto = accepted.0
+                self.preparedPhoto = accepted.0
                 originalImage = accepted.0.original
                 photoKind = accepted.0.kind
                 inputStatus = accepted.0.inputStatus
