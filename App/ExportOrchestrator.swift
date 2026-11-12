@@ -106,7 +106,7 @@ enum ExportOrchestrator {
             return ExportDeviceBudget.standard(
                 maxTextureDimension: ExportDeviceBudget.metalMaxTextureDimension,
                 workingSetBytes: ExportDeviceBudget.workingSetBytes(
-                    recommendedMaxWorkingSetSize: device.recommendedMaxWorkingSetSize
+                    recommendedMaxWorkingSetSize: Int(clamping: device.recommendedMaxWorkingSetSize)
                 )
             )
         }
