@@ -74,7 +74,7 @@ final class AdvancedParamsTests: XCTestCase {
         let baselineLeaves = leaves(baseline)
 
         for spec in AdvancedParams.catalog where spec.availability == .applied {
-            guard let candidate = value(for: spec, baseline: baseline) else {
+            guard let candidate = distinctValue(for: spec, baseline: baseline) else {
                 XCTFail("no value for \(spec.path)")
                 continue
             }
@@ -124,7 +124,7 @@ final class AdvancedParamsTests: XCTestCase {
         )
 
         for spec in AdvancedParams.catalog where spec.availability == .basicSheet {
-            guard let candidate = value(for: spec, baseline: baseline) else {
+            guard let candidate = distinctValue(for: spec, baseline: baseline) else {
                 XCTFail("no value for \(spec.path)")
                 continue
             }
@@ -620,7 +620,7 @@ private func changedLeaves(
 /// A parameter with a single accepted value (the ported spectral method,
 /// the ported input compression) has no other value: the current one is
 /// returned with `isDistinct == false`.
-private func value(
+private func distinctValue(
     for spec: AdvancedParamSpec,
     baseline: PipelineParams
 ) -> (value: AdvancedValue, isDistinct: Bool)? {
