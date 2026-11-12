@@ -1,0 +1,43 @@
+name: LightSuffer
+options:
+  bundleIdPrefix: com.lightsuffer
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  LightSufferEngine:
+    path: .
+targets:
+  LightSuffer:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: App
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: LightSufferEngine
+        product: FilmPhysics
+      - package: LightSufferEngine
+        product: FilmPhysicsMetal
+      - package: LightSufferEngine
+        product: LightSufferPreview
+    settings:
+      base:
+        CODE_SIGN_STYLE: Automatic
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_FILE: App/Info.plist
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        MARKETING_VERSION: 0.1.0
+        PRODUCT_BUNDLE_IDENTIFIER: com.lightsuffer.LightSuffer
+        PRODUCT_NAME: LightSuffer
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1,2"
+schemes:
+  LightSuffer:
+    build:
+      targets:
+        LightSuffer: all
+    run:
+      config: Debug

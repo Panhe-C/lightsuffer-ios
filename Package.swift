@@ -23,6 +23,7 @@ let package = Package(
     products: [
         .library(name: "FilmPhysics", targets: ["FilmPhysics"]),
         .library(name: "FilmPhysicsMetal", targets: ["FilmPhysicsMetal"]),
+        .library(name: "LightSufferPreview", targets: ["LightSufferPreview"]),
     ],
     targets: [
         .target(
@@ -44,6 +45,10 @@ let package = Package(
                 .copy("Shaders"),
             ]
         ),
+        .target(
+            name: "LightSufferPreview",
+            dependencies: ["FilmPhysics"]
+        ),
         .testTarget(
             name: "FilmPhysicsTests",
             dependencies: ["FilmPhysics"],
@@ -54,6 +59,10 @@ let package = Package(
         .testTarget(
             name: "FilmPhysicsMetalTests",
             dependencies: ["FilmPhysicsMetal", "FilmPhysics"]
+        ),
+        .testTarget(
+            name: "LightSufferPreviewTests",
+            dependencies: ["LightSufferPreview", "FilmPhysics"]
         ),
     ]
 )

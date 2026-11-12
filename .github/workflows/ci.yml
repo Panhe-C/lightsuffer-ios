@@ -100,10 +100,10 @@ jobs:
     name: macOS (the CPU reference and the iOS build)
     runs-on: macos-15
     # The cap of the job: the build of the tests (a few minutes) plus the
-    # two steps below (35 + 25 minutes).  It must be **larger** than the
-    # sum of the caps of the steps, or the cap of the job kills a step
+    # three steps below (35 + 25 + 20 minutes).  It must be **larger** than
+    # the sum of the caps of the steps, or the cap of the job kills a step
     # that is still running (which is what happened before).
-    timeout-minutes: 70
+    timeout-minutes: 90
     env:
       NSUnbufferedIO: YES
     steps:
@@ -170,10 +170,32 @@ jobs:
           done
           exit ${STATUS}
 
-      - name: The log of the iOS build
+      - name: The app build
+        if: always()
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          {
+            # Keep the generated Xcode project out of the package-scheme loop
+            # above.  That loop still runs `xcodebuild -list` at the package
+            # root before this project exists; this step names its project
+            # explicitly and does not alter that package discovery.
+            command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
+            xcodegen generate --spec project.yml
+            xcodebuild -project LightSuffer.xcodeproj \
+              -scheme LightSuffer \
+              -destination 'generic/platform=iOS Simulator' \
+              CODE_SIGNING_ALLOWED=NO build
+          } 2>&1 \
+            | while IFS= read -r l; do printf '%s %s\n' "$(date -u +%H:%M:%S)" "$l"; done \
+            | tee app.log
+
+      - name: The logs of the iOS builds
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ios-log
-          path: ios.log
+          path: |
+            ios.log
+            app.log
           if-no-files-found: ignore
