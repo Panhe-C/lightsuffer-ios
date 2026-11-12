@@ -284,6 +284,76 @@ struct ContentView: View {
     private var adjustmentsSheet: some View {
         NavigationStack {
             Form {
+                Section("Input") {
+                    LabeledContent(
+                        "Photo",
+                        value: model.photoKind?.displayName ?? "No photo"
+                    )
+                    LabeledContent(
+                        "Decoder",
+                        value: model.isRAWPhoto ? "CIRAWFilter · scene-linear" : "Image I/O · floating point"
+                    )
+
+                    Picker("White balance", selection: whiteBalanceBinding) {
+                        ForEach(WhiteBalanceMode.allCases, id: \.self) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .disabled(!model.isRAWPhoto)
+                    if !model.isRAWPhoto {
+                        Text("White balance applies to RAW files. JPEG, HEIC and PNG are not re-tinted.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if model.isRAWPhoto && model.inputSettings.whiteBalanceMode == .custom {
+                        HStack {
+                            Text("Temperature")
+                            Spacer()
+                            Text("\(customTemperatureBinding.wrappedValue, specifier: "%.0f") K")
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(
+                            value: customTemperatureBinding,
+                            in: WhiteBalanceMode.coreImageTemperatureRange,
+                            step: 1
+                        ) {
+                            Text("Custom white-balance temperature")
+                        }
+                        HStack {
+                            Text("Tint (green multiplier)")
+                            Spacer()
+                            Text("\(model.inputSettings.customTint, specifier: "%.2f")×")
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(
+                            value: customTintBinding,
+                            in: 0.5...1.5,
+                            step: 0.01
+                        ) {
+                            Text("Custom white-balance tint")
+                        }
+                        Text("1.00× is neutral. The upstream green multiplier is mapped to CIRAWFilter’s green–magenta neutralTint axis.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Picker("Input colour space", selection: inputColorSpaceBinding) {
+                        ForEach(PhotoInputColorSpace.offered, id: \.self) { selection in
+                            Text(selection.displayName).tag(selection)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    if let inputStatus = model.inputStatus {
+                        Text(inputStatus)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
                 Section("Film output") {
                     if model.look.film.isPositive {
                         LabeledContent("Output", value: "Direct scan")
@@ -373,6 +443,53 @@ struct ContentView: View {
         Binding(
             get: { model.outputSelection },
             set: { model.selectOutput($0) }
+        )
+    }
+
+    private var whiteBalanceBinding: Binding<WhiteBalanceMode> {
+        Binding(
+            get: { model.inputSettings.whiteBalanceMode },
+            set: { mode in
+                var settings = model.inputSettings
+                settings.whiteBalanceMode = mode
+                model.inputSettings = settings
+            }
+        )
+    }
+
+    private var customTemperatureBinding: Binding<Double> {
+        Binding(
+            get: {
+                model.inputSettings.customTemperature
+                    ?? WhiteBalanceMode.defaultCustomTemperature
+            },
+            set: { temperature in
+                var settings = model.inputSettings
+                settings.customTemperature = temperature
+                model.inputSettings = settings
+            }
+        )
+    }
+
+    private var customTintBinding: Binding<Double> {
+        Binding(
+            get: { model.inputSettings.customTint },
+            set: { tint in
+                var settings = model.inputSettings
+                settings.customTint = tint
+                model.inputSettings = settings
+            }
+        )
+    }
+
+    private var inputColorSpaceBinding: Binding<PhotoInputColorSpace> {
+        Binding(
+            get: { model.inputSettings.inputColorSpace },
+            set: { selection in
+                var settings = model.inputSettings
+                settings.inputColorSpace = selection
+                model.inputSettings = settings
+            }
         )
     }
 

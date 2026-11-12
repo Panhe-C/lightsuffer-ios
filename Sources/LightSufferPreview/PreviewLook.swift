@@ -129,7 +129,8 @@ public enum PreviewLook {
     /// direct halation amount.  The stock digest itself is never bypassed.
     public static func pipelineParams(
         for look: StockCatalog.Look,
-        adjustments: PreviewAdjustments = PreviewAdjustments()
+        adjustments: PreviewAdjustments = PreviewAdjustments(),
+        inputSettings: PhotoInputSettings = PhotoInputSettings()
     ) throws -> PipelineParams {
         var params = try StockCatalog.pipelineParams(
             film: look.film.stock,
@@ -144,6 +145,11 @@ public enum PreviewLook {
         }
         params.filmRender.halation.active = adjustments.halationEnabled
         params.filmRender.halation.halationAmount = adjustments.halationAmount
+
+        // The decoder supplies pixels in exactly this tagged space. Unsupported
+        // engine names are rejected or converted by the I/O policy, never passed
+        // through to FilmPipeline. This writes no stock or stochastic fields.
+        try inputSettings.apply(to: &params)
 
         // StockCatalog supplies autoExposure == false and the PipelineParams
         // default grain sampler.  Do not replace either policy here.

@@ -20,21 +20,28 @@ public struct PreviewRenderRequest: Sendable {
     public let generation: PreviewGeneration
     public let look: StockCatalog.Look
     public let adjustments: PreviewAdjustments
+    public let inputSettings: PhotoInputSettings
 
     public init(
         generation: PreviewGeneration,
         look: StockCatalog.Look,
-        adjustments: PreviewAdjustments
+        adjustments: PreviewAdjustments,
+        inputSettings: PhotoInputSettings = PhotoInputSettings()
     ) {
         self.generation = generation
         self.look = look
         self.adjustments = adjustments
+        self.inputSettings = inputSettings
     }
 
-    /// Loads and digests the look, then applies the basic physical adjustments.
-    /// The app calls this inside its detached render task.
+    /// Loads and digests the look, then applies the basic physical and input
+    /// adjustments. The app calls this inside its detached render task.
     public func pipelineParams() throws -> PipelineParams {
-        try PreviewLook.pipelineParams(for: look, adjustments: adjustments)
+        try PreviewLook.pipelineParams(
+            for: look,
+            adjustments: adjustments,
+            inputSettings: inputSettings
+        )
     }
 }
 
@@ -77,9 +84,9 @@ public struct MainQueuePreviewRenderScheduler: PreviewRenderScheduling {
 /// Platform-neutral state and scheduling for the interactive preview.
 ///
 /// The view model owns photo decoding and backend execution.  This type owns
-/// the selected look, basic adjustments, debounce policy and generation-based
-/// stale-result rejection.  Every mutation cancels the pending debounce.  A
-/// cancelled callback is also guarded by its generation, so even a scheduler
+/// the selected look, basic and input adjustments, debounce policy and
+/// generation-based stale-result rejection. Every mutation cancels the pending
+/// debounce. A cancelled callback is also guarded by its generation, so even a scheduler
 /// that is already firing cannot emit an obsolete request.
 public final class PreviewSession {
     public static let defaultDebounceInterval: TimeInterval = 0.200
@@ -88,6 +95,14 @@ public final class PreviewSession {
     public var adjustments: PreviewAdjustments {
         didSet {
             guard adjustments != oldValue else { return }
+            invalidateAndSchedule()
+        }
+    }
+    /// Changing input policy invalidates the same generation as a physical
+    /// adjustment. The app also re-decodes the retained original bytes.
+    public var inputSettings: PhotoInputSettings {
+        didSet {
+            guard inputSettings != oldValue else { return }
             invalidateAndSchedule()
         }
     }
@@ -106,6 +121,7 @@ public final class PreviewSession {
     ) {
         self.look = PreviewLook.defaultLook
         self.adjustments = PreviewAdjustments()
+        self.inputSettings = PhotoInputSettings()
         self.debounceInterval = debounceInterval
         self.scheduler = scheduler
     }
@@ -136,10 +152,15 @@ public final class PreviewSession {
         updateLook(selected)
     }
 
-    /// Begins a new photo state.  This immediately invalidates all older work;
+    /// Begins a new photo state. This immediately invalidates all older work;
     /// `photoBecameReady` arms the debounce after decoding has completed.
-    public func photoDidChange() {
+    /// Input settings reset by default, so a non-RAW photo cannot inherit a
+    /// previous photo's selected WB and appear to have been re-tinted.
+    public func photoDidChange(resetInputSettings: Bool = true) {
         hasReadyPhoto = false
+        if resetInputSettings, inputSettings != PhotoInputSettings() {
+            inputSettings = PhotoInputSettings()
+        }
         invalidateAndSchedule()
     }
 
@@ -193,7 +214,8 @@ public final class PreviewSession {
             PreviewRenderRequest(
                 generation: generation,
                 look: look,
-                adjustments: adjustments
+                adjustments: adjustments,
+                inputSettings: inputSettings
             )
         )
     }

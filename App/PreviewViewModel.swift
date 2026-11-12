@@ -41,6 +41,21 @@ final class PreviewViewModel: ObservableObject {
             renderDidInvalidate()
         }
     }
+    /// RAW / input-colour policy is part of the same debounced generation.
+    /// A change re-decodes the original bytes before rendering new pixels.
+    @Published var inputSettings: PhotoInputSettings {
+        didSet {
+            guard inputSettings != oldValue else { return }
+            let previousGeneration = session.currentGeneration
+            session.inputSettings = inputSettings
+            guard session.currentGeneration != previousGeneration else { return }
+            renderDidInvalidate()
+        }
+    }
+    @Published private(set) var photoKind: PhotoKind?
+    @Published private(set) var inputStatus: String?
+
+    var isRAWPhoto: Bool { photoKind?.isRAW == true }
 
     // MARK: - The export
 
@@ -65,6 +80,7 @@ final class PreviewViewModel: ObservableObject {
         self.session = session
         self.look = session.look
         self.adjustments = session.adjustments
+        self.inputSettings = session.inputSettings
 
         // MainQueuePreviewRenderScheduler calls back on the main queue.  The
         // task hop gives this MainActor view model an explicit isolation handoff.
@@ -116,7 +132,10 @@ final class PreviewViewModel: ObservableObject {
         renderTask?.cancel()
         loadTask = nil
         renderTask = nil
-        session.photoDidChange()
+        // The session's documented new-photo policy resets WB and colour-space
+        // settings, preventing a processed photo from inheriting RAW-only WB.
+        session.photoDidChange(resetInputSettings: true)
+        inputSettings = session.inputSettings
 
         // A new photo invalidates a running export.
         cancelExport()
@@ -127,12 +146,16 @@ final class PreviewViewModel: ObservableObject {
         originalImage = nil
         gradedImage = nil
         framedImage = nil
+        photoKind = nil
+        inputStatus = nil
 
         guard let item else {
             activity = .idle
             return
         }
         activity = .loading
+        let pickerTypeIdentifier = item.supportedContentTypes.first?.identifier
+        let decodeSettings = inputSettings
 
         loadTask = Task {
             do {
@@ -142,13 +165,19 @@ final class PreviewViewModel: ObservableObject {
                 try Task.checkCancellation()
 
                 let prepared = try await Task.detached(priority: .userInitiated) {
-                    try PhotoDecoder.decode(data: data)
+                    try PhotoDecoder.decode(
+                        data: data,
+                        typeIdentifier: pickerTypeIdentifier,
+                        settings: decodeSettings
+                    )
                 }.value
                 try Task.checkCancellation()
                 guard currentSelection == selectionID else { return }
 
                 preparedPhoto = prepared
                 originalImage = prepared.original
+                photoKind = prepared.kind
+                inputStatus = prepared.inputStatus
                 activity = .rendering
                 // Look changes made while decoding are already reflected in
                 // the session generation and in the request it will emit.
@@ -198,17 +227,33 @@ final class PreviewViewModel: ObservableObject {
                 // physical render all stay off the main actor.  Engine rendering
                 // is synchronous, so cancellation is enforced by the generation
                 // check when the detached work returns.
-                let rendered = try await Task.detached(priority: .userInitiated) {
-                    try PreviewRenderer.render(preparedPhoto, request: request)
+                let decodedAndRendered = try await Task.detached(priority: .userInitiated) {
+                    // WB and input-space changes require new pixels, not merely
+                    // new IO tags. Decode the retained original bytes after the
+                    // same debounce used by physical adjustments.
+                    let decoded = try preparedPhoto.inputSettings == request.inputSettings
+                        ? preparedPhoto
+                        : PhotoDecoder.decode(
+                            data: preparedPhoto.source.data,
+                            typeIdentifier: preparedPhoto.source.typeIdentifier,
+                            filename: preparedPhoto.source.filename,
+                            settings: request.inputSettings
+                        )
+                    let rendered = try PreviewRenderer.render(decoded, request: request)
+                    return (decoded, rendered)
                 }.value
                 try Task.checkCancellation()
-                guard let rendered = session.accept(
-                    rendered,
+                guard let accepted = session.accept(
+                    decodedAndRendered,
                     for: request.generation
                 ) else { return }
 
-                gradedImage = rendered.image
-                backendName = rendered.backendName
+                preparedPhoto = accepted.0
+                originalImage = accepted.0.original
+                photoKind = accepted.0.kind
+                inputStatus = accepted.0.inputStatus
+                gradedImage = accepted.1.image
+                backendName = accepted.1.backendName
                 errorMessage = nil
                 activity = .idle
                 // The border of the export is shown on the preview too, with
@@ -270,8 +315,8 @@ final class PreviewViewModel: ObservableObject {
 
     /// Starts the full-resolution export.
     ///
-    /// The export runs on the snapshot of the look, the adjustments, the
-    /// border and the format of this moment: a later change of the look does
+    /// The export runs on the snapshot of the look, the adjustments, the input
+    /// settings, the border and the format of this moment: a later look change does
     /// not modify the file that is being written.  A newer export cancels the
     /// running one.
     func startExport() {
@@ -281,6 +326,7 @@ final class PreviewViewModel: ObservableObject {
         let request = ExportRequest(
             look: look,
             adjustments: adjustments,
+            inputSettings: inputSettings,
             format: exportFormat,
             quality: ExportRequest.defaultQuality,
             borderStyle: exportBorderStyle,

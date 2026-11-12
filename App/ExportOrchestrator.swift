@@ -140,7 +140,10 @@ enum ExportOrchestrator {
         progress(ExportProgress(stage: .decoding, fractionCompleted: 0.02))
         // The export decode keeps every source pixel: the 1280 pixel cap of
         // the preview is deliberately not applied here.
-        let full = try PhotoDecoder.decodeFullResolution(photo: photo)
+        let full = try PhotoDecoder.decodeFullResolution(
+            photo: photo,
+            settings: request.inputSettings
+        )
         try cancellation.check()
 
         progress(ExportProgress(stage: .planning, fractionCompleted: 0.06))

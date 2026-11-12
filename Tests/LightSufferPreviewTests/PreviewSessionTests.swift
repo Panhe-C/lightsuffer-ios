@@ -224,6 +224,55 @@ final class PreviewSessionTests: XCTestCase {
         XCTAssertEqual(requests[0].adjustments.exposureCompensationEV, 0.19)
     }
 
+    func testInputSettingsInvalidateAndSurviveLookAndBasicChanges() throws {
+        let scheduler = TestPreviewScheduler()
+        let session = PreviewSession(scheduler: scheduler)
+        session.photoDidChange()
+        session.photoBecameReady()
+        scheduler.advance()
+
+        let oldGeneration = session.currentGeneration
+        let settings = PhotoInputSettings(
+            whiteBalanceMode: .custom,
+            customTemperature: 4300,
+            customTint: 1.05,
+            inputColorSpace: .explicit("Display P3")
+        )
+        session.inputSettings = settings
+        XCTAssertNotEqual(session.currentGeneration, oldGeneration)
+        XCTAssertFalse(session.isCurrent(oldGeneration))
+        XCTAssertTrue(session.hasPendingRender)
+
+        try session.selectFilm(stock: "kodak_vision3_250d")
+        session.adjustments.exposureCompensationEV = 0.25
+        XCTAssertEqual(session.inputSettings, settings)
+        scheduler.advance()
+
+        let request = session.renderRequestForTesting()
+        XCTAssertEqual(request.inputSettings, settings)
+        let params = try request.pipelineParams()
+        XCTAssertEqual(params.io.inputColorSpace, "ProPhoto RGB")
+        XCTAssertFalse(params.io.inputCCTFDecoding)
+        XCTAssertEqual(params.stochastic.grainSampler, .fast)
+        XCTAssertEqual(params.camera.exposureCompensationEV, 0.25)
+    }
+
+    func testNewPhotoResetsInputSettingsByDefault() {
+        let session = PreviewSession(scheduler: TestPreviewScheduler())
+        session.inputSettings = PhotoInputSettings(
+            whiteBalanceMode: .tungsten,
+            customTemperature: 3200,
+            customTint: 1.1,
+            inputColorSpace: .explicit("sRGB")
+        )
+        session.photoDidChange()
+        XCTAssertEqual(session.inputSettings, PhotoInputSettings())
+
+        session.inputSettings = PhotoInputSettings(whiteBalanceMode: .daylight)
+        session.photoDidChange(resetInputSettings: false)
+        XCTAssertEqual(session.inputSettings.whiteBalanceMode, .daylight)
+    }
+
     func testCancelledCallbackThatStillRunsCannotEmitStaleRequest() {
         let scheduler = TestPreviewScheduler()
         let session = PreviewSession(scheduler: scheduler)
@@ -248,7 +297,8 @@ private extension PreviewSession {
         PreviewRenderRequest(
             generation: currentGeneration,
             look: look,
-            adjustments: adjustments
+            adjustments: adjustments,
+            inputSettings: inputSettings
         )
     }
 }
