@@ -85,6 +85,10 @@ public struct ExportRequest: @unchecked Sendable {
     public let look: StockCatalog.Look
     public let adjustments: PreviewAdjustments
     public let inputSettings: PhotoInputSettings
+    /// The advanced overrides of the panel, applied between the digest and
+    /// the basic adjustments.  The export uses the same overrides as the
+    /// preview.
+    public let advancedOverrides: AdvancedOverrides
     public let format: ExportFormat
     public let quality: Double
     public let borderStyle: BorderStyle
@@ -95,6 +99,7 @@ public struct ExportRequest: @unchecked Sendable {
         look: StockCatalog.Look,
         adjustments: PreviewAdjustments,
         inputSettings: PhotoInputSettings = PhotoInputSettings(),
+        advancedOverrides: AdvancedOverrides = AdvancedOverrides(),
         format: ExportFormat = .jpeg,
         quality: Double = ExportRequest.defaultQuality,
         borderStyle: BorderStyle = .none,
@@ -104,6 +109,7 @@ public struct ExportRequest: @unchecked Sendable {
         self.look = look
         self.adjustments = adjustments
         self.inputSettings = inputSettings
+        self.advancedOverrides = advancedOverrides
         self.format = format
         self.quality = quality.isFinite ? min(1, max(0.01, quality)) : Self.defaultQuality
         self.borderStyle = borderStyle
@@ -111,14 +117,16 @@ public struct ExportRequest: @unchecked Sendable {
         self.sourceOrientation = (1...8).contains(sourceOrientation) ? sourceOrientation : 1
     }
 
-    /// Uses the exact same stock digest, physical adjustments and input tags
-    /// as preview. The Apple export decoder applies the same input settings to
-    /// a fresh full-resolution decode of the original bytes.
+    /// Uses the exact same stock digest, advanced overrides, physical
+    /// adjustments and input tags as preview. The Apple export decoder applies
+    /// the same input settings to a fresh full-resolution decode of the
+    /// original bytes.
     public func pipelineParams() throws -> PipelineParams {
         try PreviewLook.pipelineParams(
             for: look,
             adjustments: adjustments,
-            inputSettings: inputSettings
+            inputSettings: inputSettings,
+            advancedOverrides: advancedOverrides
         )
     }
 

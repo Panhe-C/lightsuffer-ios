@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var selection: PhotosPickerItem?
     @State private var holdingOriginal = false
     @State private var showingAdjustments = false
+    @State private var showingAdvanced = false
 
     private var displayedImage: CGImage? {
         if holdingOriginal {
@@ -88,6 +89,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showingAdjustments) {
             adjustmentsSheet
+        }
+        .sheet(isPresented: $showingAdvanced) {
+            AdvancedParametersView(model: model)
         }
         .preferredColorScheme(.dark)
     }
@@ -424,6 +428,18 @@ struct ContentView: View {
                         Text("Halation amount")
                     }
                     .disabled(!model.adjustments.halationEnabled)
+                }
+
+                Section("Advanced parameters") {
+                    Button {
+                        showingAdvanced = true
+                    } label: {
+                        Label("Advanced parameters…", systemImage: "gearshape.2")
+                    }
+                    .accessibilityIdentifier("open-advanced-parameters")
+                    Text("The whole parameter surface of the simulation, in its own sheet.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
             }
             .navigationTitle("Physical adjustments")

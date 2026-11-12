@@ -76,6 +76,107 @@ colour curves or advanced parameter dump is present. The same sheet has a small
 **Input** section for the detected kind, decoder/fallback status, WB and input
 colour space; it is not the full advanced parameter panel.
 
+## The advanced parameter panel
+
+The whole parameter surface of the engine is exposed in its **own sheet**, opened
+from the last section of the Adjustments sheet.  Nothing of it is on the main
+film-strip screen, and it does not replace the basic EV / grain / halation
+controls.
+
+### The catalog
+
+`LightSufferPreview.AdvancedParams.catalog` mirrors the upstream presentation
+manifest (`spektrafilm_gui/param_manifest.py`): the dotted path of a parameter is
+the key, and every path of the manifest is listed **exactly once** — the 107
+declared parameters plus the eleven of the second diffusion group (the camera
+and the enlarger share the same point spread function), i.e. **118 paths**.
+
+The inventory (tested in `AdvancedParamsTests`):
+
+| Bucket | Count | Meaning |
+|---|---|---|
+| applied | **84** | the panel writes the value into the Swift `PipelineParams` |
+| basic sheet | 4 | `camera.exposure_compensation_ev`, `film_render.grain.active`, `film_render.halation.active`, `film_render.halation.halation_amount`: the Adjustments sheet is applied **after** the overrides and always wins |
+| look | 3 | `selection.film_stock`, `selection.print_paper`, `io.scan_film`: the film / print selection of the main screen owns them |
+| input policy | 2 | `io.input_color_space`, `io.input_cctf_decoding`: the Input section owns them |
+| locked | 1 | `io.output_color_space`: the engine always encodes the output with the sRGB transfer function, and the display and the export of the app are sRGB |
+| unported | 24 | the eight parameters of the chemistry, the two parameters of the auto exposure and the fourteen parameters of the viewer / of the workflow of the upstream GUI |
+
+The groups of the panel are the groups of the manifest: **Couplers, Halation,
+Grain, Glare, Preflash, Camera, Camera diffusion, Enlarger, Enlarger diffusion,
+Scanner, Input gamut, Output gamut, Settings, Film rendering** (the gamma of the
+density curves of the negative), **Film and print** and **I/O policy** (the rows
+owned by another sheet), plus the two unavailable groups **Chemistry** and
+**Viewer and workflow**.
+
+### The apply order
+
+`PreviewLook.pipelineParams(for:adjustments:inputSettings:advancedOverrides:)`
+applies, in this order:
+
+1. the **stock digest** (`StockCatalog.pipelineParams`: the digest, the
+   `autoExposure == false` policy and the default `GrainSampler.fast`),
+2. the **advanced overrides** of the panel, written on top of the digested
+   parameters,
+3. the **basic adjustments** of the Adjustments sheet, so that the sheet wins
+   for the four controls it owns.  The grain strength stays a multiplier of the
+   (possibly overridden) `filmRender.grain.particleScale`,
+4. the **input policy** (`PhotoInputSettings.apply`), which writes the I/O tags
+   only: an unsupported colour-space name is converted or refused there, never
+   tagged by the panel.
+
+An override is an **absolute** value: it replaces the digested value of the
+field, it is not a multiplier of it.  A missing path keeps the digested value.
+
+The engine digests the parameters a **second** time when the pipeline is
+created (`FilmPipeline.init`).  That digest is idempotent and non-destructive:
+a value that still holds the upstream default is replaced by the stock
+specific one.  An override that sets a stock specific field (the DIR coupler
+gammas, the halation strength, the width of the first bounce) to exactly the
+upstream default is therefore replaced by the value of the stock.
+
+The overrides are a snapshot: `PreviewSession`, `PreviewRenderRequest`,
+`ExportRequest` and the view model all carry the same `AdvancedOverrides`, so
+the export is the same grade as the preview.  A change of the overrides
+invalidates the session generation like any other adjustment; a change of the
+look **keeps** them and re-applies them on the fresh digest of the new look; a
+change of the photo keeps them too (only the input settings are reset).
+
+### The reset
+
+The **Reset all** button of the panel (and the per-section **Reset**) *clears
+the overrides*: the next render is the digested look, the basic adjustments and
+the input settings, with no advanced override.  It is **not** a wipe to the
+zero-initialised defaults of the structs, which would discard the digest of the
+stock.  After a global reset the parameters are exactly the baseline, with
+`GrainSampler.fast`, `autoExposure == false` and the linear ProPhoto + CCTF off
+input tags.
+
+### What is not offered
+
+Nothing that the engine does not support is offered as if it worked:
+
+- the **chemistry** group (`print_render.density_curves_morph.*`) is shown
+  disabled: the Swift engine has no counterpart for the print density-curve
+  morphing, and no shadow struct is invented for it;
+- the **auto exposure** stays off: the engine rejects `autoExposure == true`,
+  the panel cannot write it, and the apply step forces it to `false`;
+- the **spectral upsampling** only offers `hanatos2025` (`mallett2019` is not
+  ported and the engine would throw);
+- the **input gamut compression** only offers `xy` (`oklch` is not ported: the
+  engine would pass the input through unchanged);
+- the **output gamut compression** only offers `cam16ucs` and `off` (any other
+  name makes the engine throw);
+- the **film, the print medium and the direct scan** stay on the main screen,
+  and the **input colour space** stays in the Input section: the panel shows
+  them read-only, with a cross-reference;
+- the **unsharp mask** of the scanner is the two fields of the engine
+  (`unsharpMaskSigma` and `unsharpMaskAmount`), not a single slider that would
+  be dropped;
+- the **enlarger illuminant** only offers the bundled illuminants, and the
+  neutral print filters of the digest stay the ones of the default illuminant
+  of the stock.
+
 `FilmPhysics.RGBImage.data` is **row-major interleaved `RGBRGB…`**, not planar.
 The default pipeline contract is linear ProPhoto RGB input
 (`inputCCTFDecoding == false`) and encoded sRGB output
@@ -267,10 +368,18 @@ layout is computed from the size of the **full** frame, so the border of the
 preview has the proportions of the border of the export, while the film grade
 itself stays the existing 1280-pixel preview render.
 
-The full ~118-parameter advanced panel is still not part of this slice.
+The advanced parameter panel of the previous section is part of this slice: the
+118 paths of the upstream manifest are catalogued, the 84 that the panel
+applies are written into the engine, and the others are shown read-only or
+disabled, with their reason.
 
 Linux tests cover file-kind hints / magic bytes, WB constants and mapping,
 engine-tag / fallback policy, settings preservation and generation invalidation.
+They also cover the advanced panel: the catalog (every applied path maps to a
+real `PipelineParams` field, the unported paths are listed and never applied),
+the inventory, the defaults of a fresh session, the apply order, the reset and
+the guards of the unported algorithms.
 They do **not** execute CIRAWFilter, ColorSync, Metal or SwiftUI and do not
 verify a real device. No preview ΔE or RAW colour accuracy has been measured on
-a device in this step.
+a device in this step, and the SwiftUI sheet of the advanced panel has not been
+exercised on a device either.

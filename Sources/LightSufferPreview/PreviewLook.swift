@@ -122,7 +122,22 @@ public enum PreviewLook {
         try pipelineParams(for: defaultLook)
     }
 
-    /// Builds a fresh, stock-digested look and applies the basic adjustments.
+    /// Builds a fresh, stock-digested look and applies the advanced
+    /// overrides and the basic adjustments.
+    ///
+    /// The apply order is fixed and tested:
+    ///
+    /// 1. the stock digest (`StockCatalog.pipelineParams`),
+    /// 2. the advanced overrides of the panel,
+    /// 3. the basic adjustments of the Adjustments sheet,
+    /// 4. the I/O tags of the input policy (`PhotoInputSettings`).
+    ///
+    /// The basic adjustments come **after** the advanced overrides, so the
+    /// Adjustments sheet always wins for the controls it owns (the camera
+    /// EV, the grain and the halation toggles and the halation amount).  The
+    /// grain strength stays a multiplier of the (possibly overridden)
+    /// `particleScale`.  The input policy comes last and writes the I/O tags
+    /// only: it never tags an unsupported colour space.
     ///
     /// None of these controls requires another digest: the digest does not
     /// derive values from camera EV, grain activity / particle scale, or the
@@ -130,13 +145,19 @@ public enum PreviewLook {
     public static func pipelineParams(
         for look: StockCatalog.Look,
         adjustments: PreviewAdjustments = PreviewAdjustments(),
-        inputSettings: PhotoInputSettings = PhotoInputSettings()
+        inputSettings: PhotoInputSettings = PhotoInputSettings(),
+        advancedOverrides: AdvancedOverrides = AdvancedOverrides()
     ) throws -> PipelineParams {
         var params = try StockCatalog.pipelineParams(
             film: look.film.stock,
             print: look.print?.stock,
             scanFilm: look.scanFilm
         )
+
+        // The advanced overrides are written on top of the digested
+        // parameters.  Only the parameters the panel applies are written; an
+        // unported parameter or an unsupported value is refused.
+        AdvancedParams.apply(advancedOverrides, to: &params)
 
         params.camera.exposureCompensationEV = adjustments.exposureCompensationEV
         params.filmRender.grain.active = adjustments.grainEnabled

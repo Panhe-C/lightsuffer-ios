@@ -39,6 +39,7 @@ final class PreviewViewModel: ObservableObject {
             session.adjustments = adjustments
             guard session.currentGeneration != previousGeneration else { return }
             renderDidInvalidate()
+            refreshAdvancedParameters()
         }
     }
     /// RAW / input-colour policy is part of the same debounced generation.
@@ -50,8 +51,26 @@ final class PreviewViewModel: ObservableObject {
             session.inputSettings = inputSettings
             guard session.currentGeneration != previousGeneration else { return }
             renderDidInvalidate()
+            refreshAdvancedParameters()
         }
     }
+    /// The advanced overrides of the parameter panel.  They are written on
+    /// top of the digested look and before the basic adjustments, so the
+    /// Adjustments sheet still wins for the controls it owns.  A change
+    /// invalidates the same generation as a physical adjustment.
+    @Published var advancedOverrides: AdvancedOverrides {
+        didSet {
+            guard advancedOverrides != oldValue else { return }
+            let previousGeneration = session.currentGeneration
+            session.advancedOverrides = advancedOverrides
+            guard session.currentGeneration != previousGeneration else { return }
+            renderDidInvalidate()
+            refreshAdvancedParameters()
+        }
+    }
+    /// The parameters the panel displays: the digested look, the advanced
+    /// overrides, the basic adjustments and the input tags.
+    @Published private(set) var advancedParameters: PipelineParams?
     @Published private(set) var photoKind: PhotoKind?
     @Published private(set) var inputStatus: String?
 
@@ -71,6 +90,7 @@ final class PreviewViewModel: ObservableObject {
     private var preparedPhoto: PreparedPhoto?
     private var loadTask: Task<Void, Never>?
     private var renderTask: Task<Void, Never>?
+    private var advancedRefreshTask: Task<Void, Never>?
     private var exportTask: Task<Void, Never>?
     private var exportCancellation: ExportCancellation?
     private var exportGeneration: UInt64 = 0
@@ -81,6 +101,7 @@ final class PreviewViewModel: ObservableObject {
         self.look = session.look
         self.adjustments = session.adjustments
         self.inputSettings = session.inputSettings
+        self.advancedOverrides = session.advancedOverrides
 
         // MainQueuePreviewRenderScheduler calls back on the main queue.  The
         // task hop gives this MainActor view model an explicit isolation handoff.
@@ -200,8 +221,71 @@ final class PreviewViewModel: ObservableObject {
             guard session.currentGeneration != previousGeneration else { return }
             errorMessage = nil
             renderDidInvalidate()
+            refreshAdvancedParameters()
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - The advanced parameters
+
+    /// Sets one advanced override.
+    ///
+    /// The value is refused when the parameter is not applied by the panel
+    /// (an unported parameter) or when the engine does not support it.
+    func setAdvancedValue(_ value: AdvancedValue, for path: String) {
+        var overrides = advancedOverrides
+        guard overrides.set(value, for: path) else { return }
+        advancedOverrides = overrides
+    }
+
+    /// Removes every advanced override.
+    ///
+    /// The next render is the digested look, the basic adjustments and the
+    /// input settings: the digest of the stock is preserved.
+    func resetAdvancedOverrides() {
+        guard !advancedOverrides.isEmpty else { return }
+        var overrides = advancedOverrides
+        overrides.removeAll()
+        advancedOverrides = overrides
+    }
+
+    /// Removes the advanced overrides of one section.
+    func resetAdvancedSection(_ section: AdvancedSection) {
+        let paths = AdvancedParams.paths(in: section)
+        let remaining = advancedOverrides.removing(paths: paths)
+        guard remaining != advancedOverrides else { return }
+        advancedOverrides = remaining
+    }
+
+    /// Whether a section holds at least one override.
+    func hasAdvancedOverride(in section: AdvancedSection) -> Bool {
+        advancedOverrides.contains(section: section)
+    }
+
+    /// Recomputes the parameters the panel displays.
+    ///
+    /// The digest, the overrides, the basic adjustments and the input tags
+    /// are rebuilt off the main actor; the result is published for the
+    /// sheet.  A refresh that is still running when a new one starts is
+    /// cancelled: the panel always shows the newest state.
+    func refreshAdvancedParameters() {
+        let look = self.look
+        let adjustments = self.adjustments
+        let inputSettings = self.inputSettings
+        let overrides = self.advancedOverrides
+        advancedRefreshTask?.cancel()
+        advancedRefreshTask = Task {
+            let params = try? await Task.detached(priority: .userInitiated) {
+                try PreviewLook.pipelineParams(
+                    for: look,
+                    adjustments: adjustments,
+                    inputSettings: inputSettings,
+                    advancedOverrides: overrides
+                )
+            }.value
+            guard !Task.isCancelled else { return }
+            self.advancedParameters = params
         }
     }
 
@@ -327,6 +411,7 @@ final class PreviewViewModel: ObservableObject {
             look: look,
             adjustments: adjustments,
             inputSettings: inputSettings,
+            advancedOverrides: advancedOverrides,
             format: exportFormat,
             quality: ExportRequest.defaultQuality,
             borderStyle: exportBorderStyle,

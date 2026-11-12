@@ -21,26 +21,33 @@ public struct PreviewRenderRequest: Sendable {
     public let look: StockCatalog.Look
     public let adjustments: PreviewAdjustments
     public let inputSettings: PhotoInputSettings
+    /// The advanced overrides of the panel, applied between the digest and
+    /// the basic adjustments.
+    public let advancedOverrides: AdvancedOverrides
 
     public init(
         generation: PreviewGeneration,
         look: StockCatalog.Look,
         adjustments: PreviewAdjustments,
-        inputSettings: PhotoInputSettings = PhotoInputSettings()
+        inputSettings: PhotoInputSettings = PhotoInputSettings(),
+        advancedOverrides: AdvancedOverrides = AdvancedOverrides()
     ) {
         self.generation = generation
         self.look = look
         self.adjustments = adjustments
         self.inputSettings = inputSettings
+        self.advancedOverrides = advancedOverrides
     }
 
-    /// Loads and digests the look, then applies the basic physical and input
-    /// adjustments. The app calls this inside its detached render task.
+    /// Loads and digests the look, then applies the advanced overrides, the
+    /// basic physical adjustments and the input tags. The app calls this
+    /// inside its detached render task.
     public func pipelineParams() throws -> PipelineParams {
         try PreviewLook.pipelineParams(
             for: look,
             adjustments: adjustments,
-            inputSettings: inputSettings
+            inputSettings: inputSettings,
+            advancedOverrides: advancedOverrides
         )
     }
 }
@@ -106,6 +113,15 @@ public final class PreviewSession {
             invalidateAndSchedule()
         }
     }
+    /// The advanced overrides of the panel.  A change invalidates the same
+    /// generation as a physical adjustment; a change of the look keeps them
+    /// and re-applies them on the fresh digest of the new look.
+    public var advancedOverrides: AdvancedOverrides {
+        didSet {
+            guard advancedOverrides != oldValue else { return }
+            invalidateAndSchedule()
+        }
+    }
 
     public private(set) var currentGeneration = PreviewGeneration(rawValue: 0)
     public private(set) var hasReadyPhoto = false
@@ -122,6 +138,7 @@ public final class PreviewSession {
         self.look = PreviewLook.defaultLook
         self.adjustments = PreviewAdjustments()
         self.inputSettings = PhotoInputSettings()
+        self.advancedOverrides = AdvancedOverrides()
         self.debounceInterval = debounceInterval
         self.scheduler = scheduler
     }
@@ -215,7 +232,8 @@ public final class PreviewSession {
                 generation: generation,
                 look: look,
                 adjustments: adjustments,
-                inputSettings: inputSettings
+                inputSettings: inputSettings,
+                advancedOverrides: advancedOverrides
             )
         )
     }
