@@ -147,7 +147,26 @@ enum ExportOrchestrator {
         try cancellation.check()
 
         progress(ExportProgress(stage: .planning, fractionCompleted: 0.06))
-        let params = try request.pipelineParams()
+        let requestedParams = try request.pipelineParams()
+        // The 1280 px decode is the canonical App metering frame. Re-decode it
+        // when an export starts before the latest WB/input preview has finished.
+        // Never meter a cropped tile or the differently resampled full decode.
+        let meteringPhoto: PreparedPhoto
+        if requestedParams.camera.autoExposure && photo.inputSettings != request.inputSettings {
+            meteringPhoto = try PhotoDecoder.decode(
+                data: photo.source.data,
+                typeIdentifier: photo.source.typeIdentifier,
+                filename: photo.source.filename,
+                settings: request.inputSettings
+            )
+        } else {
+            meteringPhoto = photo
+        }
+        let exposure = try AutoExposure.resolve(
+            params: requestedParams, meteringImage: meteringPhoto.input
+        )
+        let params = exposure.params
+        try cancellation.check()
         let plan = try ExportPlanner.plan(
             params: params,
             imageWidth: full.sourceSize.width,
@@ -182,7 +201,7 @@ enum ExportOrchestrator {
                 fullWidth: plan.imageWidth,
                 fullHeight: plan.imageHeight
             )
-            let rendered = try backend.render(sourceTile, params: tileParams)
+            let rendered = try backend.render(exposure.apply(to: sourceTile), params: tileParams)
             try cancellation.check()
 
             // The interior of the tile is copied into the stitched frame; the

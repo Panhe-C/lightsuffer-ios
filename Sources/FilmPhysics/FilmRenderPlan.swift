@@ -348,6 +348,11 @@ public struct FilmRenderPlan: Sendable {
     ///   precomputed inputs the plan reuses.
     public init(pipeline: FilmPipeline) throws {
         let params = pipeline.params
+        guard !params.camera.autoExposure else {
+            throw PipelineError.invalidInputs(
+                "resolve whole-frame auto exposure before building an image-independent render plan"
+            )
+        }
         let inputs = pipeline.inputs
         let film = params.film
         let printProfile = params.print

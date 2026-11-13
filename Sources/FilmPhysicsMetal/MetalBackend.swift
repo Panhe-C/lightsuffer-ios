@@ -445,8 +445,11 @@ public final class MetalBackend: FilmRenderBackend {
     public func render(
         _ image: RGBImage, params: PipelineParams, sampler: GrainSampler?
     ) throws -> RGBImage {
-        let plan = try FilmRenderPlan.build(params: params)
-        return try render(image, plan: plan, sampler: sampler, collectTaps: false).rgbOut
+        let exposure = try AutoExposure.resolve(params: params, meteringImage: image)
+        let plan = try FilmRenderPlan.build(params: exposure.params)
+        return try render(
+            exposure.apply(to: image), plan: plan, sampler: sampler, collectTaps: false
+        ).rgbOut
     }
 
     /// Renders an image with a precomputed plan.
@@ -496,6 +499,9 @@ public final class MetalBackend: FilmRenderBackend {
         sampler: GrainSampler?,
         collectTaps: Bool
     ) throws -> MetalRenderTaps {
+        guard !plan.params.camera.autoExposure else {
+            throw PipelineError.invalidInputs("the render plan contains unresolved auto exposure")
+        }
         guard let library else {
             throw initializationError ?? MetalBackendError.noDevice
         }

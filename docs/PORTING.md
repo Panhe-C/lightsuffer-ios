@@ -1,6 +1,6 @@
 # PORTING.md — spektrafilm → Swift (slices 1, 2, 4, 5, 6 and CPU auto exposure)
 
-Status: **slice 1, 2, 4, 5 and 6 ported and validated; CPU auto exposure ported and validated** (2026-11-13). Metal auto exposure is still to do.
+Status: **slice 1, 2, 4, 5 and 6 ported and validated; CPU auto exposure and its Metal hand-off implemented** (2026-11-13). The meter runs on the CPU, before the GPU input conversion.
 
 This document is the map between the upstream Python engine
 ([spektrafilm](https://github.com/andreavolpato/spektrafilm) @ `3bb2c2d`, GPLv3)
@@ -71,7 +71,7 @@ runs the complete upstream topology:
 | neutral print filter database | `runtime/params_builder.py::apply_database_neutral_print_filters` | `NeutralPrintFilters.swift` + bundled JSON | ported (bundled) |
 | CMY dichroic filters | `model/color_filters.py::DichroicFilters` | `ColorFilters.swift` | ported |
 | direct film scan (`io.scan_film`) | `runtime/stages/scanning.py` | — | **not ported** |
-| auto exposure | `runtime/stages/filming.py::auto_exposure`, `utils/autoexposure.py`, `runtime/services/resize.py::small_preview` | `AutoExposure.swift`, `FilmPipeline.swift::process` | **CPU ported** (all 7 methods); **Metal not ported yet** |
+| auto exposure | `runtime/stages/filming.py::auto_exposure`, `utils/autoexposure.py`, `runtime/services/resize.py::small_preview` | `AutoExposure.swift`, `FilmPipeline.swift::process` | **CPU ported** (all 7 methods); Metal consumes CPU-resolved, RGB-scaled input |
 | spatial effects (halation, grain, diffusion, glare, blur, unsharp) | `runtime/stages/*`, `model/*` | `SpatialEffects.swift`, `DiffusionFilter.swift`, `Halation.swift` | **ported in slice 5** (the grain and the glare in slice 6, see §1.5) |
 | the other stocks and papers | — | — | **not bundled** (Portra 400 + Portra Endura only) |
 
@@ -86,8 +86,8 @@ let taps = try pipeline.process(rgbIn: image)
 The pipeline validates its parameters and **throws** on features that are not
 ported yet (`FilmPipeline.init`), including the `mallett2019` RGB → raw method.
 Auto exposure is accepted and metered by the CPU pipeline. The Metal backend
-does not consume that metered EV yet; feeding the CPU-computed EV into the Metal
-exposure scale (or porting the meter to Metal) remains future work.
+resolves the same meter on the CPU, scales input RGB and then builds an AE-off
+plan. Image-independent plans explicitly reject unresolved AE.
 
 ### 1.3 Slice 4 — the whole catalogue, the digest and the direct scan
 
@@ -527,9 +527,31 @@ print-balance reference is still exactly `0.184 * 2 ** compensation`; no
 image-dependent AE value enters either mid-grey reference. The new
 `autoexposure_pipeline_*` fixtures explicitly cover AE off, AE on, and AE on
 with +0.75 EV compensation. Earlier slice fixtures intentionally keep
-`auto_exposure = False`; `StockCatalog` and the app also keep AE off in this
-step. The CPU EV API is available for a later Metal integration, but **Metal
-AE is not implemented here**.
+`auto_exposure = False`; `StockCatalog` and fresh App sessions keep AE off.
+The App Camera section can enable it and select any of the seven methods.
+
+#### Resolved exposure and the Metal hand-off
+
+`AutoExposure.resolve` returns an immutable EV and an AE-off parameter snapshot.
+Its `apply(to:)` scales RGB **before** CCTF decoding; adding the EV to the
+post-upsampling `exposureScale` would be wrong for encoded inputs. Metal's
+parameter-based entry point resolves the complete image before building its
+plan. The plan builder and all evaluators reject unresolved AE rather than
+silently ignoring it, even if a caller mutates a prebuilt plan's parameters.
+
+The App preview and exporter share a canonical metering input: the 1280 px
+colour-managed preview decode, reduced to 256 px by the meter. Export resolves
+that input once, after applying its snapshot's WB/colour policy, and uses the
+fixed scale for all full-resolution tiles and CPU fallback. This avoids both
+per-tile metering seams and preview/export exposure drift from independent
+resampling. The App intentionally differs from standalone upstream full-res
+metering here; see `docs/APP.md` for the contract.
+
+Local macOS Metal tests cover seven methods on linear ProPhoto and encoded sRGB:
+mean GPU/CPU Delta E2000 is 0.00156-0.00230 and worst pixel 0.00804 (gates
+mean < 0.01, max < 0.05). These are small fixture images, not iPhone performance
+or RAW-colour acceptance. Export tests isolate AE from spatial/stochastic effects
+and verify bit-identical whole-frame vs stitched CPU results for all methods.
 
 ### 3.3 Slice 5
 
@@ -964,7 +986,7 @@ the historical slice rows that are now ported):
 | A2 | the glare of the print | `model/glare.py::add_glare` | **ported in slice 6** — it draws a lognormal from the seeded generator of the port (the upstream draws it from the **unseeded** NumPy random state, so the upstream itself is not reproducible); the validation compares the summary statistics of the glare field against the upstream over 12 upstream seeds (§3.4). |
 | A3 | the debug switches (`deactivate_spatial_effects`, `deactivate_stochastic_effects`, `lut_mode`) and the preview mode | `runtime/params_builder.py::digest_params` | **not ported** — the port has no `debug` / `preview` switches; the fixtures always run with them off |
 | A4 | the lens blur of the enlarger | `runtime/params_schema.py::EnlargerParams.lens_blur` | **dead code upstream** — the upstream pipeline never reads it |
-| B | the auto exposure (7 metering methods) | `runtime/stages/filming.py::auto_exposure`, `utils/autoexposure.py` | **CPU ported** in `AutoExposure.swift` / `FilmPipeline`. Earlier-slice fixtures still use `auto_exposure = False`; new `autoexposure_*` fixtures cover every method, both input transfer-function variants and full-pipeline AE on / off / compensation. **Metal remains unported.** |
+| B | the auto exposure (7 metering methods) | `runtime/stages/filming.py::auto_exposure`, `utils/autoexposure.py` | **CPU ported**, with resolved RGB input consumed by Metal. Earlier fixtures keep AE off; `autoexposure_*` fixtures cover metering and CPU parity, Metal tests cover both input transfer-function variants. |
 | C | the direct film scan (`io.scan_film = true`) | `runtime/stages/scanning.py` | **ported in slice 4** — `Slice1Pipeline.runScanFilm` |
 | D | the `mallett2019` RGB → raw method | `utils/spectral_upsampling.py::rgb_to_raw_mallett2019` | only `hanatos2025` is ported |
 | E | the other gamut compression algorithms (`oklch`, `aces_rgc`, `oklrab`, `jzazbz`) | `utils/gamut_compression.py` | only the `xy` input and the `cam16ucs` output are ported |
@@ -1621,9 +1643,7 @@ corrupt its memory.  The findings and the fixes:
   is not ported to the GPU: the backend raises
   `MetalBackendError.invalidPlan` for it (the upstream default is the sub
   layer model),
-* the **auto exposure** is ported on the CPU but not on Metal: the planned
-  hand-off of a CPU-computed EV into the Metal exposure scale is not done;
-  the **lut modes** and **debug switches** remain unported on both paths,
+* the **lut modes** and **debug switches** remain unported on both paths,
 * the **input gamut compression** is baked into the tc lookup table (as it
   is on the CPU), it is not a GPU pass,
 * the **Metal performance** of the grain is not measured: the inversion of
@@ -1953,9 +1973,9 @@ device.
   (4.38).  More seeds would tighten the gate of §3.4.
 * Port the debug switches of the upstream digest (`deactivate_spatial_effects`,
   `deactivate_stochastic_effects`, `lut_mode`) and the preview mode.
-* Feed the CPU-computed auto-exposure EV into the Metal exposure scale (or
-  port metering to Metal), then expose the app toggle in a later app step.
-  The direct film scan (`io.scan_film`) is already ported in slice 4.
+* Validate the App's auto-exposure controls and canonical preview/export
+  metering on real RAW inputs and large iPhone exports. The CPU-to-Metal RGB
+  hand-off and App toggle are implemented; a GPU meter is not required for correctness.
 * Port the remaining gamut compression algorithms (`oklch`, `aces_rgc`,
   `oklrab`, `jzazbz`) and the `mallett2019` RGB → raw method.
 * Bundle the other stocks and papers (the upstream ships 20 films and 8

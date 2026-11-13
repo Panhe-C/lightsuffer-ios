@@ -49,6 +49,9 @@ public enum FilmPlanEvaluatorFloat32 {
         plan: FilmRenderPlan,
         rgbIn: RGBImage
     ) throws -> FilmPlanTaps {
+        guard !plan.params.camera.autoExposure else {
+            throw PipelineError.invalidInputs("the render plan contains unresolved auto exposure")
+        }
         guard rgbIn.data.count == rgbIn.width * rgbIn.height * 3 else {
             throw PipelineError.invalidImageData(
                 "expected \(rgbIn.width * rgbIn.height * 3) values for a "

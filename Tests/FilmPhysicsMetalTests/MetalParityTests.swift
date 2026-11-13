@@ -112,6 +112,46 @@ final class MetalParityTests: XCTestCase {
 
     // MARK: - The per pixel chain
 
+    func testAutoExposureMatchesCPUForEveryMethodAndInputTransferFunction() throws {
+        let backend = try makeBackend()
+        let common = try JSONValue.load(named: "slice2_common")
+        let film = try ProfileLoader.load(stock: "kodak_portra_400")
+        let paper = try ProfileLoader.load(stock: "kodak_portra_endura")
+        for name in ["defaults", "srgb_input"] {
+            let fixture = try JSONValue.load(named: "slice2_\(name)")
+            var params = try makePipelineParams(fixture: fixture, film: film, print: paper)
+            params.camera.autoExposure = true
+            let identifier = try XCTUnwrap(fixture["input"]?.string)
+            let record = try XCTUnwrap(common["input_images"]?[identifier])
+            let size = try XCTUnwrap(record["size"]?.doubles)
+            let input = RGBImage(
+                width: Int(size[0]), height: Int(size[1]),
+                data: try XCTUnwrap(record["data"]?.flatDoubles)
+            )
+            for method in AutoExposure.methods {
+                params.camera.autoExposureMethod = method
+                let cpu = try CPUBackend().render(input, params: params)
+                let gpu = try backend.render(input, params: params)
+                let error = deltaE(cpu.data, gpu.data)
+                progress("METAL-PARITY auto-exposure \(name) \(method): mean \(error.mean), max \(error.max)")
+                XCTAssertLessThan(error.mean, 0.01, "\(name) / \(method)")
+                XCTAssertLessThan(error.max, 0.05, "\(name) / \(method)")
+            }
+        }
+    }
+
+    func testPrecomputedPlanRejectsUnresolvedAutoExposure() throws {
+        let backend = try makeBackend()
+        let fixture = try JSONValue.load(named: "slice2_defaults")
+        let film = try ProfileLoader.load(stock: "kodak_portra_400")
+        let paper = try ProfileLoader.load(stock: "kodak_portra_endura")
+        let params = try makePipelineParams(fixture: fixture, film: film, print: paper)
+        var plan = try FilmRenderPlan.build(params: params)
+        plan.params.camera.autoExposure = true
+        let image = RGBImage(width: 1, height: 1, data: [0.1, 0.2, 0.3])
+        XCTAssertThrowsError(try backend.render(image, plan: plan))
+    }
+
     /// The GPU reproduces the CPU pipeline of the slice 2.
     ///
     /// The four cases of the slice 2 run the whole pipeline from the camera

@@ -45,6 +45,57 @@ public enum AutoExposure {
         "highlight_weighted",
     ]
 
+    /// A whole-frame metering result, reusable across tiles and backends.
+    /// The parameters have AE disabled so the scaled input is not metered twice.
+    public struct Resolved: Sendable {
+        public let ev: Double
+        public let params: PipelineParams
+
+        fileprivate init(ev: Double, params: PipelineParams) {
+            self.ev = ev
+            self.params = params
+        }
+
+        /// Scales RGB before CCTF decoding, not the already linear film exposure.
+        public func apply(to image: RGBImage) -> RGBImage {
+            guard ev != 0 else { return image }
+            let scale = pow(2.0, ev)
+            return RGBImage(
+                width: image.width, height: image.height,
+                data: image.data.map { $0 * scale }
+            )
+        }
+    }
+
+    /// Meters once on the supplied whole frame. A caller exporting tiles may
+    /// supply its preview frame to keep the displayed and exported exposure equal.
+    public static func resolve(
+        params: PipelineParams,
+        meteringImage: RGBImage
+    ) throws -> Resolved {
+        let image = try RGBImage.make(
+            width: meteringImage.width, height: meteringImage.height,
+            data: meteringImage.data
+        )
+        var resolvedParams = params
+        resolvedParams.camera.autoExposure = false
+        guard params.camera.autoExposure, image.pixelCount > 0 else {
+            return Resolved(ev: 0, params: resolvedParams)
+        }
+        guard let colourspace = RGBColourspace.named(params.io.inputColorSpace) else {
+            throw PipelineError.invalidInputs("the metering input colour space is not supported")
+        }
+        let ev = meteredEV(
+            image: image, colourspace: colourspace,
+            applyCCTFDecoding: params.io.inputCCTFDecoding,
+            method: params.camera.autoExposureMethod
+        )
+        guard ev.isFinite, pow(2.0, ev).isFinite else {
+            throw PipelineError.invalidInputs("auto exposure produced a non-finite RGB scale")
+        }
+        return Resolved(ev: ev, params: resolvedParams)
+    }
+
     /// Builds the small preview used for metering.
     ///
     /// Images whose long edge is already at most `maxSize` are returned

@@ -499,10 +499,6 @@ public enum AdvancedParams {
             }
         }
 
-        // The auto exposure is not ported: the engine rejects it, so the
-        // advanced panel can never turn it on.
-        params.camera.autoExposure = false
-
         return AdvancedApplyReport(applied: applied, rejected: rejected)
     }
 
@@ -1149,15 +1145,22 @@ public enum AdvancedParams {
             get: { $0.camera.exposureCompensationEV },
             set: { $0.camera.exposureCompensationEV = $1 }
         ))
-        specs.append(unported(
+        specs.append(toggle(
             "camera.auto_exposure", "camera.autoExposure",
             .camera, "Auto exposure",
-            reason: "The auto exposure is not ported: the engine rejects autoExposure == true."
+            availability: .basicSheet,
+            note: "The Adjustments sheet owns this control; the sheet wins.",
+            get: { $0.camera.autoExposure },
+            set: { $0.camera.autoExposure = $1 }
         ))
-        specs.append(unported(
+        specs.append(choice(
             "camera.auto_exposure_method", "camera.autoExposureMethod",
             .camera, "Metering method",
-            reason: "The auto exposure is not ported, so the metering method has no effect."
+            choices: AutoExposure.methods,
+            availability: .basicSheet,
+            note: "The Adjustments sheet owns this control; the sheet wins.",
+            get: { $0.camera.autoExposureMethod },
+            set: { $0.camera.autoExposureMethod = $1 }
         ))
 
         // --- the diffusion filters --------------------------------------

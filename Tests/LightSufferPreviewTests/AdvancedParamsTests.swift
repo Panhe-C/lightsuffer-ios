@@ -19,13 +19,13 @@ final class AdvancedParamsTests: XCTestCase {
         XCTAssertEqual(AdvancedParams.catalog.count, 118)
         XCTAssertEqual(Set(AdvancedParams.catalog.map(\.path)).count, 118)
 
-        // The inventory: 84 parameters are written by the panel, 4 belong to
+        // The inventory: 84 parameters are written by the panel, 6 belong to
         // the Adjustments sheet, 3 to the look, 2 to the Input policy, 1 is
-        // locked to the contract of the app and 24 are not ported.
+        // locked to the contract of the app and 22 are not ported.
         XCTAssertEqual(AdvancedParams.appliedCount, 84)
-        XCTAssertEqual(AdvancedParams.basicSheetOwnedCount, 4)
+        XCTAssertEqual(AdvancedParams.basicSheetOwnedCount, 6)
         XCTAssertEqual(AdvancedParams.externallyOwnedCount, 6)
-        XCTAssertEqual(AdvancedParams.unportedCount, 24)
+        XCTAssertEqual(AdvancedParams.unportedCount, 22)
         XCTAssertEqual(
             AdvancedParams.appliedCount
                 + AdvancedParams.basicSheetOwnedCount
@@ -54,10 +54,10 @@ final class AdvancedParamsTests: XCTestCase {
             XCTAssertTrue(spec.availability.reason?.contains("not ported") == true)
         }
 
-        // The app panel still lists auto exposure as unavailable in this step.
+        // Auto exposure is owned by the basic Camera section.
         let autoExposure = AdvancedParams.spec(for: "camera.auto_exposure")
         XCTAssertNotNil(autoExposure)
-        XCTAssertNotNil(autoExposure?.availability.reason)
+        XCTAssertEqual(autoExposure?.availability, .basicSheet)
 
         // The viewer and the workflow of the upstream GUI are not parameters
         // of the simulation.
@@ -117,6 +117,8 @@ final class AdvancedParamsTests: XCTestCase {
             Set(basicSheetPaths),
             [
                 "camera.exposure_compensation_ev",
+                "camera.auto_exposure",
+                "camera.auto_exposure_method",
                 "film_render.grain.active",
                 "film_render.halation.active",
                 "film_render.halation.halation_amount",
@@ -169,7 +171,7 @@ final class AdvancedParamsTests: XCTestCase {
             if case .unported = $0.availability { return true }
             return false
         }
-        XCTAssertEqual(unported.count, 24)
+        XCTAssertEqual(unported.count, 22)
 
         for spec in unported {
             var overrides = AdvancedOverrides()
@@ -222,23 +224,28 @@ final class AdvancedParamsTests: XCTestCase {
         XCTAssertFalse(params.camera.autoExposure)
     }
 
-    func testTheAutoExposureStaysOff() throws {
-        // The app panel still keeps auto exposure off in this step: it can
-        // never turn it on, and the apply step forces it off.
+    func testBasicAutoExposureControlsWinOverAdvancedOverrides() throws {
         var overrides = AdvancedOverrides()
-        XCTAssertFalse(overrides.set(.bool(true), for: "camera.auto_exposure"))
-        XCTAssertTrue(overrides.isEmpty)
+        XCTAssertTrue(overrides.set(.bool(true), for: "camera.auto_exposure"))
+        XCTAssertTrue(overrides.set(.choice("median"), for: "camera.auto_exposure_method"))
 
-        var params = try PreviewLook.pipelineParams(for: PreviewLook.defaultLook)
-        params.camera.autoExposure = true
+        var params = try PreviewLook.pipelineParams()
         AdvancedParams.apply(overrides, to: &params)
-        XCTAssertFalse(params.camera.autoExposure)
+        XCTAssertTrue(params.camera.autoExposure)
+        XCTAssertEqual(params.camera.autoExposureMethod, "median")
 
-        // The CPU engine now accepts auto exposure; this does not change the
-        // app-panel policy above (Metal and the app toggle are separate work).
-        var accepted = try PreviewLook.pipelineParams(for: PreviewLook.defaultLook)
-        accepted.camera.autoExposure = true
-        XCTAssertNoThrow(try FilmPipeline(params: accepted))
+        let accepted = try PreviewLook.pipelineParams(
+            for: PreviewLook.defaultLook,
+            adjustments: PreviewAdjustments(autoExposureEnabled: true, meteringMethod: "matrix"),
+            advancedOverrides: overrides
+        )
+        XCTAssertTrue(accepted.camera.autoExposure)
+        XCTAssertEqual(accepted.camera.autoExposureMethod, "matrix")
+        let defaultParams = try PreviewLook.pipelineParams(
+            for: PreviewLook.defaultLook, advancedOverrides: overrides
+        )
+        XCTAssertFalse(defaultParams.camera.autoExposure)
+        XCTAssertEqual(defaultParams.camera.autoExposureMethod, "center_weighted")
     }
 
     // MARK: - The defaults
