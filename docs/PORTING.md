@@ -516,6 +516,11 @@ before `Filming.rawFromRGB` and `Filming.expose`, matching upstream
 `_preprocess`: auto exposure precedes `crop_and_rescale` (crop / upscale itself
 is not ported).
 
+The metering fixtures use a 320 × 32 raster (long edge 320 > 256), so the
+upstream preview really is downsampled (to 256 × 26) and the order-0 sampler
+can be checked pixel by pixel; the three full-pipeline fixtures use a
+separate 48 × 32 raster, which is at or below the preview limit.
+
 Auto exposure is **not** folded into `exposureCompensationEV`. Camera
 compensation still scales raw exposure independently, and the compensated
 print-balance reference is still exactly `0.184 * 2 ** compensation`; no
@@ -1055,24 +1060,35 @@ cancellation of larger terms (see §3.2, point 5).
 
 `AutoExposureTests` checks all seven methods plus an unknown method on linear
 ProPhoto RGB (CCTF decoding off) and encoded sRGB (decoding on), using the
-320 × 240 deterministic image and its actual 192 × 256 upstream previews. The
-stored preview pixels match the CPU sampler exactly on both variants. Across
-the 16 EV cases, the maximum relative error is **3.1247e-07** and the maximum
-absolute error is **4.4175e-07** (gate: relative 1e-6 with an absolute floor
-of 1e-8).
+320 × 32 deterministic metering image and its actual 256 × 26 upstream
+previews. The stored preview pixels match the CPU sampler exactly on both
+variants (max abs error 0.0). Across the 16 EV cases, the maximum relative
+error is **2.9714e-07** and the maximum absolute error is **4.5815e-07**
+(gate: relative 1e-6 with an absolute floor of 1e-8).
 
-The three full `SimulationPipeline` fixtures produce these CPU results:
+The three full `SimulationPipeline` fixtures use a separate 48 × 32
+deterministic image (at or below the 256-pixel preview limit: the downscale
+is already covered by the metering fixture) and produce these CPU results:
 
 | Case | `log_e_film` max abs | `rgb_out` max abs | `rgb_out` mean ΔE₀₀ | `rgb_out` max ΔE₀₀ |
 |---|---|---|---|---|
-| AE off control | 8.0227e-07 | 2.7938e-05 | **0.0009656** | 0.0043606 |
-| AE on, `center_weighted` | 8.4192e-07 | 1.3743e-05 | **0.0008181** | 0.0018697 |
-| AE on + 0.75 EV compensation | 8.5679e-07 | 1.3984e-05 | **0.0007764** | 0.0020151 |
+| AE off control | 6.8648e-08 | 2.7928e-05 | **0.0009653** | 0.0043473 |
+| AE on, `center_weighted` | 1.3021e-07 | 1.3851e-05 | **0.0008143** | 0.0018824 |
+| AE on + 0.75 EV compensation | 1.2447e-07 | 1.4100e-05 | **0.0007754** | 0.0020265 |
 
 The tap and colour gates are unchanged from slice 2: `log_e_film` max abs
 < 5e-6, mean ΔE₀₀ < 0.01 and max ΔE₀₀ < 0.05. The fixtures also demonstrate
 that AE changes the negative, compensation applies in addition to it, and the
 compensated print-balance mid-grey changes only with camera compensation.
+
+The four auto-exposure fixtures are stored **compactly**: the images, the
+previews and the pipeline taps are base64 records of little endian float32 in
+C order, next to their shape and their SHA-256 (the house style of the
+hanatos2025 tc LUT). The metering sources are rounded to float32 *before* the
+upstream runs, so the stored source and the `rgb_in` tap are bit-identical and
+the only rounding left in the EVs is the seven significant digits of the JSON
+scalars. The four files total ≈ 800 KiB instead of the ≈ 39.8 MB of the
+nested JSON form; the earlier slice fixtures are untouched.
 
 ### 5.3 Slice 5 (the spatial effects)
 

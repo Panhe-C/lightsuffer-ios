@@ -110,20 +110,77 @@ enum JSONValue {
         return rows
     }
 
-    /// The value as a flat array of numbers, flattening the nested arrays.
+    /// A packed float32 array of a fixture, with its shape.
+    struct PackedArray {
+        /// The shape of the array, in C order (`[height][width][3]` for an image).
+        let shape: [Int]
+        /// The decoded values, in C order.
+        let values: [Double]
+    }
+
+    /// The value as a flat array of numbers.
+    ///
+    /// Besides the original nested JSON arrays, this accepts the packed array
+    /// records used by the hanatos LUT and by the compact auto-exposure
+    /// fixtures. Image records may contain their array directly or under
+    /// `data`.
     var flatDoubles: [Double]? {
-        guard case let .array(array) = self else { return nil }
-        var values: [Double] = []
-        for element in array {
-            if let number = element.double {
-                values.append(number)
-            } else if let nested = element.flatDoubles {
-                values.append(contentsOf: nested)
-            } else {
-                return nil
+        if case let .array(array) = self {
+            var values: [Double] = []
+            for element in array {
+                if let number = element.double {
+                    values.append(number)
+                } else if let nested = element.flatDoubles {
+                    values.append(contentsOf: nested)
+                } else {
+                    return nil
+                }
+            }
+            return values
+        }
+        if let packed = packedArray {
+            return packed.values
+        }
+        return self["data"]?.flatDoubles
+    }
+
+    /// The value as a packed float32 array record.
+    ///
+    /// The compact fixtures store their large arrays as base64 (little endian
+    /// float32, C order) next to their shape. The bytes are assembled
+    /// explicitly rather than loaded through an unaligned `Float` pointer, so
+    /// this has the same behaviour on every test host.
+    var packedArray: PackedArray? {
+        guard
+            let encoded = self["data"]?.string,
+            self["dtype"]?.string == "float32",
+            self["encoding"]?.string == "base64 (little endian, C order)",
+            let shape = self["shape"]?.doubles,
+            !shape.isEmpty,
+            shape.allSatisfy({
+                $0 >= 0 && $0 <= Double(Int.max) && $0 == $0.rounded()
+            }),
+            let data = Data(base64Encoded: encoded),
+            data.count % 4 == 0
+        else { return nil }
+
+        let count = data.count / 4
+        let expectedCount = shape.reduce(1.0, *)
+        guard expectedCount == Double(count) else { return nil }
+
+        var values = [Double](repeating: 0, count: count)
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            let bytes = raw.bindMemory(to: UInt8.self)
+            for index in 0..<count {
+                let offset = index * 4
+                let bits = UInt32(bytes[offset])
+                    | (UInt32(bytes[offset + 1]) << 8)
+                    | (UInt32(bytes[offset + 2]) << 16)
+                    | (UInt32(bytes[offset + 3]) << 24)
+                values[index] = Double(Float(bitPattern: bits))
             }
         }
-        return values
+        return PackedArray(shape: shape.map(Int.init), values: values)
     }
 
     /// The value as a string.

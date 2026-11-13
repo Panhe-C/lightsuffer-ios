@@ -59,15 +59,16 @@ For every parameter case the script runs
 | `slice4_catalog.json` | the whole catalogue of the upstream engine: the 128 printed looks (16 negatives × 8 print media) and the 20 direct scans, with the digest of every case |
 | `slice5_spatial.json` | the spatial effects: the ten parameter cases (the upstream defaults, every deterministic effect alone and all of them at once), the textured 32 × 32 test image and the reference of the image space helpers |
 | `slice6_stochastic.json` | the stochastic effects: the 16 cases (four stocks × four images), the 64 × 64 test images (a flat patch and a textured one), the parameters of every case and the **summary statistics** of the grain and of the glare over 12 upstream realisations (against the two upstream samplers for the grain) |
-| `autoexposure_common.json` | the 320 × 240 deterministic image in linear ProPhoto and encoded sRGB, both complete upstream 192 × 256 previews, and 16 EV records (7 methods + unknown × 2 I/O variants) |
+| `autoexposure_common.json` | the 320 × 32 deterministic metering image in linear ProPhoto and encoded sRGB, both complete upstream 256 × 26 previews, the 48 × 32 pipeline source and 16 EV records (7 methods + unknown × 2 I/O variants) |
 | `autoexposure_pipeline_off.json` | full upstream control run with `auto_exposure=False` |
 | `autoexposure_pipeline_center_weighted.json` | full upstream run with `auto_exposure=True` and the default `center_weighted` method |
 | `autoexposure_pipeline_compensation.json` | full upstream run with center-weighted AE plus `exposure_compensation_ev=+0.75` |
 
 The original `gen_fixtures.py` total is ≈ 2.5 MB (slice 1: ≈ 972 KiB, slice 2:
 ≈ 232 KiB, slice 4: ≈ 378 KiB, slice 5: ≈ 1.06 MB). The focused AE fixtures
-are ≈ 39.8 MB because they retain three full-resolution 320 × 240 tap sets and
-two complete upstream previews.
+are ≈ 800 KiB: their images, previews and taps are stored as base64 (little
+endian float32, C order), the metering raster is 320 × 32 and the pipeline
+raster is 48 × 32. The nested JSON form of the same data was ≈ 39.8 MB.
 
 The script runs the cases **serially**: the numba kernels of the upstream
 engine use the GNU OpenMP threading layer and a `multiprocessing` pool
@@ -131,24 +132,42 @@ runs), append `--metering-only`; `--out /tmp/ae-fixtures` selects another output
 directory. The normal command writes all four files listed above under
 `Tests/FilmPhysicsTests/Fixtures/`.
 
-The deterministic linear ProPhoto image is 320 × 240, with a bright off-centre,
-dark edges and colour gradients, so every method has a distinct EV and the
-long-edge downscale is exercised. The encoded variant is clipped to [0, 1] and
-sRGB encoded. `autoexposure_common.json` records all seven upstream method
-names — `average`, `median`, `center_weighted`, `partial`, `matrix`,
-`multi_zone`, `highlight_weighted` — plus an unknown-name fallback, on **both**
-I/O variants. Each record includes the colourspace, CCTF-decoding flag, EV and
-preview shape. The complete outputs of unmodified
+The deterministic linear ProPhoto **metering** image is 320 × 32, with a bright
+off-centre, dark edges and colour gradients, so every method has a distinct EV
+and the long-edge downscale is exercised (the upstream preview is 256 × 26).
+The encoded variant is clipped to [0, 1] and sRGB encoded. The metering
+sources are rounded to float32 *before* the upstream runs, so the stored
+source and the `rgb_in` tap are bit-identical and the only rounding left in
+the EVs is the seven significant digits of the JSON scalars.
+`autoexposure_common.json` records all seven upstream method names —
+`average`, `median`, `center_weighted`, `partial`, `matrix`, `multi_zone`,
+`highlight_weighted` — plus an unknown-name fallback, on **both** I/O variants.
+Each record includes the colourspace, CCTF-decoding flag, EV and preview
+shape. The complete outputs of unmodified
 `ResizingService.small_preview(image)` (default `max_size=256`, order 0) are
 stored for sampling diagnostics.
 
-The three pipeline files run the unmodified `SimulationPipeline` with Portra
+The three pipeline files run the unmodified `SimulationPipeline` on a separate
+48 × 32 deterministic image (at or below the preview limit: the downscale is
+already covered by the metering fixture) with Portra
 400 → Portra Endura, grain and the other spatial / stochastic effects off, and
 DIR couplers active per pixel. They store `rgb_in`, `log_e_film`, `rgb_out`, the
 digested parameters, measured AE EV / scale, camera-compensation scale and both
 print-balance mid-grey references. This makes the AE / compensation ordering
 and the rule `0.184 * 2 ** exposure_compensation_ev` directly testable. Earlier
 slice fixtures are unchanged and continue to use `auto_exposure=False`.
+
+### The packed arrays of the AE fixtures
+
+The images, the previews and the pipeline taps are stored as **packed
+records**: `shape`, `dtype` (`float32`), `encoding`
+(`base64 (little endian, C order)`), the SHA-256 of the unencoded float32
+bytes and the base64 payload itself. This is the same house style as the
+hanatos2025 tc LUT of `slice1_common.json`, and it is what keeps the four
+files at ≈ 800 KiB instead of ≈ 39.8 MB. The Swift test loader
+(`JSONValue.packedArray` / `JSONValue.flatDoubles` in
+`Tests/FilmPhysicsTests/FixtureSupport.swift`) decodes both the packed and the
+older nested JSON array form.
 
 ## The slice 5 fixtures (the spatial effects)
 
@@ -247,6 +266,9 @@ kernels have been compiled in the parent process).
   `[height][width][3]`.
 * The hanatos2025 tc LUT is stored as base64 (little endian float32, C order)
   to keep the file small; its SHA-256 is stored next to it.
+* The auto-exposure images, previews and pipeline taps use the same packed
+  form (`shape`, `dtype`, `encoding`, `sha256_float32`, `data`); the scalars
+  of the same files keep the seven significant digits.
 
 ## Parameter cases
 

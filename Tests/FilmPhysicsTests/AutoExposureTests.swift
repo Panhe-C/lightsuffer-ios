@@ -46,14 +46,22 @@ final class AutoExposureTests: XCTestCase {
         )
     }
 
-    private func inputImage(common: JSONValue, named name: String) throws -> RGBImage {
-        let record = try XCTUnwrap(common["images"]?[name])
+    private func inputImage(
+        common: JSONValue,
+        named name: String,
+        section: String = "images"
+    ) throws -> RGBImage {
+        let record = try XCTUnwrap(common[section]?[name])
         let size = try XCTUnwrap(record["size"]?.doubles)
-        return RGBImage(
-            width: Int(size[0]),
-            height: Int(size[1]),
-            data: try XCTUnwrap(record["data"]?.flatDoubles)
-        )
+        let width = Int(size[0])
+        let height = Int(size[1])
+        let data = try XCTUnwrap(record.flatDoubles)
+        if let packed = record.packedArray {
+            // The packed records carry their own shape: [height][width][3].
+            XCTAssertEqual(packed.shape, [height, width, 3])
+            XCTAssertEqual(packed.values.count, data.count)
+        }
+        return RGBImage(width: width, height: height, data: data)
     }
 
     private func labImage(_ rgb: [Double]) -> [LabColour] {
@@ -106,17 +114,21 @@ final class AutoExposureTests: XCTestCase {
             let previewShape = try XCTUnwrap(entry["preview_shape"]?.doubles)
             XCTAssertEqual(preview.height, Int(previewShape[0]), "\(inputName) preview height")
             XCTAssertEqual(preview.width, Int(previewShape[1]), "\(inputName) preview width")
-            XCTAssertEqual(Swift.max(image.width, image.height), 320)
+            XCTAssertGreaterThan(Swift.max(image.width, image.height), 256)
             XCTAssertEqual(Swift.max(preview.width, preview.height), 256)
 
             if checkedPreviews.insert(inputName).inserted {
                 let referencePreview = try XCTUnwrap(common["previews"]?[inputName])
-                let referenceData = try XCTUnwrap(referencePreview["data"]?.flatDoubles)
+                let referenceData = try XCTUnwrap(referencePreview.flatDoubles)
+                if let packed = referencePreview.packedArray {
+                    XCTAssertEqual(packed.shape, [preview.height, preview.width, 3])
+                    XCTAssertEqual(packed.values.count, referenceData.count)
+                }
                 let previewError = maxAbsoluteDifference(preview.data, referenceData)
                 print("[auto exposure preview] \(inputName): max abs error \(previewError)")
-                // The fixture stores seven significant digits. The bundled
-                // skimage 0.26 default filter differs from explicit nearest
-                // sampling by less than 9e-16 on this smooth image.
+                // The stored preview is packed as float32, so the order-0
+                // sampler is compared pixel by pixel with the upstream
+                // rescale: the measured error is exactly 0.0 on this image.
                 XCTAssertLessThan(previewError, 5e-6, "\(inputName): preview samples")
             }
 
@@ -205,14 +217,30 @@ final class AutoExposureTests: XCTestCase {
             )
             let pipeline = try FilmPipeline(params: params)
             let inputName = try XCTUnwrap(fixture["input"]?.string)
-            let input = try inputImage(common: common, named: inputName)
+            let input = try inputImage(
+                common: common, named: inputName, section: "pipeline_images"
+            )
+            let inputSize = try XCTUnwrap(fixture["input_size"]?.doubles)
+            XCTAssertEqual(input.width, Int(inputSize[0]))
+            XCTAssertEqual(input.height, Int(inputSize[1]))
+            XCTAssertEqual(inputSize[2], 3)
             let result = try pipeline.process(rgbIn: input)
             let taps = try XCTUnwrap(fixture["taps"])
             let derived = try XCTUnwrap(fixture["derived"])
 
-            let referenceRGBIn = try XCTUnwrap(taps["rgb_in"]?.flatDoubles)
-            let referenceLogEFilm = try XCTUnwrap(taps["log_e_film"]?.flatDoubles)
-            let referenceRGBOut = try XCTUnwrap(taps["rgb_out"]?.flatDoubles)
+            let packedIn = try XCTUnwrap(taps["rgb_in"]?.packedArray)
+            let packedLogEFilm = try XCTUnwrap(taps["log_e_film"]?.packedArray)
+            let packedRGBOut = try XCTUnwrap(taps["rgb_out"]?.packedArray)
+            let referenceRGBIn = packedIn.values
+            let referenceLogEFilm = packedLogEFilm.values
+            let referenceRGBOut = packedRGBOut.values
+            // The pipeline raster is smaller than the preview limit: the
+            // downscale of the metering fixture covers that path.
+            XCTAssertEqual(packedIn.shape, [input.height, input.width, 3])
+            XCTAssertEqual(packedLogEFilm.shape, packedIn.shape)
+            XCTAssertEqual(packedRGBOut.shape, packedIn.shape)
+            XCTAssertEqual(packedIn.values.count, input.data.count)
+            XCTAssertLessThanOrEqual(Swift.max(input.width, input.height), 256)
             XCTAssertEqual(maxAbsoluteDifference(input.data, referenceRGBIn), 0)
 
             let logError = maxAbsoluteDifference(result.logEFilm.data, referenceLogEFilm)
