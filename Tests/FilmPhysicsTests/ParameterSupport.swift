@@ -202,6 +202,8 @@ func makePipelineParams(
             autoExposure: try XCTUnwrap(
                 camera["auto_exposure"]?.bool, file: file, line: line
             ),
+            // Older fixtures predate this field and use the upstream default.
+            autoExposureMethod: camera["auto_exposure_method"]?.string ?? "center_weighted",
             lensBlurUM: try XCTUnwrap(
                 camera["lens_blur_um"]?.double, file: file, line: line
             ),

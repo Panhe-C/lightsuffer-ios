@@ -54,7 +54,7 @@ final class AdvancedParamsTests: XCTestCase {
             XCTAssertTrue(spec.availability.reason?.contains("not ported") == true)
         }
 
-        // The auto exposure is not ported either.
+        // The app panel still lists auto exposure as unavailable in this step.
         let autoExposure = AdvancedParams.spec(for: "camera.auto_exposure")
         XCTAssertNotNil(autoExposure)
         XCTAssertNotNil(autoExposure?.availability.reason)
@@ -223,8 +223,8 @@ final class AdvancedParamsTests: XCTestCase {
     }
 
     func testTheAutoExposureStaysOff() throws {
-        // The engine rejects autoExposure == true: the panel can never turn
-        // the auto exposure on, and the apply step forces it off.
+        // The app panel still keeps auto exposure off in this step: it can
+        // never turn it on, and the apply step forces it off.
         var overrides = AdvancedOverrides()
         XCTAssertFalse(overrides.set(.bool(true), for: "camera.auto_exposure"))
         XCTAssertTrue(overrides.isEmpty)
@@ -234,10 +234,11 @@ final class AdvancedParamsTests: XCTestCase {
         AdvancedParams.apply(overrides, to: &params)
         XCTAssertFalse(params.camera.autoExposure)
 
-        // The engine itself refuses an auto exposure.
-        var rejected = try PreviewLook.pipelineParams(for: PreviewLook.defaultLook)
-        rejected.camera.autoExposure = true
-        XCTAssertThrowsError(try FilmPipeline(params: rejected))
+        // The CPU engine now accepts auto exposure; this does not change the
+        // app-panel policy above (Metal and the app toggle are separate work).
+        var accepted = try PreviewLook.pipelineParams(for: PreviewLook.defaultLook)
+        accepted.camera.autoExposure = true
+        XCTAssertNoThrow(try FilmPipeline(params: accepted))
     }
 
     // MARK: - The defaults

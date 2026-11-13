@@ -15,10 +15,10 @@ back — not a set of baked LUTs.
 
 | Phase | Scope | State |
 |---|---|---|
-| P1 | `FilmPhysics`: pure-Swift port of the spektrafilm pipeline (CPU reference), validated tap by tap against the Python engine | **in progress** (slices 1, 2 and 4 ported: profile loading, the hanatos 2025 spectral upsampling and the whole camera → print → scan chain, negative development with DIR couplers, enlarger printing, print development, scanning, the cam16ucs gamut compression and the whole stock catalogue — parity with the Python engine, mean ΔE2000 ≈ 0.0021) |
+| P1 | `FilmPhysics`: pure-Swift port of the spektrafilm pipeline (CPU reference), validated tap by tap against the Python engine | **in progress** (slices 1, 2 and 4 ported: profile loading, the hanatos 2025 spectral upsampling and the whole camera → print → scan chain, negative development with DIR couplers, enlarger printing, print development, scanning, the cam16ucs gamut compression, the whole stock catalogue and CPU auto exposure (all seven metering methods) — parity with the Python engine, mean ΔE2000 ≈ 0.0021 on the original slice 2) |
 | P2 | Spatial effects (halation, grain, DIR-coupler diffusion, diffusion filters, glare, blur, unsharp) | **in progress** (slice 5 ported: the highlight boost, the in-emulsion scatter, the back-reflection halation, the DIR-coupler diffusion, the four diffusion-filter families, the lens blurs and the unsharp mask — parity with the Python engine, mean ΔE2000 ≈ 0.0011. The **grain** and the **glare** are ported in slice 6 and validated statistically against the upstream) |
 | P3 | Metal port of the engine, parity-tested against the CPU reference | **on `main`** (`FilmPhysicsMetal`): the render plan, the pure-Swift plan evaluator and its `Float32` specification, 28 Metal kernels (the whole per-pixel chain, the spatial effects, the grain and the glare) and the `MetalBackend`, with macOS Metal CI |
-| P4 | SwiftUI app shell | **in progress**: the iOS 17 preview loop (EXIF-upright whole-frame 1280 px input, Metal with CPU fallback, hold-to-compare), a bottom catalogue of all 20 films, eight print media / direct scan, and a debounced basic panel for camera EV, physical grain and halation. Default: Portra 400 × Portra Endura. JPEG / HEIC / PNG use floating-point ColorSync input without an 8-bit-sRGB wide-gamut clip; RAW / ProRAW / DNG use iOS 17 CIRAWFilter scene-linear demosaic with as-shot / daylight (6504 K) / tungsten (2850 K) / custom WB. The Input section offers seven colour-space names: only sRGB and ProPhoto RGB are engine-native; the other five have a visible conversion-to-linear-ProPhoto fallback. The **full-resolution export** decodes the original bytes with the same input policy (GPU, tiled when the device budget needs it, never cropping the grade), writes JPEG or HEIC with source EXIF (upright pixels, orientation 1), saves with add-only authorization, and paints the six offered borders around the picture. An **advanced parameter panel**, in its own sheet off the main screen, exposes the 118 paths of the upstream manifest: 84 are applied to the engine, 4 belong to the basic sheet (which wins), 6 to the look / to the Input policy / to the locked output space, and 24 are listed as not ported (the chemistry, the auto exposure, the viewer and the workflow of the upstream GUI). The overrides are applied on top of the digested look and before the basic adjustments; the reset clears them and keeps the digest. Linux tests do not verify CIRAWFilter, Metal, the SwiftUI sheet or a real device |
+| P4 | SwiftUI app shell | **in progress**: the iOS 17 preview loop (EXIF-upright whole-frame 1280 px input, Metal with CPU fallback, hold-to-compare), a bottom catalogue of all 20 films, eight print media / direct scan, and a debounced basic panel for camera EV, physical grain and halation. Default: Portra 400 × Portra Endura. JPEG / HEIC / PNG use floating-point ColorSync input without an 8-bit-sRGB wide-gamut clip; RAW / ProRAW / DNG use iOS 17 CIRAWFilter scene-linear demosaic with as-shot / daylight (6504 K) / tungsten (2850 K) / custom WB. The Input section offers seven colour-space names: only sRGB and ProPhoto RGB are engine-native; the other five have a visible conversion-to-linear-ProPhoto fallback. The **full-resolution export** decodes the original bytes with the same input policy (GPU, tiled when the device budget needs it, never cropping the grade), writes JPEG or HEIC with source EXIF (upright pixels, orientation 1), saves with add-only authorization, and paints the six offered borders around the picture. An **advanced parameter panel**, in its own sheet off the main screen, exposes the 118 paths of the upstream manifest: 84 are applied to the engine, 4 belong to the basic sheet (which wins), 6 to the look / to the Input policy / to the locked output space, and 24 are listed as not ported in the app (the chemistry, the app-side auto exposure controls, the viewer and the workflow of the upstream GUI). The CPU auto-exposure meter is now ported, but Metal and the app toggle are deliberately not hooked up in this step. The overrides are applied on top of the digested look and before the basic adjustments; the reset clears them and keeps the digest. Linux tests do not verify CIRAWFilter, Metal, the SwiftUI sheet or a real device |
 | P5 | Release | not started |
 
 See [`docs/PLAN.md`](docs/PLAN.md) for the full plan and [`docs/APP.md`](docs/APP.md)
@@ -51,6 +51,7 @@ Sources/FilmPhysics/              pure-Swift physical engine (CPU reference)
   CAM16.swift                     the CAM16 / CAM16-UCS appearance model
   SpectralUpsampling.swift        the hanatos 2025 spectral upsampling and its tc LUT
   Filming.swift                   the filming stage (camera image → log exposure)
+  AutoExposure.swift              CPU auto-exposure metering and the 256 px preview
   SpatialEffects.swift            the image space filters (separable Gaussian, the
                                   Young & van Vliet IIR, the exponential surrogate,
                                   the unsharp mask)
@@ -97,6 +98,7 @@ Tests/FilmPhysicsTests/           Swift test target
   Fixtures/                       reference fixtures generated from upstream Python
   Slice2ParityTests.swift         whole pipeline parity (rgb_in → rgb_out) + the
                                   tc LUT, the CAM16-UCS model, the gamut compressor
+  AutoExposureTests.swift         all metering methods, preview and AE pipeline parity
   Slice1ParityTests.swift         tap by tap parity with the Python engine
   SpatialParityTests.swift        parity of the spatial effects (the halation, the
                                   highlight boost, the DIR coupler diffusion, the
@@ -150,7 +152,8 @@ Tests/FilmPhysicsMetalTests/      the Metal test target (macOS only)
                                   the timing of a 1024 x 1024 image
   MetalAvailabilityTests.swift    the fallback on the platforms that have no Metal
 tools/
-  gen_fixtures.py                 regenerates the reference fixtures
+  gen_fixtures.py                 regenerates the original slice reference fixtures
+  gen_autoexposure_fixtures.py    regenerates the focused CPU auto-exposure fixtures
   README.md                       how to regenerate them
 docs/PLAN.md                      project plan and decisions
 docs/PORTING.md                   upstream → Swift mapping, TODO list, measured errors
@@ -194,6 +197,14 @@ validates the ported slices against the reference fixtures:
   checks the hanatos 2025 tc LUT (max relative error 2.4e-07), the CAM16-UCS
   model (max abs error 2.5e-05, round trip 1.1e-15), the cam16ucs output
   gamut compressor (max abs error 4.8e-08) and the colour matrices.
+* `AutoExposureTests` — all seven CPU metering methods plus the unknown-method
+  fallback are checked on linear ProPhoto RGB and encoded sRGB against the
+  unmodified upstream 256 px preview path (maximum relative EV error
+  **3.13e-7**). Full-pipeline AE off / on / +0.75 EV compensation cases match
+  `log_e_film` to **≤ 8.57e-7** and `rgb_out` to mean ΔE2000 **≤ 0.00097**;
+  the tests also prove that AE does not enter print-balance mid-grey and that
+  the AE-off path is bit-identical. Metal AE and the app toggle remain future
+  work.
 * `Slice1ParityTests` — the Swift pipeline is fed with the `log_e_film` tap
   captured from the upstream Python engine and every downstream tap
   (`cmy_film`, `log_e_print`, `cmy_print`, `rgb_out`) is compared with the
@@ -288,6 +299,7 @@ the Swift port.
 
 ```bash
 /workspace/venv-sf/bin/python tools/gen_fixtures.py
+/workspace/venv-sf/bin/python tools/gen_autoexposure_fixtures.py
 ```
 
 The upstream data tables the package bundles (the hanatos 2025 irradiance
