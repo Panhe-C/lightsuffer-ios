@@ -1603,7 +1603,7 @@ def _slice5_base_params(output_gamut_compress: str = "cam16ucs"):
     params.print_render.glare.active = False
     params.film_render.glare.active = False
 
-    # --- the auto exposure (not ported) --------------------------------
+    # --- auto exposure (kept off for this established fixture) ---------
     params.camera.auto_exposure = False
 
     # --- the print density curve morph (off at the upstream default) ---
@@ -1754,7 +1754,7 @@ SLICE5_CASES = (
             "couplers active with their default 20 um inhibitor diffusion, "
             "the unsharp mask of the scanner at its default (0.7, 0.7). The "
             "grain and the glare are switched off (they are stochastic) and "
-            "so is the auto exposure (not ported). On a 35 mm frame of a "
+            "so is the auto exposure (kept off for this fixture). On a 35 mm frame of a "
             "32 x 32 image a pixel is 1093.75 um, so the micrometre scale "
             "effects are below one pixel."
         ),
@@ -2145,8 +2145,9 @@ def _slice6_base_params(stock: dict, ev: float, output_gamut_compress: str = "ca
     """The upstream defaults of a slice 6 case.
 
     Every parameter keeps its upstream default value; the only changes are
-    the ones the port needs: the auto exposure is off (not ported yet) and
-    the film format is narrow (so that the grain is visible on a 64 x 64
+    the ones the port needs: the auto exposure is off (the focused CPU AE
+    fixtures cover the enabled path) and the film format is narrow (so that
+    the grain is visible on a 64 x 64
     image).
     """
     params = init_params(film_profile=stock["film"], print_profile=stock["print"])

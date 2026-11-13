@@ -23,6 +23,8 @@ public struct CameraParams: Equatable, Sendable {
     public var exposureCompensationEV: Double
     /// Whether the camera meters the image.
     public var autoExposure: Bool
+    /// The metering method (`"center_weighted"` by default).
+    public var autoExposureMethod: String
     /// The radius of the lens blur, in micrometres.
     public var lensBlurUM: Double
     /// The width of the film frame, in millimetres.
@@ -37,12 +39,14 @@ public struct CameraParams: Equatable, Sendable {
     public init(
         exposureCompensationEV: Double = 0.0,
         autoExposure: Bool = true,
+        autoExposureMethod: String = "center_weighted",
         lensBlurUM: Double = 0.0,
         filmFormatMM: Double = 35.0,
         diffusionFilter: DiffusionFilterParams = DiffusionFilterParams()
     ) {
         self.exposureCompensationEV = exposureCompensationEV
         self.autoExposure = autoExposure
+        self.autoExposureMethod = autoExposureMethod
         self.lensBlurUM = lensBlurUM
         self.filmFormatMM = filmFormatMM
         self.diffusionFilter = diffusionFilter
@@ -431,9 +435,6 @@ public struct FilmPipeline {
                 "the RGB to raw method '\(params.settings.rgbToRawMethod)' is not ported yet"
             )
         }
-        guard params.camera.autoExposure == false else {
-            throw PipelineError.invalidInputs("the auto exposure is not ported yet")
-        }
         guard RGBColourspace.named(params.io.inputColorSpace) != nil else {
             throw PipelineError.invalidInputs(
                 "the input colour space '\(params.io.inputColorSpace)' is not supported"
@@ -611,6 +612,12 @@ public struct FilmPipeline {
 
     /// Runs the simulation.
     ///
+    /// When `params.camera.autoExposure` is true, the CPU meter builds its
+    /// 256-pixel preview and scales the full-resolution input RGB before
+    /// spectral upsampling. This image-dependent scale is independent of
+    /// `exposureCompensationEV` and of the print-balance mid-grey. When auto
+    /// exposure is false, the input follows the original path unchanged.
+    ///
     /// - Parameter rgbIn: the camera image, in the input colourspace.
     /// - Returns: the taps of the pipeline.
     public func process(rgbIn: RGBImage) throws -> FilmTaps {
@@ -651,8 +658,24 @@ public struct FilmPipeline {
         stageInputs.enlarger.diffusionFilter = params.enlarger.diffusionFilter
 
         // --- the filming stage ------------------------------------------
+        // Upstream `_preprocess` applies auto exposure before crop / rescale
+        // and before `FilmingStage.expose`. Crop and upscale are not ported,
+        // so the metered full-resolution RGB goes directly to rawFromRGB.
+        // This image-dependent scale stays separate from the camera's
+        // exposureCompensationEV and from the print-balance mid-grey.
+        let filmInput: RGBImage
+        if params.camera.autoExposure {
+            filmInput = AutoExposure.apply(
+                to: rgbIn,
+                colourspace: inputColourSpace,
+                applyCCTFDecoding: params.io.inputCCTFDecoding,
+                method: params.camera.autoExposureMethod
+            ).image
+        } else {
+            filmInput = rgbIn
+        }
         let raw = Filming.rawFromRGB(
-            rgb: rgbIn.data,
+            rgb: filmInput.data,
             lut: tcLUT,
             colourspace: inputColourSpace,
             applyCCTFDecoding: params.io.inputCCTFDecoding,
