@@ -4,6 +4,22 @@ import FilmPhysics
 
 final class PreviewLookTests: XCTestCase {
 
+    func testEveryMeteringMethodMapsToTheCameraAndInvalidNamesAreRejected() throws {
+        for method in AutoExposure.methods {
+            let params = try PreviewLook.pipelineParams(
+                for: PreviewLook.defaultLook,
+                adjustments: PreviewAdjustments(autoExposureEnabled: true, meteringMethod: method)
+            )
+            XCTAssertTrue(params.camera.autoExposure)
+            XCTAssertEqual(params.camera.autoExposureMethod, method)
+            XCTAssertEqual(params.stochastic.grainSampler, .fast)
+        }
+        XCTAssertThrowsError(try PreviewLook.pipelineParams(
+            for: PreviewLook.defaultLook,
+            adjustments: PreviewAdjustments(meteringMethod: "not_a_method")
+        ))
+    }
+
     func testDefaultLookLoadsBundledProfilesAndKeepsFastGrainSampler() throws {
         let params = try PreviewLook.pipelineParams()
 

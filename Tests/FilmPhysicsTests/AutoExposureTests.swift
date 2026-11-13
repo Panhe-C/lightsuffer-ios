@@ -225,6 +225,15 @@ final class AutoExposureTests: XCTestCase {
             XCTAssertEqual(input.height, Int(inputSize[1]))
             XCTAssertEqual(inputSize[2], 3)
             let result = try pipeline.process(rgbIn: input)
+            let exposure = try AutoExposure.resolve(params: params, meteringImage: input)
+            XCTAssertFalse(exposure.params.camera.autoExposure)
+            XCTAssertEqual(exposure.params.camera.exposureCompensationEV, params.camera.exposureCompensationEV)
+            let scaledInput = exposure.apply(to: input)
+            let replay = try FilmPipeline(params: exposure.params).process(rgbIn: scaledInput)
+            XCTAssertEqual(replay, result, "resolving AE must not double-meter or alter print balance")
+            let plan = try FilmRenderPlan.build(params: exposure.params)
+            let specification = try FilmPlanEvaluatorFloat32.evaluate(plan: plan, rgbIn: scaledInput)
+            XCTAssertLessThan(deltaE(result.rgbOut.data, specification.rgbOut.data).mean, 0.01)
             let taps = try XCTUnwrap(fixture["taps"])
             let derived = try XCTUnwrap(fixture["derived"])
 
@@ -353,6 +362,37 @@ final class AutoExposureTests: XCTestCase {
 
         params.settings.rgbToRawMethod = "mallett2019"
         XCTAssertThrowsError(try FilmPipeline(params: params))
+    }
+
+    func testRenderPlanRejectsUnresolvedAutoExposure() throws {
+        let film = try ProfileLoader.load(stock: "kodak_portra_400")
+        let paper = try ProfileLoader.load(stock: "kodak_portra_endura")
+        let params = PipelineParams(film: film, print: paper, camera: CameraParams(autoExposure: true))
+        let pipeline = try FilmPipeline(params: params)
+        XCTAssertThrowsError(try FilmRenderPlan.build(params: params))
+        XCTAssertThrowsError(try FilmRenderPlan(pipeline: pipeline))
+    }
+
+    func testResolvedExposureValidatesInputAndRejectsNonFiniteMetering() throws {
+        let film = try ProfileLoader.load(stock: "kodak_portra_400")
+        let paper = try ProfileLoader.load(stock: "kodak_portra_endura")
+        var params = PipelineParams(film: film, print: paper)
+        XCTAssertThrowsError(try AutoExposure.resolve(
+            params: params, meteringImage: RGBImage(width: 1, height: 1, data: [])
+        ))
+        XCTAssertThrowsError(try AutoExposure.resolve(
+            params: params, meteringImage: RGBImage(width: 1, height: 1, data: [.nan, 0.1, 0.2])
+        ))
+        let black = RGBImage(width: 1, height: 1, data: [0, 0, 0])
+        let exposure = try AutoExposure.resolve(params: params, meteringImage: black)
+        XCTAssertEqual(exposure.ev, 0)
+        XCTAssertEqual(exposure.apply(to: black), black)
+
+        params.camera.autoExposure = false
+        var plan = try FilmRenderPlan.build(params: params)
+        plan.params.camera.autoExposure = true
+        XCTAssertThrowsError(try FilmPlanEvaluator.evaluate(plan: plan, rgbIn: black))
+        XCTAssertThrowsError(try FilmPlanEvaluatorFloat32.evaluate(plan: plan, rgbIn: black))
     }
 
     /// With AE off, changing its method cannot affect any tap of the existing

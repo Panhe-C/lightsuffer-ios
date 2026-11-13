@@ -4,6 +4,30 @@ import XCTest
 
 final class PreviewSessionTests: XCTestCase {
 
+    func testAutoExposureInvalidatesAndKeepsPreviewAndExportSnapshotsIndependent() throws {
+        let session = PreviewSession(scheduler: TestPreviewScheduler())
+        session.photoBecameReady()
+        let old = session.renderRequestForTesting()
+        session.adjustments.autoExposureEnabled = true
+        session.adjustments.meteringMethod = "highlight_weighted"
+        XCTAssertFalse(session.isCurrent(old.generation))
+        let preview = session.renderRequestForTesting()
+        let export = ExportRequest(look: session.look, adjustments: session.adjustments)
+        XCTAssertEqual(try preview.pipelineParams(), try export.pipelineParams())
+
+        session.adjustments.meteringMethod = "median"
+        XCTAssertFalse(session.isCurrent(preview.generation))
+        XCTAssertEqual(try preview.pipelineParams().camera.autoExposureMethod, "highlight_weighted")
+        XCTAssertEqual(try export.pipelineParams().camera.autoExposureMethod, "highlight_weighted")
+        try session.selectFilm(stock: "kodak_gold_200")
+        XCTAssertTrue(try session.renderRequestForTesting().pipelineParams().camera.autoExposure)
+        XCTAssertEqual(session.adjustments.meteringMethod, "median")
+        session.photoDidChange()
+        XCTAssertTrue(session.adjustments.autoExposureEnabled)
+        session.adjustments = PreviewAdjustments()
+        XCTAssertFalse(try session.renderRequestForTesting().pipelineParams().camera.autoExposure)
+    }
+
     func testDefaultLookIsPortra400OnPortraEnduraWithFastGrain() throws {
         let session = PreviewSession(scheduler: TestPreviewScheduler())
 

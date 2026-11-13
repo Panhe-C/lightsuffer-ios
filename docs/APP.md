@@ -47,8 +47,8 @@ swift test --build-system native --filter LightSufferPreviewTests
    catalogue contains all 20 camera films; selecting one chooses its `targetPrint`,
    or direct scan for a slide.  The adjustments sheet offers all eight print media
    and direct scan for negatives.  Each render builds fresh parameters through
-   `StockCatalog.pipelineParams`, which disables the unported auto-exposure feature,
-   applies the stock digest and preserves `GrainSampler.fast`. EV, grain,
+   `StockCatalog.pipelineParams`, which starts with AE off, applies the stock
+   digest and preserves `GrainSampler.fast`. AE/metering, EV, grain,
    halation and `PhotoInputSettings` are then reapplied, so a look change does
    not discard either physical or input adjustments.
 5. Look, physical-adjustment and input-setting changes are debounced for
@@ -65,7 +65,8 @@ swift test --build-system native --filter LightSufferPreviewTests
    the compact bottom film strip.  Press/hold displays the original scaled photo;
    releasing restores the grade.
 
-The basic sheet maps camera EV to `camera.exposureCompensationEV`, grain/halation
+The basic sheet maps AE/metering to `camera.autoExposure` and
+`camera.autoExposureMethod`, camera EV to `camera.exposureCompensationEV`, grain/halation
 toggles to their `active` fields, and halation amount to
 `filmRender.halation.halationAmount`.  Grain strength is a dimensionless physical
 particle-area scale: every digested `filmRender.grain.particleScale[channel]` is
@@ -75,6 +76,34 @@ ratios and sublayer ratios are unchanged.  It is not a post-process noise layer.
 colour curves or advanced parameter dump is present. The same sheet has a small
 **Input** section for the detected kind, decoder/fallback status, WB and input
 colour space; it is not the full advanced parameter panel.
+
+## Auto exposure across preview and export
+
+The basic **Camera** section offers an Auto exposure toggle (default **off**)
+and seven upstream methods, defaulting to `center_weighted`. These settings
+travel in `PreviewAdjustments`, invalidate the same debounced generation as EV,
+and survive look/photo changes. Resetting basic adjustments restores AE off.
+The advanced panel lists the two controls as basic-sheet-owned, not unavailable.
+
+`AutoExposure.resolve(params:meteringImage:)` freezes a measured EV and returns
+parameters with AE disabled. Its `apply(to:)` scales **input RGB before CCTF
+decoding**. AE is never folded into camera compensation or print-balance grey.
+Both the preview and export use this result with either rendering backend.
+
+The App's canonical metering frame is the colour-managed **1280 px preview
+decode**. The meter still reduces that frame to at most 256 px. Export decodes
+the original at full resolution for rendering, but meters the preview input
+once before processing any tile. If an export starts while changed WB/input
+settings are still rendering, it re-decodes the preview with the export
+request's immutable input settings first. Every tile and CPU fallback receives
+the same frozen RGB scale; none measures a cropped tile. This deliberately
+preserves the displayed exposure rather than separately metering a differently
+resampled full-resolution decode. Standalone CPU/Metal engine calls instead
+meter the complete image supplied by their caller, as upstream does.
+
+The image-independent `FilmRenderPlan` rejects unresolved AE, including a
+caller-mutated plan at execution. The Metal `render(image, params:)` entry point
+resolves AE on the CPU before building the plan. There is no GPU metering kernel.
 
 ## The advanced parameter panel
 
@@ -96,11 +125,11 @@ The inventory (tested in `AdvancedParamsTests`):
 | Bucket | Count | Meaning |
 |---|---|---|
 | applied | **84** | the panel writes the value into the Swift `PipelineParams` |
-| basic sheet | 4 | `camera.exposure_compensation_ev`, `film_render.grain.active`, `film_render.halation.active`, `film_render.halation.halation_amount`: the Adjustments sheet is applied **after** the overrides and always wins |
+| basic sheet | 6 | camera EV, auto exposure, metering method, grain activity, halation activity and amount: the Adjustments sheet is applied **after** the overrides and always wins |
 | look | 3 | `selection.film_stock`, `selection.print_paper`, `io.scan_film`: the film / print selection of the main screen owns them |
 | input policy | 2 | `io.input_color_space`, `io.input_cctf_decoding`: the Input section owns them |
 | locked | 1 | `io.output_color_space`: the engine always encodes the output with the sRGB transfer function, and the display and the export of the app are sRGB |
-| unported | 24 | the eight parameters of the chemistry, the two parameters of the auto exposure and the fourteen parameters of the viewer / of the workflow of the upstream GUI |
+| unported | 22 | the eight parameters of the chemistry and the fourteen parameters of the viewer / of the workflow of the upstream GUI |
 
 The groups of the panel are the groups of the manifest: **Couplers, Halation,
 Grain, Glare, Preflash, Camera, Camera diffusion, Enlarger, Enlarger diffusion,
@@ -115,11 +144,11 @@ owned by another sheet), plus the two unavailable groups **Chemistry** and
 applies, in this order:
 
 1. the **stock digest** (`StockCatalog.pipelineParams`: the digest, the
-   `autoExposure == false` policy and the default `GrainSampler.fast`),
+`autoExposure == false` starting policy and the default `GrainSampler.fast`),
 2. the **advanced overrides** of the panel, written on top of the digested
    parameters,
 3. the **basic adjustments** of the Adjustments sheet, so that the sheet wins
-   for the four controls it owns.  The grain strength stays a multiplier of the
+   for the six controls it owns.  The grain strength stays a multiplier of the
    (possibly overridden) `filmRender.grain.particleScale`,
 4. the **input policy** (`PhotoInputSettings.apply`), which writes the I/O tags
    only: an unsupported colour-space name is converted or refused there, never
@@ -149,8 +178,8 @@ the overrides*: the next render is the digested look, the basic adjustments and
 the input settings, with no advanced override.  It is **not** a wipe to the
 zero-initialised defaults of the structs, which would discard the digest of the
 stock.  After a global reset the parameters are exactly the baseline, with
-`GrainSampler.fast`, `autoExposure == false` and the linear ProPhoto + CCTF off
-input tags.
+`GrainSampler.fast` and the current basic/input settings. AE is off for a fresh
+session, but clearing advanced overrides does not change the basic AE toggle.
 
 ### What is not offered
 
@@ -159,8 +188,6 @@ Nothing that the engine does not support is offered as if it worked:
 - the **chemistry** group (`print_render.density_curves_morph.*`) is shown
   disabled: the Swift engine has no counterpart for the print density-curve
   morphing, and no shadow struct is invented for it;
-- the **auto exposure** stays off: the engine rejects `autoExposure == true`,
-  the panel cannot write it, and the apply step forces it to `false`;
 - the **spectral upsampling** only offers `hanatos2025` (`mallett2019` is not
   ported and the engine would throw);
 - the **input gamut compression** only offers `xy` (`oklch` is not ported: the
@@ -383,3 +410,16 @@ They do **not** execute CIRAWFilter, ColorSync, Metal or SwiftUI and do not
 verify a real device. No preview ΔE or RAW colour accuracy has been measured on
 a device in this step, and the SwiftUI sheet of the advanced panel has not been
 exercised on a device either.
+
+### Local acceptance (2026-11-13)
+
+- macOS Release suite: 193 tests, zero failures, one timing test skipped
+  because `RUN_TIMING` was not enabled. Actual Metal parity and grain tests ran.
+- The iOS Simulator App target builds unsigned with Xcode 16.2.
+- On iPhone 16 Pro / iOS 18.3 Simulator, the Camera sheet starts with AE off
+  and metering disabled; enabling AE enables all seven choices, and selecting
+  Highlight Weighted updates the control. This was a no-photo UI smoke check,
+  not an interactive photo render/export or a physical iPhone test.
+- GPU/CPU AE parity and whole-frame/tiled exposure are tested at the engine
+  seams. CIRAWFilter accuracy, permission flows and large-photo export memory
+  still need device acceptance.

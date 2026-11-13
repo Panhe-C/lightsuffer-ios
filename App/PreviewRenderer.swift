@@ -17,6 +17,7 @@ enum PreviewRenderer {
         request: PreviewRenderRequest
     ) throws -> RenderedPreview {
         let params = try request.pipelineParams()
+        let exposure = try AutoExposure.resolve(params: params, meteringImage: photo.input)
 
         // A Metal device alone is not enough: MetalBackend can return nil for
         // a missing command queue and can report a shader compilation error
@@ -33,7 +34,7 @@ enum PreviewRenderer {
             backendName = "CPU"
         }
 
-        let output = try backend.render(photo.input, params: params)
+        let output = try backend.render(exposure.apply(to: photo.input), params: exposure.params)
         let pixels = try SRGBPixelBuffer(encodedSRGB: output)
         return RenderedPreview(
             image: try CGImagePixels.makeImage(from: pixels),

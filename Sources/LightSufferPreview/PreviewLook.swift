@@ -14,6 +14,8 @@ import Foundation
 public struct PreviewAdjustments: Equatable, Sendable {
     /// Camera exposure compensation, in stops.
     public var exposureCompensationEV: Double
+    public var autoExposureEnabled: Bool
+    public var meteringMethod: String
     /// Whether the physical silver-halide grain simulation is active.
     public var grainEnabled: Bool
     /// A dimensionless multiplier of the digested per-channel particle scales.
@@ -40,9 +42,13 @@ public struct PreviewAdjustments: Equatable, Sendable {
         grainEnabled: Bool = true,
         grainStrength: Double = 1,
         halationEnabled: Bool = true,
-        halationAmount: Double = 1
+        halationAmount: Double = 1,
+        autoExposureEnabled: Bool = false,
+        meteringMethod: String = "center_weighted"
     ) {
         self.exposureCompensationEV = exposureCompensationEV
+        self.autoExposureEnabled = autoExposureEnabled
+        self.meteringMethod = meteringMethod
         self.grainEnabled = grainEnabled
         self.grainStrength = grainStrength
         self.halationEnabled = halationEnabled
@@ -134,7 +140,7 @@ public enum PreviewLook {
     ///
     /// The basic adjustments come **after** the advanced overrides, so the
     /// Adjustments sheet always wins for the controls it owns (the camera
-    /// EV, the grain and the halation toggles and the halation amount).  The
+    /// EV, AE and metering method, grain and halation controls).  The
     /// grain strength stays a multiplier of the (possibly overridden)
     /// `particleScale`.  The input policy comes last and writes the I/O tags
     /// only: it never tags an unsupported colour space.
@@ -160,6 +166,11 @@ public enum PreviewLook {
         AdvancedParams.apply(advancedOverrides, to: &params)
 
         params.camera.exposureCompensationEV = adjustments.exposureCompensationEV
+        guard AutoExposure.methods.contains(adjustments.meteringMethod) else {
+            throw PipelineError.invalidInputs("the selected metering method is not supported")
+        }
+        params.camera.autoExposure = adjustments.autoExposureEnabled
+        params.camera.autoExposureMethod = adjustments.meteringMethod
         params.filmRender.grain.active = adjustments.grainEnabled
         params.filmRender.grain.particleScale = params.filmRender.grain.particleScale.map {
             $0 * adjustments.grainStrength
@@ -172,8 +183,7 @@ public enum PreviewLook {
         // through to FilmPipeline. This writes no stock or stochastic fields.
         try inputSettings.apply(to: &params)
 
-        // StockCatalog supplies autoExposure == false and the PipelineParams
-        // default grain sampler.  Do not replace either policy here.
+        // The default stays AE off; the grain sampler keeps the stock policy.
         return params
     }
 

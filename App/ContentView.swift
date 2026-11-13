@@ -1,4 +1,5 @@
 import CoreGraphics
+import FilmPhysics
 import FrameCore
 import LightSufferPreview
 import PhotosUI
@@ -376,6 +377,20 @@ struct ContentView: View {
                 }
 
                 Section("Camera") {
+                    Toggle("Auto exposure", isOn: $model.adjustments.autoExposureEnabled)
+                        .accessibilityIdentifier("auto-exposure")
+                    Picker("Metering method", selection: $model.adjustments.meteringMethod) {
+                        ForEach(AutoExposure.methods, id: \.self) { method in
+                            Text(method.replacingOccurrences(of: "_", with: " ").capitalized)
+                                .tag(method)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .disabled(!model.adjustments.autoExposureEnabled)
+                    .accessibilityIdentifier("metering-method")
+                    Text("Meters the whole preview frame. Export uses the same metering input for every tile; compensation below remains independent.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                     HStack {
                         Text("Exposure compensation")
                         Spacer()
