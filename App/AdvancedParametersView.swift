@@ -87,8 +87,9 @@ struct AdvancedParametersView: View {
     private func sectionNote(_ section: AdvancedSection) -> String? {
         switch section {
         case .chemistry:
-            return "The print density-curve morphing of the upstream is not ported: the "
-                + "engine has no counterpart for this group."
+            return "Gamma factors combine across global, layer and RGB controls. Developer "
+                + "exhaustion preserves the morphed curve's midgray density. Stock black/white "
+                + "references stay unchanged. Direct scans bypass print chemistry."
         case .filmOutput:
             return "The film, the print medium and the direct scan path are chosen on the "
                 + "main screen."
@@ -99,7 +100,8 @@ struct AdvancedParametersView: View {
             return "These parameters belong to the viewer or to the workflow of the upstream "
                 + "desktop application; they are not parameters of the simulation."
         case .camera:
-            return "The auto exposure is not ported: the engine rejects it, so it stays off."
+            return "Auto exposure and its metering method are set in the Camera section "
+                + "of the Adjustments sheet."
         case .enlarger:
             return "The neutral print filters of the digest stay the ones of the default "
                 + "illuminant of the stock."

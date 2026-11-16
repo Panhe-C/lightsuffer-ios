@@ -537,18 +537,21 @@ public struct FilmRenderPlan: Sendable {
         )
         colorReference.logRawPrintBlack = logRawBlack
         colorReference.logRawPrintWhite = logRawWhite
-        colorReference.updateReferences(printProfile: printProfile) { cmy in
-            Scanning.cmyToLogXYZ(
-                cmy: cmy,
-                channelDensity: printProfile.data.channelDensity,
-                baseDensity: printProfile.data.baseDensity,
-                scanIlluminant: inputs.spectral.scanIlluminant,
-                colourMatchingFunctions: inputs.spectral.colourMatchingFunctions,
-                normalization: inputs.spectral.scanIlluminantNormalization
-            )
+        // A direct scan keeps the film references prepared above; it must
+        // not overwrite them with the unrelated print medium's references.
+        if !params.io.scanFilm {
+            colorReference.updateReferences(printProfile: printProfile) { cmy in
+                Scanning.cmyToLogXYZ(
+                    cmy: cmy, channelDensity: printProfile.data.channelDensity,
+                    baseDensity: printProfile.data.baseDensity,
+                    scanIlluminant: inputs.spectral.scanIlluminant,
+                    colourMatchingFunctions: inputs.spectral.colourMatchingFunctions,
+                    normalization: inputs.spectral.scanIlluminantNormalization
+                )
+            }
         }
         self.printingExposureCorrection = Float(
-            colorReference.printingExposureCorrection(printProfile: printProfile)
+            params.io.scanFilm ? 1 : colorReference.printingExposureCorrection(printProfile: printProfile)
         )
         if let correction = colorReference.correctionFunction() {
             self.colorReferenceSlope = Float(correction.slope)
@@ -558,9 +561,11 @@ public struct FilmRenderPlan: Sendable {
             self.colorReferenceOffset = 0
         }
 
-        let printCurves = DensityCurves.evaluateFittedDensity(
+        let printCurves = try PrintCurvesMorph.evaluate(
             logExposure: printProfile.data.logExposure,
             model: printProfile.data.densityCurvesModel,
+            params: params.io.scanFilm
+                ? PrintCurvesMorphParams(active: false) : params.printRender.densityCurvesMorph,
             profileType: printProfile.info.type
         )
         self.printCurve = UniformCurve(

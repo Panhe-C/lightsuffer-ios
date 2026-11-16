@@ -136,6 +136,21 @@ public enum Printing {
         )
     }
 
+    /// Develops with creative chemistry without changing stock reference curves.
+    public static func develop(
+        logRaw: [Double], printProfile: Profile, morph: PrintCurvesMorphParams
+    ) throws -> [Double] {
+        let curves = try PrintCurvesMorph.evaluate(
+            logExposure: printProfile.data.logExposure,
+            model: printProfile.data.densityCurvesModel,
+            params: morph, profileType: printProfile.info.type
+        )
+        return DensityCurves.interpolateExposureToDensity(
+            logExposureRGB: logRaw, densityCurves: curves,
+            logExposure: printProfile.data.logExposure, gammaFactor: 1
+        )
+    }
+
     /// Converts a linear exposure into a log exposure, clamping the negative
     /// values the way the upstream pipeline does.
     ///

@@ -200,9 +200,14 @@ public struct FilmRenderParams: Equatable, Sendable {
 public struct PrintRenderParams: Equatable, Sendable {
     /// The glare of the print.
     public var glare: GlareParams
+    public var densityCurvesMorph: PrintCurvesMorphParams
 
-    public init(glare: GlareParams = GlareParams()) {
+    public init(
+        glare: GlareParams = GlareParams(),
+        densityCurvesMorph: PrintCurvesMorphParams = PrintCurvesMorphParams()
+    ) {
         self.glare = glare
+        self.densityCurvesMorph = densityCurvesMorph
     }
 }
 
@@ -605,6 +610,7 @@ public struct FilmPipeline {
             enlarger: enlargerInputs,
             scanner: scannerInputs,
             filmRender: filmRenderInputs,
+            printCurvesMorph: params.printRender.densityCurvesMorph,
             seed: params.stochastic.seed,
             grainSampler: params.stochastic.grainSampler
         )

@@ -280,6 +280,8 @@ public struct Slice1Inputs: Equatable, Sendable {
     public var scanner: ScannerInputs
     /// The film rendering settings.
     public var filmRender: FilmRenderInputs
+    /// Creative print chemistry, separate from the stock black/white references.
+    public var printCurvesMorph: PrintCurvesMorphParams
     /// The seed of the random number generator of the stochastic effects.
     ///
     /// The upstream engine has no reproducible stochastic path (the grain
@@ -298,6 +300,7 @@ public struct Slice1Inputs: Equatable, Sendable {
         enlarger: EnlargerInputs,
         scanner: ScannerInputs,
         filmRender: FilmRenderInputs = FilmRenderInputs(),
+        printCurvesMorph: PrintCurvesMorphParams = PrintCurvesMorphParams(),
         seed: UInt64 = StochasticParams.defaultSeed,
         grainSampler: GrainSampler = .fast
     ) {
@@ -305,6 +308,7 @@ public struct Slice1Inputs: Equatable, Sendable {
         self.enlarger = enlarger
         self.scanner = scanner
         self.filmRender = filmRender
+        self.printCurvesMorph = printCurvesMorph
         self.seed = seed
         self.grainSampler = grainSampler
     }
@@ -407,7 +411,7 @@ public struct Slice1Pipeline {
         var colorReference = inputs.scanner.colorReference
         let cmyFilm = developFilm(logEFilm)
         let logEPrint = exposePrint(cmyFilm, colorReference: &colorReference)
-        let cmyPrint = developPrint(logEPrint)
+        let cmyPrint = try developPrint(logEPrint)
         let rgbOut = scanPrint(cmyPrint, colorReference: colorReference)
         return Slice1Taps(
             cmyFilm: cmyFilm, logEPrint: logEPrint, cmyPrint: cmyPrint, rgbOut: rgbOut
@@ -660,8 +664,10 @@ public struct Slice1Pipeline {
     ///
     /// Upstream reference:
     /// `spektrafilm.runtime.stages.printing.PrintingStage.develop`.
-    private func developPrint(_ logRaw: RGBImage) -> RGBImage {
-        let density = Printing.develop(logRaw: logRaw.data, printProfile: print)
+    private func developPrint(_ logRaw: RGBImage) throws -> RGBImage {
+        let density = try Printing.develop(
+            logRaw: logRaw.data, printProfile: print, morph: inputs.printCurvesMorph
+        )
         return RGBImage(width: logRaw.width, height: logRaw.height, data: density)
     }
 

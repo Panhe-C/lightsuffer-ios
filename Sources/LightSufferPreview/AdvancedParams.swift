@@ -17,8 +17,7 @@
 //  * explicitly listed as **unported**, with the reason why the engine has
 //    no counterpart for it.
 //
-//  Nothing here changes the engine: `FilmPhysics` is not modified, and the
-//  numerics, the fixtures and the grain sampler of the port are untouched.
+//  This catalog only maps values: numerical preparation stays in FilmPhysics.
 //
 
 import FilmPhysics
@@ -1059,48 +1058,66 @@ public enum AdvancedParams {
             set: { $0.printRender.glare.blur = $1 }
         ))
 
-        // --- the chemistry (not ported) ---------------------------------
-        let chemistryReason = "The print density-curve morphing is not ported: the Swift " +
-            "engine has no counterpart for this group."
-        specs.append(unported(
+        // --- the print chemistry ---------------------------------------
+        specs.append(toggle(
             "print_render.density_curves_morph.active",
             "printRender.densityCurvesMorph.active",
-            .chemistry, "Morphing active", reason: chemistryReason
+            .chemistry, "Morphing active",
+            note: "Creative print chemistry; direct scans bypass this stage.",
+            get: { $0.printRender.densityCurvesMorph.active },
+            set: { $0.printRender.densityCurvesMorph.active = $1 }
         ))
-        specs.append(unported(
+        specs.append(slider(
             "print_render.density_curves_morph.gamma_factor",
             "printRender.densityCurvesMorph.gammaFactor",
-            .chemistry, "Gamma factor", reason: chemistryReason
+            .chemistry, "Gamma factor", range: 0.5...2, step: 0.05,
+            get: { $0.printRender.densityCurvesMorph.gammaFactor },
+            set: { $0.printRender.densityCurvesMorph.gammaFactor = $1 }
         ))
-        specs.append(unported(
+        specs.append(slider(
             "print_render.density_curves_morph.gamma_factor_fast",
             "printRender.densityCurvesMorph.gammaFactorFast",
-            .chemistry, "Gamma factor fast", reason: chemistryReason
+            .chemistry, "Gamma factor fast", range: 0.5...2, step: 0.05,
+            note: "Applied to the layer with the lowest exposure threshold.",
+            get: { $0.printRender.densityCurvesMorph.gammaFactorFast },
+            set: { $0.printRender.densityCurvesMorph.gammaFactorFast = $1 }
         ))
-        specs.append(unported(
+        specs.append(slider(
             "print_render.density_curves_morph.gamma_factor_slow",
             "printRender.densityCurvesMorph.gammaFactorSlow",
-            .chemistry, "Gamma factor slow", reason: chemistryReason
+            .chemistry, "Gamma factor slow", range: 0.5...2, step: 0.05,
+            note: "Applied to both the mid and slow layers.",
+            get: { $0.printRender.densityCurvesMorph.gammaFactorSlow },
+            set: { $0.printRender.densityCurvesMorph.gammaFactorSlow = $1 }
         ))
-        specs.append(unported(
+        specs.append(slider(
             "print_render.density_curves_morph.gamma_factor_red",
             "printRender.densityCurvesMorph.gammaFactorRed",
-            .chemistry, "Gamma factor red", reason: chemistryReason
+            .chemistry, "Gamma factor red", range: 0.5...2, step: 0.02,
+            get: { $0.printRender.densityCurvesMorph.gammaFactorRed },
+            set: { $0.printRender.densityCurvesMorph.gammaFactorRed = $1 }
         ))
-        specs.append(unported(
+        specs.append(slider(
             "print_render.density_curves_morph.gamma_factor_green",
             "printRender.densityCurvesMorph.gammaFactorGreen",
-            .chemistry, "Gamma factor green", reason: chemistryReason
+            .chemistry, "Gamma factor green", range: 0.5...2, step: 0.02,
+            get: { $0.printRender.densityCurvesMorph.gammaFactorGreen },
+            set: { $0.printRender.densityCurvesMorph.gammaFactorGreen = $1 }
         ))
-        specs.append(unported(
+        specs.append(slider(
             "print_render.density_curves_morph.gamma_factor_blue",
             "printRender.densityCurvesMorph.gammaFactorBlue",
-            .chemistry, "Gamma factor blue", reason: chemistryReason
+            .chemistry, "Gamma factor blue", range: 0.5...2, step: 0.02,
+            get: { $0.printRender.densityCurvesMorph.gammaFactorBlue },
+            set: { $0.printRender.densityCurvesMorph.gammaFactorBlue = $1 }
         ))
-        specs.append(unported(
+        specs.append(slider(
             "print_render.density_curves_morph.developer_exhaustion",
             "printRender.densityCurvesMorph.developerExhaustion",
-            .chemistry, "Developer exhaustion", reason: chemistryReason
+            .chemistry, "Developer exhaustion", range: 0...1, step: 0.02,
+            note: "Blends the layer CDFs while preserving their combined density at zero log exposure.",
+            get: { $0.printRender.densityCurvesMorph.developerExhaustion },
+            set: { $0.printRender.densityCurvesMorph.developerExhaustion = $1 }
         ))
 
         // --- the preflash of the enlarger -------------------------------

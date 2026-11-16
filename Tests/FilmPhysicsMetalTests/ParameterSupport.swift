@@ -15,6 +15,19 @@ import FilmPhysics
 
 extension JSONValue {
 
+    func printCurvesMorphParams() -> PrintCurvesMorphParams {
+        PrintCurvesMorphParams(
+            active: self["active"]?.bool ?? false,
+            gammaFactor: self["gamma_factor"]?.double ?? 1,
+            gammaFactorFast: self["gamma_factor_fast"]?.double ?? 1,
+            gammaFactorSlow: self["gamma_factor_slow"]?.double ?? 1,
+            gammaFactorRed: self["gamma_factor_red"]?.double ?? 1,
+            gammaFactorGreen: self["gamma_factor_green"]?.double ?? 1,
+            gammaFactorBlue: self["gamma_factor_blue"]?.double ?? 1,
+            developerExhaustion: self["developer_exhaustion"]?.double ?? 0
+        )
+    }
+
     /// The halation parameters of a fixture.
     ///
     /// Upstream reference: `spektrafilm.runtime.params_schema.HalationParams`.
@@ -221,7 +234,9 @@ func makePipelineParams(
         ),
         printRender: PrintRenderParams(
             glare: try XCTUnwrap(params["print_render"], file: file, line: line)
-                .glareParams(file: file, line: line)
+                .glareParams(file: file, line: line),
+            densityCurvesMorph: params["print_render"]?["density_curves_morph"]?
+                .printCurvesMorphParams() ?? PrintCurvesMorphParams(active: false)
         ),
         enlarger: EnlargerParams(
             illuminant: try XCTUnwrap(

@@ -124,19 +124,28 @@ The inventory (tested in `AdvancedParamsTests`):
 
 | Bucket | Count | Meaning |
 |---|---|---|
-| applied | **84** | the panel writes the value into the Swift `PipelineParams` |
+| applied | **92** | the panel writes the value into the Swift `PipelineParams` |
 | basic sheet | 6 | camera EV, auto exposure, metering method, grain activity, halation activity and amount: the Adjustments sheet is applied **after** the overrides and always wins |
 | look | 3 | `selection.film_stock`, `selection.print_paper`, `io.scan_film`: the film / print selection of the main screen owns them |
 | input policy | 2 | `io.input_color_space`, `io.input_cctf_decoding`: the Input section owns them |
 | locked | 1 | `io.output_color_space`: the engine always encodes the output with the sRGB transfer function, and the display and the export of the app are sRGB |
-| unported | 22 | the eight parameters of the chemistry and the fourteen parameters of the viewer / of the workflow of the upstream GUI |
+| unported | 14 | the viewer / workflow parameters of the upstream GUI |
 
 The groups of the panel are the groups of the manifest: **Couplers, Halation,
 Grain, Glare, Preflash, Camera, Camera diffusion, Enlarger, Enlarger diffusion,
-Scanner, Input gamut, Output gamut, Settings, Film rendering** (the gamma of the
+Scanner, Chemistry, Input gamut, Output gamut, Settings, Film rendering** (the gamma of the
 density curves of the negative), **Film and print** and **I/O policy** (the rows
-owned by another sheet), plus the two unavailable groups **Chemistry** and
-**Viewer and workflow**.
+owned by another sheet), plus the unavailable group **Viewer and workflow**.
+
+The eight **Chemistry** controls map to
+`printRender.densityCurvesMorph`: enable, global gamma, fast-layer gamma,
+mid/slow-layer gamma, R/G/B gamma and developer exhaustion. Gamma controls
+multiply together; exhaustion blends the normal and matched Gumbel CDFs,
+with one center offset per channel preserving density at zero log exposure.
+Defaults are enabled with all gammas at 1 and exhaustion at 0, reproducing
+the previous fitted curves exactly for bundled profiles. Direct scans bypass
+print chemistry. Curve preparation is shared by CPU and Metal plans; the
+stock black/white reference curves are never morphed.
 
 ### The apply order
 
@@ -185,9 +194,8 @@ session, but clearing advanced overrides does not change the basic AE toggle.
 
 Nothing that the engine does not support is offered as if it worked:
 
-- the **chemistry** group (`print_render.density_curves_morph.*`) is shown
-  disabled: the Swift engine has no counterpart for the print density-curve
-  morphing, and no shadow struct is invented for it;
+- the **viewer / workflow** group is shown disabled: these controls have no
+  App implementation yet;
 - the **spectral upsampling** only offers `hanatos2025` (`mallett2019` is not
   ported and the engine would throw);
 - the **input gamut compression** only offers `xy` (`oklch` is not ported: the
@@ -396,7 +404,7 @@ preview has the proportions of the border of the export, while the film grade
 itself stays the existing 1280-pixel preview render.
 
 The advanced parameter panel of the previous section is part of this slice: the
-118 paths of the upstream manifest are catalogued, the 84 that the panel
+118 paths of the upstream manifest are catalogued, the 92 that the panel
 applies are written into the engine, and the others are shown read-only or
 disabled, with their reason.
 

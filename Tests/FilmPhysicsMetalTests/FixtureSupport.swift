@@ -117,17 +117,40 @@ enum JSONValue {
         return rows
     }
 
-    /// The value as a flat array of numbers, flattening the nested arrays.
+    /// Nested arrays or compact little-endian float32 records from the CPU fixtures.
     var flatDoubles: [Double]? {
-        guard case let .array(array) = self else { return nil }
-        var values: [Double] = []
-        for element in array {
-            if let number = element.double {
-                values.append(number)
-            } else if let nested = element.flatDoubles {
-                values.append(contentsOf: nested)
-            } else {
-                return nil
+        if case let .array(array) = self {
+            var values: [Double] = []
+            for element in array {
+                if let number = element.double {
+                    values.append(number)
+                } else if let nested = element.flatDoubles {
+                    values.append(contentsOf: nested)
+                } else {
+                    return nil
+                }
+            }
+            return values
+        }
+        guard let encoded = self["data"]?.string,
+              self["dtype"]?.string == "float32",
+              self["encoding"]?.string == "base64 (little endian, C order)",
+              let shape = self["shape"]?.doubles, !shape.isEmpty,
+              shape.allSatisfy({ $0 >= 0 && $0 == $0.rounded() }),
+              let data = Data(base64Encoded: encoded), data.count % 4 == 0,
+              shape.reduce(1.0, *) == Double(data.count / 4) else {
+            return self["data"]?.flatDoubles
+        }
+        var values = [Double](repeating: 0, count: data.count / 4)
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            let bytes = raw.bindMemory(to: UInt8.self)
+            for index in values.indices {
+                let offset = index * 4
+                let bits = UInt32(bytes[offset])
+                    | (UInt32(bytes[offset + 1]) << 8)
+                    | (UInt32(bytes[offset + 2]) << 16)
+                    | (UInt32(bytes[offset + 3]) << 24)
+                values[index] = Double(Float(bitPattern: bits))
             }
         }
         return values
