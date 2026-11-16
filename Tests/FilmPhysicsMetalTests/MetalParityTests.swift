@@ -112,6 +112,69 @@ final class MetalParityTests: XCTestCase {
 
     // MARK: - The per pixel chain
 
+    func testPrintChemistryMatchesCPUAndUpstreamIncludingBlackWhiteCorrections() throws {
+        let backend = try makeBackend()
+        let fixture = try JSONValue.load(named: "chemistry")
+        let record = try XCTUnwrap(fixture["image"])
+        let image = RGBImage(
+            width: try XCTUnwrap(record["width"]?.int),
+            height: try XCTUnwrap(record["height"]?.int),
+            data: try XCTUnwrap(record.flatDoubles)
+        )
+        for entry in try XCTUnwrap(fixture["pipelines"]?.arrayElements) {
+            let name = try XCTUnwrap(entry["name"]?.string)
+            let film = try ProfileLoader.load(stock: try XCTUnwrap(entry["film_profile"]?.string))
+            let paper = try ProfileLoader.load(stock: try XCTUnwrap(entry["print_profile"]?.string))
+            let params = try makePipelineParams(fixture: entry, film: film, print: paper)
+            let pipeline = try FilmPipeline(params: params)
+            let cpu = try pipeline.process(rgbIn: image)
+            let gpu = try backend.render(image, plan: FilmRenderPlan(pipeline: pipeline))
+            let expected = try XCTUnwrap(entry["taps"]?["rgb_out"]?.flatDoubles)
+            let error = deltaE(cpu.rgbOut.data, gpu.rgbOut.data)
+            let pythonError = deltaE(expected, gpu.rgbOut.data)
+            progress("METAL-PARITY chemistry \(name): CPU mean \(error.mean), max \(error.max); Python mean \(pythonError.mean), max \(pythonError.max)")
+            XCTAssertLessThan(error.mean, 0.01, name)
+            XCTAssertLessThan(error.max, 0.05, name)
+            XCTAssertLessThan(pythonError.mean, 0.01, name)
+            XCTAssertLessThan(pythonError.max, 0.05, name)
+        }
+    }
+
+    func testPrintChemistryMatchesCPUForEveryMediumAndControl() throws {
+        let backend = try makeBackend()
+        let fixture = try JSONValue.load(named: "chemistry")
+        let record = try XCTUnwrap(fixture["image"])
+        let image = RGBImage(
+            width: try XCTUnwrap(record["width"]?.int),
+            height: try XCTUnwrap(record["height"]?.int),
+            data: try XCTUnwrap(record.flatDoubles)
+        )
+        let base = try XCTUnwrap(fixture["pipelines"]?.arrayElements?.first)
+        let film = try ProfileLoader.load(stock: "kodak_portra_400")
+        var largestMean = 0.0
+        var largestMax = 0.0
+        for medium in try XCTUnwrap(fixture["curves"]?.arrayElements) {
+            let stock = try XCTUnwrap(medium["stock"]?.string)
+            let paper = try ProfileLoader.load(stock: stock)
+            var params = try makePipelineParams(fixture: base, film: film, print: paper)
+            // Start from stock defaults so the new film/paper pair is digested normally.
+            params.enlarger = EnlargerParams()
+            for entry in try XCTUnwrap(medium["cases"]?.arrayElements) {
+                let name = try XCTUnwrap(entry["name"]?.string)
+                params.printRender.densityCurvesMorph = try XCTUnwrap(entry["params"])
+                    .printCurvesMorphParams()
+                let cpu = try CPUBackend().render(image, params: params)
+                let gpu = try backend.render(image, params: params)
+                let error = deltaE(cpu.data, gpu.data)
+                largestMean = max(largestMean, error.mean)
+                largestMax = max(largestMax, error.max)
+                XCTAssertLessThan(error.mean, 0.01, "\(stock) / \(name)")
+                XCTAssertLessThan(error.max, 0.05, "\(stock) / \(name)")
+            }
+        }
+        progress("METAL-PARITY chemistry 8 media x 12 controls: largest mean \(largestMean), largest pixel \(largestMax)")
+    }
+
     func testAutoExposureMatchesCPUForEveryMethodAndInputTransferFunction() throws {
         let backend = try makeBackend()
         let common = try JSONValue.load(named: "slice2_common")

@@ -993,14 +993,15 @@ the historical slice rows that are now ported):
 | F | the other stocks and papers (148 looks upstream) | — | **ported in slice 4** — the 28 profiles are bundled and the 148 looks are validated |
 | G | the 3D LUT approximations (`use_enlarger_lut`, `use_scanner_lut`) | `runtime/*` | the port always runs the exact spectral path |
 | H | the camera band pass filter (`camera.filter_uv` / `filter_ir`) and the highlight boost | `model/color_filters.py::compute_band_pass_filter` | inactive at the upstream defaults |
-| I | the print density curve morph (`print_render.density_curves_morph`) | `model/develop.py::develop_print_morph` | ported but inactive (the upstream default is off) |
+| I | the print density curve morph (`print_render.density_curves_morph`) | `model/develop.py::develop_print_morph` | **ported** in `PrintCurvesMorph`; eight live App controls, CPU curve preparation consumed by Metal. Upstream defaults: active, gamma factors 1, exhaustion 0 (identity). See §7.14. |
 | J | the hanatos 2025 log exposure correction surface (`apply_hanatos2025_adaptation_surface`) | `utils/spectral_upsampling.py` | ported but inactive (the upstream default is off) |
 
 The **black / white printing exposure correction** and the **black / white XYZ
 correction** *are* ported (`Sources/FilmPhysics/ColorReference.swift`); they
-are inactive in the reference fixtures (the scanner correction is disabled),
-so the parity test does not exercise them — only a smoke test
-(`testBlackAndWhiteCorrectionRuns`) runs that path.
+are inactive in the original slice fixtures. The focused `chemistry.json`
+fixtures now exercise corrections on/off and black-only/white-only, with and
+without creative chemistry. Encoded sRGB levels are decoded before the linear
+XYZ correction, matching the upstream service.
 
 The **direct scan of a slide** (the `scan_film` + `positive` branch of the
 black / white reference) is exercised by the slice 4 fixture: the reference
@@ -1232,6 +1233,7 @@ Other measured quantities:
 | `Tests/FilmPhysicsTests/Slice1ParityTests.swift` | The tap by tap parity of the four parameter cases, the print balance reference, the exposure factor and the black / white correction path. |
 | `Tests/FilmPhysicsTests/Slice2ParityTests.swift` | The whole pipeline from `rgb_in` against the four slice 2 cases, the hanatos 2025 tc LUT, the CAM16-UCS model (forward and round trip), the output gamut compressor and the colour matrices. |
 | `Tests/FilmPhysicsTests/AutoExposureTests.swift` | CPU auto exposure: both preview variants, all seven methods plus unknown, all 16 EV fixtures, full-pipeline AE off / on / +0.75 EV compensation, print-balance separation, init acceptance, and the bit-identical AE-off path. |
+| `Tests/FilmPhysicsTests/PrintCurvesMorphTests.swift` | All eight print media x twelve chemistry cases against upstream curves, pipeline taps and both plan evaluators, default identity, direct-scan bypass, black/white reference independence, exhaustion invariants and invalid-input rejection. |
 | `Tests/FilmPhysicsTests/SpatialParityTests.swift` | The parity of the ten spatial effect cases of the slice 5 (the halation, the highlight boost, the DIR coupler diffusion, the diffusion filters, the lens blurs and the unsharp mask) and the parity of the image space helpers (the FIR and the IIR Gaussian, the exponential filter and the `reflect` boundary). |
 | `Tests/FilmPhysicsTests/GrainStatisticsTests.swift` | The statistical validation of the grain of the negative against the two upstream references (the fast kernels and the exact SciPy generators), the validation of the **exact** samplers of the port against the default upstream path (no allowance), the determinism of the seed, the timing of the grain of a 1024 × 1024 image and the invariance of the grain off path. |
 | `Tests/FilmPhysicsTests/GlareStatisticsTests.swift` | The statistical validation of the glare of the print against the upstream, the determinism of the seed and the absence of glare on a directly scanned film. |
@@ -1965,6 +1967,54 @@ device.
 
 ---
 
+### 7.14 Print chemistry (coupled gamma and developer exhaustion)
+
+`PrintCurvesMorphParams` mirrors all eight controls of the upstream s023 model:
+active, global/fast/slow/R/G/B gamma factors and developer exhaustion. The
+effective gamma is the product of global, band and channel factors; the fast
+layer is the lowest center, and the slow factor applies to both remaining
+layers. Centers and sigmas are divided by that gamma, with sigma floored at
+0.05; amplitudes stay fixed. Exhaustion blends the normal CDF with the matched
+Gumbel-max CDF. A common offset per channel preserves the gamma-adjusted
+model's density at zero log exposure. The bounded monotone root uses bisection
+to the upstream's 1e-10 exposure tolerance rather than SciPy's Brent solver.
+
+`Printing.develop(logRaw:printProfile:morph:)` and `FilmRenderPlan` use the same
+curve preparation. Metal consumes the existing curve buffer and interpolation
+kernel; no per-pixel root solving or new shader is introduced. Direct scans
+bypass print chemistry. The black/white reference service always evaluates
+the stock curves, never creative morphed curves.
+
+`tools/gen_chemistry_fixtures.py` runs unmodified upstream commit `3bb2c2d`.
+It captures eight print media x twelve cases, including isolated gamma controls,
+combined controls, exhaustion 0/0.5/1 and the sigma-floor corner, plus ten
+pipeline cases. Curves and taps are packed as little-endian float32; earlier
+fixture families are unchanged. Curve parity is gated at 5e-7 absolute density
+error; full output and CPU/Metal parity at mean Delta E2000 < 0.01 and max < 0.05.
+The App catalog now has 92 applied + 6 basic-owned + 6 external + 14 unavailable
+paths. Physical-device photo/export acceptance remains outstanding.
+
+The expanded correction fixtures exposed three pre-existing parity bugs, now
+fixed: encoded sRGB scanner levels were used directly as linear XYZ targets;
+the slide filming-exposure correction had an extra reciprocal; and render
+plans overwrote direct-scan film references with those of the unused print
+medium. Corrections remain off by default. With corrections enabled, the
+fixtures now cover print, negative direct scan (no correction upstream),
+and Velvia slide direct scan on CPU, both plan evaluators and Metal.
+
+Local focused validation (macOS Metal, Release): curve maximum absolute error
+2.3826e-7 across 96 cases; CPU output vs Python mean Delta E2000
+0.00201-0.00312 and maximum < 0.00961 across ten pipelines. For all eight
+media x twelve controls on Metal, the largest CPU/GPU mean is 0.002407 and
+the worst pixel 0.009658. These small deterministic fixtures disable spatial
+and stochastic effects; they do not establish real-iPhone export acceptance.
+
+Final local regression on 2026-11-13: `swift test -c release` ran 201 tests
+with zero failures and one skip (only the opt-in `RUN_TIMING` test). Actual
+Metal parity and grain tests ran. The unsigned generic iOS Simulator App
+build also succeeded. No physical-device or interactive photo/export run is
+claimed by this checkpoint.
+
 ## 8. Next steps
 
 * Regenerate the slice 6 fixture with **more upstream seeds** (12 today): the
@@ -1978,8 +2028,9 @@ device.
   hand-off and App toggle are implemented; a GPU meter is not required for correctness.
 * Port the remaining gamut compression algorithms (`oklch`, `aces_rgc`,
   `oklrab`, `jzazbz`) and the `mallett2019` RGB → raw method.
-* Bundle the other stocks and papers (the upstream ships 20 films and 8
-  papers, i.e. 132 looks) and extend the parity fixtures to them.
-* The Metal port of the engine (phase P3) is in place and parity-tested
-  against this CPU reference (§7, CI run 43149838375).  The next product
-  phase is the SwiftUI app shell (P4); it is not started here.
+* Validate the existing 148-look catalog, App photo/save flows, RAW accuracy
+  and large-image export memory on physical iPhones. The catalog, Metal
+  backend and SwiftUI app shell are implemented; this is acceptance work,
+  not an unstarted port.
+* Add user presets/state persistence, zoom/pan, file input/output and sharing
+  to the existing App workflow.

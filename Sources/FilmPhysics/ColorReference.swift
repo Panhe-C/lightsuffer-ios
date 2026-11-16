@@ -136,8 +136,16 @@ public struct ColorReference: Equatable, Sendable {
     public func correctionFunction() -> (slope: Double, offset: Double)? {
         guard !isIdentity else { return nil }
         guard let yBlack, let yWhite else { return nil }
-        var whiteLevel = self.whiteLevel
-        var blackLevel = self.blackLevel
+        // Upstream stores slider levels in encoded sRGB and removes its CCTF
+        // before applying the correction to linear XYZ luminance.
+        let srgbToSRGB = ColourScience.matrixRGBToRGB(from: .sRGB, to: .sRGB)
+        func linearLevel(_ encoded: Double) -> Double {
+            let linear = Colour.sRGBDecode(encoded)
+            let rgb = Matrix.multiply(srgbToSRGB, [linear, linear, linear])
+            return rgb.reduce(0, +) / 3
+        }
+        var whiteLevel = linearLevel(self.whiteLevel)
+        var blackLevel = linearLevel(self.blackLevel)
         if blackCorrection && !whiteCorrection {
             whiteLevel = yWhite
         }
@@ -233,7 +241,9 @@ public struct ColorReference: Equatable, Sendable {
             values: mirroredAxis
         )
         let exposureCorrection = pow(10.0, logExposureMidgrayCorrected - logExposureMidgray)
-        return 1.0 / exposureCorrection
+        // Upstream negates both interpolated exposures and then reciprocates
+        // their ratio. Those two sign inversions cancel.
+        return exposureCorrection
     }
 
     /// The correction of the scanned tristimulus values.

@@ -19,13 +19,13 @@ final class AdvancedParamsTests: XCTestCase {
         XCTAssertEqual(AdvancedParams.catalog.count, 118)
         XCTAssertEqual(Set(AdvancedParams.catalog.map(\.path)).count, 118)
 
-        // The inventory: 84 parameters are written by the panel, 6 belong to
+        // The inventory: 92 parameters are written by the panel, 6 belong to
         // the Adjustments sheet, 3 to the look, 2 to the Input policy, 1 is
-        // locked to the contract of the app and 22 are not ported.
-        XCTAssertEqual(AdvancedParams.appliedCount, 84)
+        // locked to the contract of the app and 14 are not ported.
+        XCTAssertEqual(AdvancedParams.appliedCount, 92)
         XCTAssertEqual(AdvancedParams.basicSheetOwnedCount, 6)
         XCTAssertEqual(AdvancedParams.externallyOwnedCount, 6)
-        XCTAssertEqual(AdvancedParams.unportedCount, 22)
+        XCTAssertEqual(AdvancedParams.unportedCount, 14)
         XCTAssertEqual(
             AdvancedParams.appliedCount
                 + AdvancedParams.basicSheetOwnedCount
@@ -45,13 +45,11 @@ final class AdvancedParamsTests: XCTestCase {
     }
 
     func testUnportedGroupsAreListedWithTheirReason() {
-        // The chemistry is not ported: the group is listed, never applied.
+        // The print chemistry has a live engine mapping for every control.
         let chemistry = AdvancedParams.specs(in: .chemistry)
         XCTAssertEqual(chemistry.count, 8)
         for spec in chemistry {
-            XCTAssertEqual(spec.availability, .unported(reason: spec.availability.reason ?? ""))
-            XCTAssertNotNil(spec.availability.reason)
-            XCTAssertTrue(spec.availability.reason?.contains("not ported") == true)
+            XCTAssertEqual(spec.availability, .applied)
         }
 
         // Auto exposure is owned by the basic Camera section.
@@ -171,7 +169,7 @@ final class AdvancedParamsTests: XCTestCase {
             if case .unported = $0.availability { return true }
             return false
         }
-        XCTAssertEqual(unported.count, 22)
+        XCTAssertEqual(unported.count, 14)
 
         for spec in unported {
             var overrides = AdvancedOverrides()
